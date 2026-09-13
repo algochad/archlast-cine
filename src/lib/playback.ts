@@ -40,6 +40,7 @@ const HEVC_CODEC_RE = /hev1|hev2|hvc1|hvc2|dvh1|dvhe|dvh2|dvav|dva1/i;
 
 /** Normalize a codecs= attribute payload into a set of known families. */
 function codecFamilies(codecsAttr: string): string[] {
+  if (typeof codecsAttr !== "string" || codecsAttr === "") return [];
   const out: string[] = [];
   for (const raw of codecsAttr.split(",")) {
     const fam = raw.trim().split(".")[0].toLowerCase();
@@ -68,6 +69,7 @@ function codecFamilies(codecsAttr: string): string[] {
 }
 
 function collectFamilies(scope: string): string[] {
+  if (typeof scope !== "string" || scope === "") return [];
   const seen = new Set<string>();
   const re = /codecs\s*=\s*["']([^"']*)["']/gi;
   let m: RegExpExecArray | null;
@@ -95,6 +97,9 @@ const VIDEO_FAMILIES: Record<string, true> = { hevc: true, avc: true, av1: true,
  * Representations — both are inside the set scope, so both are sniffed.
  */
 export function sniffManifest(text: string): Sniff {
+  if (typeof text !== "string" || text === "") {
+    return { videoCodecs: [], hevcOnly: false, hasAvc: false, hasFallback: false };
+  }
   const sets: string[] = [];
   let m: RegExpExecArray | null;
   const adaptRe = new RegExp(ADAPTATION_SET_RE.source, "gi");
@@ -147,6 +152,9 @@ export function sniffManifest(text: string): Sniff {
  * hevcOnly) so it still plays instead of misrouting to transcode.
  */
 export function sniffHls(text: string): Sniff {
+  if (typeof text !== "string" || text === "") {
+    return { videoCodecs: [], hevcOnly: false, hasAvc: false, hasFallback: false };
+  }
   const families = new Set<string>();
   const re = /codecs\s*=\s*["']([^"']*)["']/gi;
   let m: RegExpExecArray | null;
@@ -178,6 +186,9 @@ export interface StripResult {
  * set.
  */
 export function stripHevcManifest(text: string): StripResult {
+  if (typeof text !== "string" || text === "") {
+    return { text: typeof text === "string" ? text : "", removed: 0 };
+  }
   const sniff = sniffManifest(text);
   if (!sniff.hasFallback || !sniff.videoCodecs.includes("hevc")) {
     return { text, removed: 0 };
@@ -256,11 +267,16 @@ export function browserSupportsHevc(videoEl?: HTMLVideoElement | null): boolean 
     }
   }
   if (videoEl == null && typeof document === "undefined") return false;
-  const video = videoEl ?? document.createElement("video");
-  if (typeof video.canPlayType !== "function") return false;
-  const probe = (codec: string) => video.canPlayType(`video/mp4; codecs="${codec}"`);
-  const hev1 = probe("hev1.1.6.L120.90");
-  const hvc1 = probe("hvc1.1.6.L120.90");
+  let video: HTMLVideoElement | null = null;
+  try {
+    video = videoEl ?? document.createElement("video");
+  } catch {
+    return false;
+  }
+  if (video == null || typeof video.canPlayType !== "function") return false;
+  const target: HTMLVideoElement = video;
+  const hev1 = target.canPlayType('video/mp4; codecs="hev1.1.6.L120.90"');
+  const hvc1 = target.canPlayType('video/mp4; codecs="hvc1.1.6.L120.90"');
   if (hev1 === "probably" || hvc1 === "probably") return true;
   if (hev1 === "maybe" || hvc1 === "maybe") return true;
   // Safari hint: HEVC-capable Safari reports the short form when it refuses the
@@ -268,7 +284,7 @@ export function browserSupportsHevc(videoEl?: HTMLVideoElement | null): boolean 
   if (typeof navigator !== "undefined") {
     const ua = navigator.userAgent;
     const isSafari = /Safari\//.test(ua) && !/Chrome\//.test(ua) && !/Chromium/.test(ua);
-    if (isSafari && (probe("hev1") !== "" || probe("hvc1") !== "")) return true;
+    if (isSafari && (target.canPlayType('video/mp4; codecs="hev1"') !== "" || target.canPlayType('video/mp4; codecs="hvc1"') !== "")) return true;
   }
   return false;
 }
@@ -287,6 +303,9 @@ export function pickPlayableManifest(
   text: string,
   videoEl?: HTMLVideoElement | null,
 ): ManifestDecision {
+  if (typeof text !== "string" || text === "") {
+    return { mode: "dash", text: typeof text === "string" ? text : "", stripped: false, hevcOnly: false };
+  }
   const sniff = sniffManifest(text);
   const hevc = sniff.videoCodecs.includes("hevc");
   if (hevc && sniff.hevcOnly) {
@@ -311,6 +330,7 @@ export function pickPlayableManifest(
  * Returns null when the value is absent or does not parse.
  */
 export function isoDurationToSeconds(raw: string): number | null {
+  if (typeof raw !== "string") return null;
   const m = raw.trim().match(
     /^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/i,
   );
@@ -332,6 +352,7 @@ export function isoDurationToSeconds(raw: string): number | null {
  * absent or unparseable.
  */
 export function parseMpdDuration(text: string): number | null {
+  if (typeof text !== "string" || text === "") return null;
   const attr = text.match(/mediaPresentationDuration\s*=\s*["']([^"']+)["']/i);
   if (!attr) return null;
   return isoDurationToSeconds(attr[1]);
@@ -346,7 +367,8 @@ export function parseMpdDuration(text: string): number | null {
  * references are left alone.
  */
 export function rewriteRelativeTo(baseDir: string, text: string): string {
-  if (!baseDir) return text;
+  if (typeof text !== "string") return "";
+  if (!baseDir || typeof baseDir !== "string") return text;
   // Segment-template media/initialization attributes whose value is a bare
   // relative path (optionally with a leading directory, e.g. "dash/xxx/init-stream$…").
   let out = text.replace(

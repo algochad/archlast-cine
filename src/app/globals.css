@@ -150,6 +150,8 @@ input[type="range"].player-range {
   );
   cursor: pointer;
   outline: none;
+  /* Horizontal scrub owns the gesture; vertical page pans still pass through. */
+  touch-action: pan-y;
 }
 input[type="range"].player-range::-webkit-slider-thumb {
   -webkit-appearance: none;
@@ -161,10 +163,11 @@ input[type="range"].player-range::-webkit-slider-thumb {
   border: 2px solid #fff;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
   opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, transform 0.15s ease;
 }
 input[type="range"].player-range:hover::-webkit-slider-thumb,
 input[type="range"].player-range:focus::-webkit-slider-thumb,
+input[type="range"].player-range:focus-visible::-webkit-slider-thumb,
 input[type="range"].player-range:active::-webkit-slider-thumb {
   opacity: 1;
 }
@@ -175,12 +178,52 @@ input[type="range"].player-range::-moz-range-thumb {
   background: var(--color-brand);
   border: 2px solid #fff;
   opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, transform 0.15s ease;
 }
 input[type="range"].player-range:hover::-moz-range-thumb,
 input[type="range"].player-range:focus::-moz-range-thumb,
+input[type="range"].player-range:focus-visible::-moz-range-thumb,
 input[type="range"].player-range:active::-moz-range-thumb {
   opacity: 1;
+}
+/* Scrub/keyboard focus reveals the overlay input (it rests at opacity-0 so the
+   painted buffered/played fills own the idle look). Opacity-only: no layout shift.
+   :focus-visible (not :focus) so mouse users don't get a stuck visible track. */
+input[type="range"].player-range:active,
+input[type="range"].player-range:focus-visible {
+  opacity: 1;
+}
+/* Brand focus ring for keyboard users; outlines never shift layout. */
+input[type="range"].player-range:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 6px;
+}
+/* Pressed thumb grows via transform only (no layout shift); brand kept. */
+input[type="range"].player-range:active::-webkit-slider-thumb {
+  transform: scale(1.25);
+}
+input[type="range"].player-range:active::-moz-range-thumb {
+  transform: scale(1.25);
+}
+/* Touch: no hover on coarse pointers, so the thumb is always visible and larger.
+   The input is absolutely positioned, so the taller hit area cannot shift layout;
+   background-size keeps the painted track 4px tall and centered. */
+@media (pointer: coarse) {
+  input[type="range"].player-range::-webkit-slider-thumb,
+  input[type="range"].player-range::-moz-range-thumb {
+    width: 22px;
+    height: 22px;
+    opacity: 1;
+  }
+  input[type="range"].player-range {
+    height: 32px;
+    top: 50%;
+    bottom: auto;
+    transform: translateY(-50%);
+    background-size: 100% 4px;
+    background-repeat: no-repeat;
+    background-position: center;
+  }
 }
 
 /* ------------------------------------------------------------------ */

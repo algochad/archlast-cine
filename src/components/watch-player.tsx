@@ -22,6 +22,7 @@ import {
 import { formatClock } from "@/lib/format";
 import { getHistory } from "@/lib/history";
 import { browserSupportsHevc, parseMpdDuration, pickPlayableManifest, rewriteRelativeTo, sniffHls } from "@/lib/playback";
+import { clampSeekTarget, isSeekableDuration, resolveDisplayTime, seekProgressPct } from "@/lib/seek";
 import { useMyList, useServerHistory, useSession } from "@/lib/session";
 import type { MediaDetails, Release, StreamsResponse, SubtitleOption } from "@/lib/types";
 import { ApiError } from "@/lib/types";
@@ -131,11 +132,59 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   // currentTime until the browser lands, so the thumb holds instead of
   // rubberbanding to the old position. Cleared on seeked/land or supersede.
   const pendingSeekRef = useRef<number | null>(null);
+  // Clearable id for the deferred pin release after `seeked` (a superseding
+  // seek cancels the prior clear so rapid seeks resolve to the latest target).
+  const pendingClearRef = useRef<number | null>(null);
+  // Watchdog fallback when `seeking` fires but `seeked` never does: releases
+  // a stuck pin after 8s so the thumb can't strand.
+  const seekWatchdogRef = useRef<number | null>(null);
+  // Latest remote-seek target queued while a restart is in flight (storm
+  // guard: superseded targets collapse to the latest instead of dropping).
+  const queuedRemoteSeekRef = useRef<number | null>(null);
+  // Direct-seek target deferred until metadata makes the duration seekable
+  // (first-seek fix: never clamp to 0 while duration is NaN/Inf/<=0).
+  const deferredSeekRef = useRef<number | null>(null);
   const subTrackRef = useRef<SubtitleTrackState | null>(null);
   const chosenSubRef = useRef<SubtitleOption | null>(null);
   const remoteSeekBusyRef = useRef(false);
   // media-session seekto + resume route through the absolute seek dispatcher
   const seekAbsoluteRef = useRef<(absSeconds: number) => void>(() => undefined);
+  // ---- seek-pin lifecycle --------------------------------------------------
+  // An in-flight direct seek pins the timeline display at its target until the
+  // browser lands. A superseding seek cancels the prior deferred clear, so
+  // rapid seeks always resolve to the latest target; a watchdog releases a
+  // stuck pin when `seeked` never fires.
+  const cancelPinTimers = useCallback(() => {
+    if (pendingClearRef.current != null) {
+      window.clearTimeout(pendingClearRef.current);
+      pendingClearRef.current = null;
+    }
+    if (seekWatchdogRef.current != null) {
+      window.clearTimeout(seekWatchdogRef.current);
+      seekWatchdogRef.current = null;
+    }
+  }, []);
+  const pinSeekTarget = useCallback(
+    (target: number) => {
+      cancelPinTimers();
+      pendingSeekRef.current = target;
+      const pinned = target;
+      seekWatchdogRef.current = window.setTimeout(() => {
+        seekWatchdogRef.current = null;
+        // Only release our own pin: a superseding seek or drag preview that
+        // bypassed cancelPinTimers must not be cleared by a stale timer.
+        if (pendingSeekRef.current === pinned) pendingSeekRef.current = null;
+      }, 8000);
+    },
+    [cancelPinTimers],
+  );
+  /** Transient center-of-screen notice that auto-clears. */
+  const flashNotice = useCallback((text: string) => {
+    setSeekNotice(text);
+    window.setTimeout(() => {
+      setSeekNotice((cur) => (cur === text ? null : cur));
+    }, 2000);
+  }, []);
 
   // ---- account session -------------------------------------------------
   // Mirrors the (async) session status so callbacks bound to a single render
@@ -319,6 +368,16 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     currentSourceRef.current = null;
     transcodeIndexUrlRef.current = null;
     remoteSeekBusyRef.current = false;
+    queuedRemoteSeekRef.current = null;
+    deferredSeekRef.current = null;
+    if (pendingClearRef.current != null) {
+      window.clearTimeout(pendingClearRef.current);
+      pendingClearRef.current = null;
+    }
+    if (seekWatchdogRef.current != null) {
+      window.clearTimeout(seekWatchdogRef.current);
+      seekWatchdogRef.current = null;
+    }
     pendingSeekRef.current = null;
     watchdogLastTimeRef.current = null;
     watchdogLastStampRef.current = 0;
@@ -938,11 +997,25 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         seekAbsoluteRef.current(pos);
       } else {
         const trySeek = () => {
-          pendingSeekRef.current = Number.isFinite(pos) ? pos : null;
-          video.currentTime = pos;
           video.removeEventListener("loadedmetadata", trySeek);
+          const dur = video.duration;
+          const target = clampSeekTarget(pos, dur);
+          if (target == null) {
+            // Duration not seekable yet: queue for the metadata drain instead
+            // of clamping to 0 (first-seek race).
+            deferredSeekRef.current = pos;
+            flashNotice("Still loading — try again in a moment");
+            return;
+          }
+          pinSeekTarget(target);
+          try {
+            video.currentTime = target;
+          } catch {
+            pendingSeekRef.current = null;
+          }
         };
         video.addEventListener("loadedmetadata", trySeek);
+        // Seeking before metadata is ready clamps to 0 — defer instead.
         if (video.readyState >= 1) trySeek();
       }
     }
@@ -979,17 +1052,42 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     if (!video) return;
     if (transcodeActiveRef.current) {
       const total = totalDurationRef.current ?? manifestTotalRef.current;
-      if (total != null && Number.isFinite(total)) {
-        seekAbsoluteRef.current(Math.min(Math.max(absolutePosition() + delta, 0), total));
-        pokeControls();
+      if (!isSeekableDuration(total)) {
+        // Total unknown yet: queue the relative intent for the metadata drain
+        // instead of clamping to 0 (first-seek race).
+        deferredSeekRef.current = absolutePosition() + delta;
+        flashNotice("Still loading — try again in a moment");
         return;
       }
+      const target = clampSeekTarget(absolutePosition() + delta, total);
+      if (target == null) {
+        flashNotice("Still loading — try again in a moment");
+        return;
+      }
+      seekAbsoluteRef.current(target);
+      pokeControls();
+      return;
     }
-    const target = Math.min(Math.max(0, video.currentTime + delta), video.duration || 0);
-    pendingSeekRef.current = Number.isFinite(target) ? target : null;
-    video.currentTime = Number.isFinite(target) ? target : video.currentTime;
+    if (!isSeekableDuration(video.duration)) {
+      // Duration unknown yet: defer the relative intent until metadata makes
+      // the absolute target computable (never jump to 0).
+      deferredSeekRef.current = video.currentTime + delta;
+      flashNotice("Still loading — try again in a moment");
+      return;
+    }
+    const target = clampSeekTarget(video.currentTime + delta, video.duration);
+    if (target == null) {
+      flashNotice("Still loading — try again in a moment");
+      return;
+    }
+    pinSeekTarget(target);
+    try {
+      video.currentTime = target;
+    } catch {
+      pendingSeekRef.current = null;
+    }
     pokeControls();
-  }, [pokeControls, absolutePosition]);
+  }, [pokeControls, absolutePosition, pinSeekTarget, flashNotice]);
 
   const toggleMute = useCallback(() => {
     const video = videoRef.current;
@@ -1034,13 +1132,6 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   };
 
   // ---------------- absolute seeking (transcode path) ----------------
-  /** Transient center-of-screen notice that auto-clears. */
-  const flashNotice = useCallback((text: string) => {
-    setSeekNotice(text);
-    window.setTimeout(() => {
-      setSeekNotice((cur) => (cur === text ? null : cur));
-    }, 2000);
-  }, []);
 
   /**
    * Restart the transcode pipeline at an absolute source offset and resume on
@@ -1052,7 +1143,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     async (absSeconds: number) => {
       const session = transcodeSessionRef.current;
       if (!session) return;
-      if (remoteSeekBusyRef.current) return; // ignore seek storms
+      if (remoteSeekBusyRef.current) {
+        // Storm guard: collapse superseded targets to the latest instead of
+        // dropping them — drained in `finally` once the restart settles.
+        queuedRemoteSeekRef.current = absSeconds;
+        return;
+      }
       const total = totalDurationRef.current ?? manifestTotalRef.current;
       if (total != null && absSeconds >= total - 0.05) {
         flashNotice("End of video");
@@ -1114,7 +1210,14 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           flashNotice("Seek failed — stream unchanged");
         }
       } finally {
-        if (sourceEpochRef.current === epoch) remoteSeekBusyRef.current = false;
+        if (sourceEpochRef.current === epoch) {
+          remoteSeekBusyRef.current = false;
+          // Drain the latest queued target (if any) through the shared
+          // dispatcher so rapid seeks resolve to the latest request.
+          const queued = queuedRemoteSeekRef.current;
+          queuedRemoteSeekRef.current = null;
+          if (queued != null && Number.isFinite(queued)) void seekAbsoluteRef.current(queued);
+        }
       }
     },
     [flashNotice, pokeControls, destroyHlsOnly, applyTranscodeState, indexHasSegments, playHls, reapplyCaptions],
@@ -1129,20 +1232,56 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     async (absSeconds: number) => {
       const video = videoRef.current;
       if (!video) return;
+      if (!Number.isFinite(absSeconds)) return;
       if (!transcodeActiveRef.current) {
-        const target = Math.min(Math.max(absSeconds, 0), video.duration || 0);
+        // First-seek race: duration is NaN/Inf until metadata loads, and the
+        // old `video.duration || 0` clamp sent the first skip to 0 (start)
+        // while the retry (duration known) landed. Defer instead of jumping.
+        if (!isSeekableDuration(video.duration)) {
+          deferredSeekRef.current = absSeconds;
+          flashNotice("Still loading — try again in a moment");
+          return;
+        }
+        const target = clampSeekTarget(absSeconds, video.duration);
+        if (target == null) {
+          flashNotice("Still loading — try again in a moment");
+          return;
+        }
         // Pin the thumb at the requested position while the browser buffers:
         // without this the rAF loop keeps painting currentTime (the old spot)
         // until the seek lands, which reads as a rubberband snap-back.
-        pendingSeekRef.current = Number.isFinite(target) ? target : null;
-        video.currentTime = Number.isFinite(target) ? target : 0;
+        pinSeekTarget(target);
+        if (video.readyState < 1) {
+          // Metadata parsed enough for duration but element not ready: the
+          // assignment below would throw/clamp, so wait for loadedmetadata.
+          deferredSeekRef.current = target;
+          return;
+        }
+        try {
+          video.currentTime = target;
+        } catch {
+          pendingSeekRef.current = null;
+        }
         pokeControls();
         return;
       }
-      if (remoteSeekBusyRef.current) return; // a restart is in flight
       const total = totalDurationRef.current ?? manifestTotalRef.current;
-      if (total == null) return;
-      const abs = Math.min(Math.max(absSeconds, 0), total);
+      if (!isSeekableDuration(total)) {
+        deferredSeekRef.current = absSeconds;
+        flashNotice("Still loading — try again in a moment");
+        return;
+      }
+      const abs = clampSeekTarget(absSeconds, total);
+      if (abs == null) {
+        flashNotice("Still loading — try again in a moment");
+        return;
+      }
+      if (remoteSeekBusyRef.current) {
+        // A restart is in flight: collapse to the latest target (drained in
+        // remoteSeek's finally) instead of dropping the request.
+        queuedRemoteSeekRef.current = abs;
+        return;
+      }
       const offset = playbackOffsetRef.current;
       let bufferedEnd = video.currentTime;
       if (video.buffered.length > 0) bufferedEnd = video.buffered.end(video.buffered.length - 1);
@@ -1150,14 +1289,19 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       const windowStart = Math.max(offset, 0);
       if (abs <= availableUntil && abs >= windowStart - 1.5) {
         // within the retained live window → plain window-relative media seek
-        const mediaTime = Math.min(Math.max(abs - offset, 0), video.duration || 0);
+        const mediaTime = clampSeekTarget(abs - offset, video.duration);
+        if (mediaTime == null) {
+          deferredSeekRef.current = abs;
+          flashNotice("Still loading — try again in a moment");
+          return;
+        }
         video.currentTime = mediaTime;
         pokeControls();
         return;
       }
       await remoteSeek(abs);
     },
-    [pokeControls, remoteSeek],
+    [pokeControls, remoteSeek, pinSeekTarget, flashNotice],
   );
   // keep the media-session / keyboard / resume handlers pointing at the
   // latest dispatcher without re-subscribing them on every render
@@ -1284,7 +1428,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       const rawDuration = video.duration;
       const duration = transcode && total != null ? total : rawDuration;
 
-      if (Number.isFinite(duration) && duration > 0) {
+      if (isSeekableDuration(duration)) {
         // Transcode path: the element only exposes the sliding live window, so
         // derive the absolute offset every frame and display the absolute
         // source position against the true total.
@@ -1326,8 +1470,8 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           // browser lands (see pendingSeekRef): painting currentTime meanwhile
           // is the rubberband — thumb snaps back to the old spot, then jumps.
           const pending = pendingSeekRef.current;
-          const displayTime = pending != null && !transcode ? pending : absTime;
-          const pct = duration > 0 ? (displayTime / duration) * 100 : 0;
+          const displayTime = resolveDisplayTime(pending, absTime, transcode);
+          const pct = seekProgressPct(displayTime, duration);
           if (timeRef.current) timeRef.current.textContent = formatClock(displayTime);
           if (playedFillRef.current) playedFillRef.current.style.width = `${pct}%`;
           if (seekRef.current) {
@@ -1339,7 +1483,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           if (bufferedFillRef.current && video.buffered.length > 0) {
             const end = video.buffered.end(video.buffered.length - 1);
             const bufAbs = transcode && total != null ? Math.min(offset + end, total) : end;
-            bufferedFillRef.current.style.width = `${duration > 0 ? (bufAbs / duration) * 100 : 0}%`;
+            bufferedFillRef.current.style.width = `${seekProgressPct(bufAbs, duration)}%`;
           }
         }
       }
@@ -1445,11 +1589,35 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     // A direct seek landed (or finished erroring): release the display pin so
     // the rAF loop resumes painting currentTime from the new position. The
     // 1.5s grace covers hls.js buffer-append settling, where currentTime can
-    // momentarily read the pre-seek value right after `seeked` fires.
-    const onSeeked = () => {
-      window.setTimeout(() => {
-        pendingSeekRef.current = null;
+    // momentarily read the pre-seek value right after `seeked` fires. The
+    // clear is stored so a superseding seek cancels it (rapid seeks resolve
+    // to the latest target); the `seeking` watchdog below releases a stuck
+    // pin when `seeked` never fires.
+    const schedulePinClear = () => {
+      if (pendingClearRef.current != null) window.clearTimeout(pendingClearRef.current);
+      const pinned = pendingSeekRef.current;
+      pendingClearRef.current = window.setTimeout(() => {
+        pendingClearRef.current = null;
+        if (pendingSeekRef.current === pinned) pendingSeekRef.current = null;
       }, 1500);
+    };
+    const armSeekWatchdog = () => {
+      if (seekWatchdogRef.current != null) window.clearTimeout(seekWatchdogRef.current);
+      const pinned = pendingSeekRef.current;
+      seekWatchdogRef.current = window.setTimeout(() => {
+        seekWatchdogRef.current = null;
+        if (pendingSeekRef.current === pinned) pendingSeekRef.current = null;
+      }, 8000);
+    };
+    const onSeeking = () => {
+      if (pendingSeekRef.current != null) armSeekWatchdog();
+    };
+    const onSeeked = () => {
+      if (seekWatchdogRef.current != null) {
+        window.clearTimeout(seekWatchdogRef.current);
+        seekWatchdogRef.current = null;
+      }
+      schedulePinClear();
     };
     video.addEventListener("play", onPlay);
     video.addEventListener("pause", onPause);
@@ -1458,6 +1626,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     video.addEventListener("volumechange", onVolumeChange);
     video.addEventListener("waiting", onWaiting);
     video.addEventListener("playing", onPlaying);
+    video.addEventListener("seeking", onSeeking);
     video.addEventListener("seeked", onSeeked);
     document.addEventListener("fullscreenchange", onFsChange);
     return () => {
@@ -1468,11 +1637,38 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       video.removeEventListener("volumechange", onVolumeChange);
       video.removeEventListener("waiting", onWaiting);
       video.removeEventListener("playing", onPlaying);
+      video.removeEventListener("seeking", onSeeking);
       video.removeEventListener("seeked", onSeeked);
       document.removeEventListener("fullscreenchange", onFsChange);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pokeControls, saveNow, maybeNextEpisode, provider, id, season, episode, showNextUp]);
+  // ---------------- deferred seek drain ----------------
+  // First-seek fix: a seek requested while duration was unseekable (NaN/Inf)
+  // is queued in deferredSeekRef instead of clamping to 0. Once metadata
+  // makes the duration seekable, replay the latest queued target through the
+  // shared dispatcher (which re-gates and pins it normally).
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const drain = () => {
+      const queued = deferredSeekRef.current;
+      if (queued == null) return;
+      const dur = transcodeActiveRef.current
+        ? totalDurationRef.current ?? manifestTotalRef.current
+        : video.duration;
+      if (!isSeekableDuration(dur)) return;
+      deferredSeekRef.current = null;
+      void seekAbsoluteRef.current(queued);
+    };
+    video.addEventListener("loadedmetadata", drain);
+    video.addEventListener("durationchange", drain);
+    return () => {
+      video.removeEventListener("loadedmetadata", drain);
+      video.removeEventListener("durationchange", drain);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ---------------- watchdog: "playing but black" fallback ----------------
   // Covers DASH and MSE-backed HLS uniformly. Triggers only on the true
@@ -1741,32 +1937,72 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
               min={0}
               max={0}
               step={1}
-              value={0}
+              defaultValue={0}
               aria-label="Seek"
               className="player-range absolute inset-0 h-full w-full cursor-pointer opacity-0"
               onPointerDown={(e) => {
+                // Only the primary pointer owns the drag; a second finger/mouse
+                // button must not hijack the preview or the pending pin.
+                if (!e.isPrimary) return;
+                if (e.pointerType === "mouse" && e.button !== 0) return;
                 draggingRef.current = true;
                 // A stale seek pin would yank the thumb back to the previous
                 // target on release; the drag preview owns the thumb now.
                 pendingSeekRef.current = null;
-                e.currentTarget.setPointerCapture?.(e.pointerId);
+                try {
+                  e.currentTarget.setPointerCapture?.(e.pointerId);
+                } catch {
+                  // Capture unavailable: pointerup/leave fallbacks below settle it.
+                }
                 pokeControls();
               }}
-              onPointerUp={(e) => commitSeekFromRange(e.currentTarget)}
-              onPointerCancel={() => {
+              onPointerUp={(e) => {
+                if (!e.isPrimary) return;
+                if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+                  try {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  } catch {
+                    // Already released — commit below still runs.
+                  }
+                }
+                commitSeekFromRange(e.currentTarget);
+              }}
+              onLostPointerCapture={(e) => {
+                // Capture loss without up/cancel: settle instead of stranding
+                // draggingRef=true. No-op after normal release (flag cleared).
+                if (draggingRef.current) commitSeekFromRange(e.currentTarget);
+              }}
+              onPointerLeave={(e) => {
+                // No-capture fallback: release outside never fires pointerup
+                // here, so buttons===0 means a missed release — commit last
+                // preview. Buttons held = drag live outside; await up/cancel.
+                if (draggingRef.current && e.buttons === 0 && e.isPrimary)
+                  commitSeekFromRange(e.currentTarget);
+              }}
+              onPointerCancel={(e) => {
+                if (!e.isPrimary) return;
                 draggingRef.current = false;
                 pendingSeekRef.current = null;
+                // No commit: rAF repaints the true position next frame.
+              }}
+              onKeyDown={(e) => {
+                // Never trap focus: Tab moves on natively; Escape blurs and
+                // bubbles to the window handler (subs/fullscreen/back).
+                // No stopPropagation/preventDefault by design.
+                if (e.key === "Escape") e.currentTarget.blur();
               }}
               onChange={(e) => {
                 const target = e.currentTarget;
                 const max = Number(target.max || 0);
                 const v = Number(target.value);
-                if (max <= 0) return;
-                const pct = Math.min(100, Math.max(0, (v / max) * 100));
+                if (!isSeekableDuration(max)) return;
+                const pct = seekProgressPct(v, max);
                 target.style.setProperty("--progress", `${pct}%`);
                 if (playedFillRef.current) playedFillRef.current.style.width = `${pct}%`;
                 if (timeRef.current) timeRef.current.textContent = formatClock(v);
                 // keyboard-driven changes never see a pointer grab: commit them
+                // (a keyboard change landing mid pointer-drag only previews;
+                // the release commits the merged final value — no seek storm)
                 if (!draggingRef.current) commitSeekFromRange(target);
               }}
             />
