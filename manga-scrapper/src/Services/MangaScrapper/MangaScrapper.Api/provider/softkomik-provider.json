@@ -1,0 +1,24 @@
+{
+  "ProviderName": "Softkomik",
+  "BaseUrl": "https://softkomik.co",
+  "ProviderIcon": "https://softkomik.co/icon.jpg",
+  "MangaSelectors": {
+    "Title": "",
+    "Author": "",
+    "Description": "",
+    "Type": "",
+    "Status": "",
+    "Genres": "",
+    "Thumbnail": ""
+  },
+  "ChapterSelectors": {
+    "Rows": "",
+    "Link": "",
+    "ChapterText": "",
+    "Views": "",
+    "UploadDate": ""
+  },
+  "PageSelectors": {
+    "Images": ""
+  }
+}

@@ -87,10 +87,14 @@ services:
       MOVIEBOX_REGION: ${MOVIEBOX_REGION:-ph}
       MOVIEBOX_PROXY_BASE: ${MOVIEBOX_PROXY_BASE:-http://localhost:3000}
       ANIME_SIDECAR_URL: "http://scraper:9798"
+      # MangaScrapper REST API over compose DNS (see `manga-api` below).
+      MANGA_API_URL: "http://manga-api:8080"
       RUST_LOG: ${RUST_LOG:-warn}
     depends_on:
       scraper:
         condition: service_started
+      manga-api:
+        condition: service_healthy
     ports:
       - "${BACKEND_HOST_PORT:-9797}:9797"
 
@@ -110,6 +114,127 @@ services:
       ROD_BIN: ${ROD_BIN:-}
     ports:
       - "${SCRAPER_HOST_PORT:-9798}:9798"
+
+  # ── Manga stack (vendored MangaScrapper) ─────────────────────────────────
+  # Same topology as prod compose, but without host port exposure for the
+  # infra (Mongo/RabbitMQ) to avoid clashing with locally running instances;
+  # override with MANGA_MONGO_HOST_PORT / MANGA_RABBITMQ_HOST_PORT if needed.
+  mongo-manga:
+    # mongo:latest (8.x) refuses to start on kernels 6.19+ (SERVER-121912);
+    # 7.x is the newest line compatible with this host kernel.
+    image: mongo:7
+    environment:
+      MONGO_INITDB_DATABASE: manga-scrap
+    volumes:
+      - manga-mongo-data-dev:/data/db
+    # Exposed for the locally-run MangaScrapper API (dotnet run), matching its
+    # appsettings default of mongodb://localhost:27017.
+    ports:
+      - "${MANGA_MONGO_HOST_PORT:-27017}:27017"
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 })' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  rabbitmq-manga:
+    image: rabbitmq:3-management
+    volumes:
+      - manga-rabbitmq-data-dev:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+    ports:
+      - "${MANGA_RABBITMQ_HOST_PORT:-5672}:5672"
+      - "${MANGA_RABBITMQ_MGMT_HOST_PORT:-}:15672"
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    # Exposed for the locally-run MangaScrapper API (Cloudflare bypass),
+    # matching its appsettings default of http://localhost:8191.
+    ports:
+      - "${FLARESOLVERR_HOST_PORT:-8191}:8191"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8191/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # MangaScrapper REST API. Built from the vendored repo (no .NET SDK
+  # hot-reload here; rebuild with `docker compose -f docker-compose.dev.yml
+  # build manga-api manga-worker` after editing its sources).
+  manga-api:
+    build:
+      context: ./manga-scrapper
+      dockerfile: src/Services/MangaScrapper/MangaScrapper.Api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mongo-manga:
+        condition: service_healthy
+      rabbitmq-manga:
+        condition: service_healthy
+      flaresolverr:
+        condition: service_started
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      MongoDB__ConnectionString: mongodb://mongo-manga:27017
+      MongoDB__DatabaseName: manga-scrap
+      FlareSolverr__Host: http://flaresolverr:8191
+      Messaging__RabbitMQ__Host: rabbitmq-manga
+      Messaging__RabbitMQ__Port: "5672"
+      Messaging__RabbitMQ__Username: guest
+      Messaging__RabbitMQ__Password: guest
+      Scrapper__ImageStoragePath: /app/images
+      Scrapper__MaxParallelDownloads: "10"
+      Cors__AllowedOrigins: http://localhost:3000
+      RateLimiting__Enabled: "true"
+    volumes:
+      - manga-images-dev:/app/images
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    ports:
+      - "${MANGA_API_HOST_PORT:-}:8080"
+
+  # Hangfire scraping worker — downloads chapters into the shared images
+  # volume and keeps MangaScrapper's Mongo in sync with the source sites.
+  manga-worker:
+    build:
+      context: ./manga-scrapper
+      dockerfile: src/Workers/Scrapper.Worker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mongo-manga:
+        condition: service_healthy
+      rabbitmq-manga:
+        condition: service_healthy
+      flaresolverr:
+        condition: service_started
+      manga-api:
+        condition: service_healthy
+    environment:
+      DOTNET_ENVIRONMENT: Development
+      MongoDB__ConnectionString: mongodb://mongo-manga:27017
+      MongoDB__DatabaseName: manga-scrap
+      FlareSolverr__Host: http://flaresolverr:8191
+      Messaging__RabbitMQ__Host: rabbitmq-manga
+      Messaging__RabbitMQ__Port: "5672"
+      Messaging__RabbitMQ__Username: guest
+      Messaging__RabbitMQ__Password: guest
+      Scrapper__ImageStoragePath: /app/images
+      Scrapper__MaxParallelDownloads: "10"
+      Scrapper__ApiBaseUrl: http://manga-api:8080
+    volumes:
+      - manga-images-dev:/app/images
+
   # Next.js dev server. Talks to the compose services over DNS; browsers hit
   # localhost:3000 on the host.
   web:
@@ -144,3 +269,6 @@ volumes:
   cargo-registry:
   cargo-target:
   go-mod-cache:
+  manga-mongo-data-dev:
+  manga-rabbitmq-data-dev:
+  manga-images-dev:

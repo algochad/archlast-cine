@@ -8,15 +8,16 @@ datasource db {
 }
 
 model User {
-  id           Int           @id @default(autoincrement())
-  email        String        @unique
-  name         String
-  passwordHash String
-  region       String        @default("ph")
-  provider     String        @default("moviebox")
-  createdAt    DateTime      @default(now())
-  history      WatchHistory[]
-  myList       MyList[]
+  id             Int              @id @default(autoincrement())
+  email          String           @unique
+  name           String
+  passwordHash   String
+  region         String           @default("ph")
+  provider       String           @default("moviebox")
+  createdAt      DateTime         @default(now())
+  history        WatchHistory[]
+  readingHistory ReadingHistory[]
+  myList         MyList[]
 }
 
 model WatchHistory {
@@ -36,6 +37,24 @@ model WatchHistory {
   updatedAt BigInt
 
   @@unique([userId, provider, mediaId, season, episode])
+}
+
+model ReadingHistory {
+  id         Int      @id @default(autoincrement())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     Int
+  provider   String
+  mediaId    String
+  title      String
+  poster     String?
+  mediaType  String
+  year       String?
+  chapter    Int      @default(0)
+  page       Int      @default(0)
+  totalPages Int      @default(0)
+  updatedAt  BigInt
+
+  @@unique([userId, provider, mediaId, chapter])
 }
 
 model MyList {

@@ -7,9 +7,13 @@ import type {
   AccountState,
   AccountUser,
   MyListItem,
+  ReadingEntry,
   RegionId,
   WatchEntry,
 } from "@/lib/account";
+
+/** A reading entry as the client sends it (the server stamps updatedAt). */
+export type ReadingEntryInput = Omit<ReadingEntry, "updatedAt">;
 
 export interface AccountConfig {
   availableRegions: RegionId[];
@@ -93,6 +97,20 @@ export const accountApi = {
 
   removeHistory: (provider: string, id: string, season?: number, episode?: number) =>
     request<void>(`/history${query({ provider, id, season, episode })}`, { method: "DELETE" }),
+
+  readingHistory: async () => (await request<{ entries: ReadingEntry[] }>("/reading-history")).entries,
+
+  recordReading: async (entry: ReadingEntryInput) =>
+    (await request<{ entry: ReadingEntry }>("/reading-history", { method: "POST", body: JSON.stringify({ entry }) })).entry,
+
+  importReadingHistory: (entries: ReadingEntryInput[]) =>
+    request<{ count: number }>("/reading-history/import", {
+      method: "POST",
+      body: JSON.stringify({ entries }),
+    }),
+
+  removeReadingHistory: (provider: string, id: string, chapter?: number) =>
+    request<void>(`/reading-history${query({ provider, id, chapter })}`, { method: "DELETE" }),
 
   mylist: async () => (await request<{ items: MyListItem[] }>("/mylist")).items,
 

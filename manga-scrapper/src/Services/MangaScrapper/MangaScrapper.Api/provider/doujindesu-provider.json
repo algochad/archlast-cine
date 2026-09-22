@@ -1,0 +1,26 @@
+{
+  "ProviderName": "DoujinDesu",
+  "BaseUrl": "https://doujin.desu.xxx",
+  "ProviderIcon": "https://pic.desu.xxx/content/web/1217a30e-c660-4212-9d80-548df7aa166d.webp",
+  "AppSecret": "dfdf72051dbfdc7d76889ebd31324e74",
+  "Salt": "doujindesu-scrapers-cannot-read-this-super-secret-salt-2026-v2",
+  "MangaSelectors": {
+    "Title": "",
+    "Author": "",
+    "Description": "",
+    "Type": "",
+    "Status": "",
+    "Genres": "",
+    "Thumbnail": ""
+  },
+  "ChapterSelectors": {
+    "Rows": "",
+    "Link": "",
+    "ChapterText": "",
+    "Views": "",
+    "UploadDate": ""
+  },
+  "PageSelectors": {
+    "Images": ""
+  }
+}

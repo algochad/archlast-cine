@@ -1,0 +1,244 @@
+<div class="space-y-3 sm:space-y-4">
+    <div class="flex gap-1.5 sm:gap-2 p-1 bg-surface border border-border-main rounded-xl overflow-x-auto">
+        @foreach (var mode in new[] { "Custom", "Minutes", "Hourly", "Daily", "Weekly", "Monthly" })
+        {
+            <button type="button" @onclick="() => SetMode(mode)" 
+                    class="px-3 sm:px-4 py-1.5 rounded-lg text-xs font-bold transition-all whitespace-nowrap @(CurrentMode == mode ? "bg-primary text-white shadow-sm shadow-primary/20" : "text-slate-500 hover:bg-bg-app")">
+                @mode
+            </button>
+        }
+    </div>
+
+    <!-- Mode Panels -->
+    <div class="p-3 sm:p-4 bg-bg-app border border-border-main rounded-xl">
+        
+        @if (CurrentMode == "Custom")
+        {
+            <div class="space-y-2">
+                <input type="text" @bind="CronExpression" @bind:event="oninput" @onkeyup="HandleCustomChange"
+                       class="w-full px-3.5 py-2 bg-surface text-text-main border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary font-mono"
+                       placeholder="e.g. 0 0 * * *" />
+            </div>
+        }
+        else if (CurrentMode == "Minutes")
+        {
+            <div class="flex flex-wrap items-center gap-2 sm:gap-3">
+                <span class="text-xs sm:text-sm text-text-main font-medium">Every</span>
+                <input type="number" min="1" max="59" @bind="minutesInterval" @bind:event="oninput" @onkeyup="UpdateMinutesCron" @onchange="UpdateMinutesCron"
+                       class="w-16 sm:w-20 px-2.5 sm:px-3 py-1.5 bg-surface text-text-main border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary text-center" />
+                <span class="text-xs sm:text-sm text-text-main font-medium">minutes</span>
+            </div>
+        }
+        else if (CurrentMode == "Hourly")
+        {
+            <div class="flex flex-wrap items-center gap-2 sm:gap-3">
+                <span class="text-xs sm:text-sm text-text-main font-medium">Every</span>
+                <input type="number" min="1" max="23" @bind="hourlyInterval" @bind:event="oninput" @onkeyup="UpdateHourlyCron" @onchange="UpdateHourlyCron"
+                       class="w-16 sm:w-20 px-2.5 sm:px-3 py-1.5 bg-surface text-text-main border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary text-center" />
+                <span class="text-xs sm:text-sm text-text-main font-medium">hours</span>
+            </div>
+        }
+        else if (CurrentMode == "Daily")
+        {
+            <div class="flex flex-wrap items-center gap-2 sm:gap-3">
+                <span class="text-xs sm:text-sm text-text-main font-medium">Every day at</span>
+                <input type="time" @bind="dailyTime" @bind:event="oninput" @onchange="UpdateDailyCron"
+                       class="px-2.5 sm:px-3 py-1.5 bg-surface text-text-main border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary" />
+            </div>
+        }
+        else if (CurrentMode == "Weekly")
+        {
+            <div class="space-y-3 sm:space-y-4">
+                <div class="flex flex-wrap gap-1.5 sm:gap-2">
+                    @foreach (var day in new[] { "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN" })
+                    {
+                        <button type="button" @onclick="() => ToggleDay(day)" 
+                                class="px-2.5 sm:px-3 py-1 rounded-lg text-[11px] sm:text-xs font-semibold transition-all border @(selectedDays.Contains(day) ? "bg-primary border-primary text-white" : "bg-surface border-border-main text-slate-500 hover:border-slate-400")">
+                            @day
+                        </button>
+                    }
+                </div>
+                <div class="flex flex-wrap items-center gap-2 sm:gap-3">
+                    <span class="text-xs sm:text-sm text-text-main font-medium">at</span>
+                    <input type="time" @bind="weeklyTime" @bind:event="oninput" @onchange="UpdateWeeklyCron"
+                           class="px-2.5 sm:px-3 py-1.5 bg-surface text-text-main border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary" />
+                </div>
+            </div>
+        }
+        else if (CurrentMode == "Monthly")
+        {
+            <div class="flex flex-wrap items-center gap-2 sm:gap-3">
+                <span class="text-xs sm:text-sm text-text-main font-medium">On day</span>
+                <input type="number" min="1" max="31" @bind="monthDay" @bind:event="oninput" @onkeyup="UpdateMonthlyCron" @onchange="UpdateMonthlyCron"
+                       class="w-16 sm:w-20 px-2.5 sm:px-3 py-1.5 bg-surface text-text-main border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary text-center" />
+                <span class="text-xs sm:text-sm text-text-main font-medium">at</span>
+                <input type="time" @bind="monthlyTime" @bind:event="oninput" @onchange="UpdateMonthlyCron"
+                       class="px-2.5 sm:px-3 py-1.5 bg-surface text-text-main border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary" />
+            </div>
+        }
+
+    </div>
+
+    <!-- Preview -->
+    <div class="p-3 bg-surface border border-border-main rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div>
+            <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-0.5">Generated Cron</p>
+            <p class="text-xs sm:text-sm font-mono text-text-main font-semibold break-all">@CronExpression</p>
+        </div>
+        <div class="text-[11px] sm:text-xs text-primary font-medium bg-primary/10 px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-lg border border-primary/20 self-start sm:self-auto">
+            @GetFriendlyDescription()
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter]
+    public string CronExpression { get; set; } = "0 * * * *";
+
+    [Parameter]
+    public EventCallback<string> CronExpressionChanged { get; set; }
+
+    private string CurrentMode { get; set; } = "Custom";
+
+    // Mode States
+    private int minutesInterval = 15;
+    private int hourlyInterval = 4;
+    private DateOnly dummyDate = new DateOnly(2023, 1, 1);
+    private TimeOnly dailyTime = new TimeOnly(0, 0);
+    private List<string> selectedDays = new();
+    private TimeOnly weeklyTime = new TimeOnly(0, 0);
+    private int monthDay = 1;
+    private TimeOnly monthlyTime = new TimeOnly(0, 0);
+
+    protected override void OnInitialized()
+    {
+        // Try to guess mode based on expression
+        if (CronExpression.StartsWith("*/") && CronExpression.EndsWith("* * * *"))
+        {
+            var parts = CronExpression.Split(' ');
+            if (parts.Length > 0 && parts[0].StartsWith("*/") && int.TryParse(parts[0].Substring(2), out var m))
+            {
+                minutesInterval = m;
+                CurrentMode = "Minutes";
+            }
+        }
+        else if (CronExpression.StartsWith("0 */") && CronExpression.EndsWith("* * *"))
+        {
+            var parts = CronExpression.Split(' ');
+            if (parts.Length > 1 && parts[1].StartsWith("*/") && int.TryParse(parts[1].Substring(2), out var h))
+            {
+                hourlyInterval = h;
+                CurrentMode = "Hourly";
+            }
+        }
+        else if (CronExpression.EndsWith("* * *") && !CronExpression.Contains("/"))
+        {
+            var parts = CronExpression.Split(' ');
+            if (parts.Length == 5 && int.TryParse(parts[0], out var m) && int.TryParse(parts[1], out var h))
+            {
+                dailyTime = new TimeOnly(h, m);
+                CurrentMode = "Daily";
+            }
+        }
+    }
+
+    private async Task SetMode(string mode)
+    {
+        CurrentMode = mode;
+        if (mode == "Minutes") await UpdateMinutesCron();
+        else if (mode == "Hourly") await UpdateHourlyCron();
+        else if (mode == "Daily") await UpdateDailyCron();
+        else if (mode == "Weekly") await UpdateWeeklyCron();
+        else if (mode == "Monthly") await UpdateMonthlyCron();
+    }
+
+    private async Task HandleCustomChange()
+    {
+        await CronExpressionChanged.InvokeAsync(CronExpression);
+    }
+
+    private async Task UpdateMinutesCron()
+    {
+        var m = Math.Max(1, Math.Min(59, minutesInterval));
+        CronExpression = $"*/{m} * * * *";
+        await CronExpressionChanged.InvokeAsync(CronExpression);
+    }
+
+    private async Task UpdateHourlyCron()
+    {
+        var h = Math.Max(1, Math.Min(23, hourlyInterval));
+        CronExpression = $"0 */{h} * * *";
+        await CronExpressionChanged.InvokeAsync(CronExpression);
+    }
+
+    private async Task UpdateDailyCron()
+    {
+        CronExpression = $"{dailyTime.Minute} {dailyTime.Hour} * * *";
+        await CronExpressionChanged.InvokeAsync(CronExpression);
+    }
+
+    private async Task ToggleDay(string day)
+    {
+        if (selectedDays.Contains(day)) selectedDays.Remove(day);
+        else selectedDays.Add(day);
+        await UpdateWeeklyCron();
+    }
+
+    private async Task UpdateWeeklyCron()
+    {
+        var daysStr = selectedDays.Any() ? string.Join(",", selectedDays) : "*";
+        CronExpression = $"{weeklyTime.Minute} {weeklyTime.Hour} * * {daysStr}";
+        await CronExpressionChanged.InvokeAsync(CronExpression);
+    }
+
+    private async Task UpdateMonthlyCron()
+    {
+        var md = Math.Max(1, Math.Min(31, monthDay));
+        CronExpression = $"{monthlyTime.Minute} {monthlyTime.Hour} {md} * *";
+        await CronExpressionChanged.InvokeAsync(CronExpression);
+    }
+
+    private string GetFriendlyDescription()
+    {
+        var parts = CronExpression.Split(' ');
+        if (parts.Length != 5) return "Invalid Cron";
+
+        var min = parts[0];
+        var hour = parts[1];
+        var dayOfMonth = parts[2];
+        var month = parts[3];
+        var dayOfWeek = parts[4];
+
+        if (min.StartsWith("*/") && hour == "*" && dayOfMonth == "*" && month == "*" && dayOfWeek == "*")
+            return $"Every {min.Substring(2)} minutes";
+            
+        if (min == "0" && hour.StartsWith("*/") && dayOfMonth == "*" && month == "*" && dayOfWeek == "*")
+            return $"Every {hour.Substring(2)} hours at minute 0";
+
+        if (dayOfMonth == "*" && month == "*" && dayOfWeek == "*")
+        {
+            if (int.TryParse(min, out var m) && int.TryParse(hour, out var h))
+            {
+                return $"Every day at {h:D2}:{m:D2}";
+            }
+        }
+
+        if (dayOfMonth == "*" && month == "*" && dayOfWeek != "*")
+        {
+            if (int.TryParse(min, out var m) && int.TryParse(hour, out var h))
+            {
+                return $"At {h:D2}:{m:D2} on {dayOfWeek}";
+            }
+        }
+
+        if (dayOfMonth != "*" && dayOfMonth != "?" && month == "*" && dayOfWeek == "*")
+        {
+            if (int.TryParse(min, out var m) && int.TryParse(hour, out var h))
+            {
+                return $"On day {dayOfMonth} of month at {h:D2}:{m:D2}";
+            }
+        }
+
+        return "Custom Schedule";
+    }
+}

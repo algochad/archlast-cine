@@ -61,6 +61,22 @@ export interface MyListItem {
   addedAt: number;
 }
 
+export interface ReadingEntry {
+  provider: string;
+  id: string;
+  title: string;
+  poster: string | null;
+  /** "manga" for the MangaScrapper reader. */
+  mediaType: MediaType;
+  year: string | null;
+  chapter: number;
+  /** 1-based page within the chapter (0 = unknown). */
+  page: number;
+  totalPages: number;
+  /** Unix ms of last update. */
+  updatedAt: number;
+}
+
 // ---- Nest v1 REST contract (internal, Bearer JWT) -------------------------
 // POST /v1/auth/register {email,name,password} -> 201 AccountState
 // POST /v1/auth/login     {email,password} -> {accessToken} & AccountState

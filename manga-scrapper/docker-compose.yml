@@ -1,0 +1,186 @@
+version: '3.9'
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: src/Services/MangaScrapper/MangaScrapper.Api/Dockerfile
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ports:
+      - "5191:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - Serilog__MinimumLevel__Override__Serilog.AspNetCore.RequestLoggingMiddleware=Warning
+      - MongoDB__ConnectionString=mongodb://mongodb:27017
+      - MongoDB__DatabaseName=manga-scrap
+      - Meili__Host=http://meilisearch:7700
+      - Qdrant__Host=http://qdrant
+      - Qdrant__Port=6334
+      - Embedding__Host=http://embedding-service:8222
+      - FlareSolverr__Host=http://flaresolverr:8191
+      - Messaging__RabbitMQ__Host=rabbitmq
+      - Messaging__RabbitMQ__Port=5672
+      - Messaging__RabbitMQ__Username=guest
+      - Messaging__RabbitMQ__Password=guest
+      - Scrapper__ImageStoragePath=/app/images
+      - Scrapper__MaxParallelDownloads=10
+      - Observability__AspireDashboard__Enabled=true
+      - Observability__AspireDashboard__Endpoint=http://aspire-dashboard:18889
+      - Observability__UsePrometheus__Enabled=false
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://aspire-dashboard:18889
+      - OTEL_SERVICE_NAME=prod-manga-api
+      - Cors__AllowedOrigins=http://localhost:3000,http://localhost:5191
+      - RateLimiting__Enabled=true
+      - RateLimiting__Global__PermitLimit=300
+      - RateLimiting__Global__WindowSeconds=60
+      - RateLimiting__Default__PermitLimit=120
+      - RateLimiting__Default__WindowSeconds=60
+      - RateLimiting__MangaView__PermitLimit=30
+      - RateLimiting__MangaView__WindowSeconds=60
+      - RateLimiting__SemanticSearch__PermitLimit=15
+      - RateLimiting__SemanticSearch__WindowSeconds=60
+      - RateLimiting__VectorSearch__PermitLimit=30
+      - RateLimiting__VectorSearch__WindowSeconds=60
+      - RateLimiting__Auth__PermitLimit=10
+      - RateLimiting__Auth__WindowSeconds=60
+      - RateLimiting__Scraping__PermitLimit=20
+      - RateLimiting__Scraping__WindowSeconds=60
+      - RateLimiting__ImageProxy__PermitLimit=100
+      - RateLimiting__ImageProxy__WindowSeconds=60
+      - TZ=Asia/Jakarta
+    volumes:
+      - ./images:/app/images
+      - ./logs:/app/logs
+      - ./keys:/app/keys
+
+  worker:
+    build:
+      context: .
+      dockerfile: src/Workers/Scrapper.Worker/Dockerfile
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - DOTNET_ENVIRONMENT=Production
+      - MongoDB__ConnectionString=mongodb://mongodb:27017
+      - MongoDB__DatabaseName=manga-scrap
+      - Meili__Host=http://meilisearch:7700
+      - Qdrant__Host=http://qdrant
+      - Qdrant__Port=6334
+      - Embedding__Host=http://embedding-service:8222
+      - FlareSolverr__Host=http://flaresolverr:8191
+      - Messaging__RabbitMQ__Host=rabbitmq
+      - Messaging__RabbitMQ__Port=5672
+      - Messaging__RabbitMQ__Username=guest
+      - Messaging__RabbitMQ__Password=guest
+      - Scrapper__ImageStoragePath=/app/images
+      - Scrapper__MaxParallelDownloads=10
+      - Scrapper__ApiBaseUrl=http://api:8080
+      - Observability__AspireDashboard__Enabled=true
+      - Observability__AspireDashboard__Endpoint=http://aspire-dashboard:18889
+      - Observability__UsePrometheus__Enabled=false
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://aspire-dashboard:18889
+      - OTEL_SERVICE_NAME=prod-manga-worker
+      - TZ=Asia/Jakarta
+    volumes:
+      - ./images:/app/images
+      - ./logs:/app/logs
+      - ./keys:/app/keys
+
+  aspire-dashboard:
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:latest
+    container_name: aspire-dashboard
+    profiles:
+      - optional
+    restart: unless-stopped
+    ports:
+      - "18888:18888" # Aspire Dashboard UI
+      - "18889:18889" # OTLP gRPC endpoint
+    environment:
+      - DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true
+      - DASHBOARD__FRONTEND__AUTHMODE=Unsecured
+      - DASHBOARD__OTLP__AUTHMODE=Unsecured
+
+  mongodb:
+    image: mongo:latest
+    profiles:
+      - optional
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    environment:
+      - MONGO_INITDB_DATABASE=manga-scrap
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    profiles:
+      - optional
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    profiles:
+      - optional
+    container_name: meilisearch
+    ports:
+      - "7700:7700"
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili_data:/meili_data
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    profiles:
+      - optional
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    profiles:
+      - optional
+    container_name: flaresolverr
+    ports:
+      - "8191:8191"
+
+  embedding-service:
+    build:
+      context: ./embedding-service
+      dockerfile: Dockerfile
+    profiles:
+      - optional
+    container_name: embedding-service
+    ports:
+      - "8222:8222"
+    environment:
+      - TZ=Asia/Jakarta
+      - MODEL_PATH=/app/models/model.onnx
+      - TOKENIZER_PATH=/app/models/tokenizer.json
+    volumes:
+      - ./embedding-service/models:/app/models
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+  rabbitmq_data:
+  meili_data:
+  qdrant_data:

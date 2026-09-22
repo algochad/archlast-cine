@@ -1,0 +1,16 @@
+version: '3.9'
+services:
+  embedding-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8222:8222"
+    environment:
+      - TZ=Asia/Jakarta
+      - MODEL_PATH=/app/models/model.onnx
+      - TOKENIZER_PATH=/app/models/tokenizer.json
+    volumes:
+      - ./models:/app/models
+    restart: unless-stopped
+

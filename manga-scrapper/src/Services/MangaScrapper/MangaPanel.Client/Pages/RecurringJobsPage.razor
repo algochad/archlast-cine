@@ -1,0 +1,336 @@
+@page "/admin/recurring-jobs"
+@rendermode @(new InteractiveWebAssemblyRenderMode(prerender: false))
+@layout Layout.AdminLayout
+@using System.Net.Http.Json
+@using MangaPanel.Client.Components
+@attribute [Authorize]
+@inject HttpClient Http
+
+<div class="space-y-4 sm:space-y-6 opacity-0 animate-backdrop-in">
+    <!-- Header Area -->
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+        <div>
+            <h1 class="text-xl sm:text-2xl font-bold text-text-main">Recurring Jobs</h1>
+            <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400">Manage background scraping tasks</p>
+        </div>
+
+        <button @onclick="OpenCreateModal" class="flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-white text-xs sm:text-sm font-semibold rounded-xl hover:bg-primary/90 transition-all shadow-md shadow-primary/20 w-full sm:w-auto">
+            <svg class="w-4 h-4 sm:w-5 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+            </svg>
+            Add New Job
+        </button>
+    </div>
+
+    @if (isLoading)
+    {
+        <div class="flex flex-col items-center justify-center py-16 sm:py-24">
+            <div class="animate-spin rounded-full h-10 w-10 sm:h-12 sm:w-12 border-b-2 border-primary mb-4"></div>
+            <p class="text-xs sm:text-sm text-slate-500 font-medium">Fetching jobs...</p>
+        </div>
+    }
+    else if (jobs == null || !jobs.Any())
+    {
+        <div class="bg-surface rounded-2xl border border-border-main p-8 sm:p-12 text-center space-y-4">
+            <div class="w-16 h-16 sm:w-20 sm:h-20 bg-bg-app rounded-full flex items-center justify-center mx-auto">
+                <svg class="w-8 h-8 sm:w-10 sm:h-10 text-slate-300 dark:text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+            </div>
+            <h3 class="text-base sm:text-lg font-bold text-text-main">No jobs found</h3>
+            <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400">No recurring jobs have been scheduled yet.</p>
+        </div>
+    }
+    else
+    {
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
+            @foreach (var job in jobs)
+            {
+                <div class="bg-surface rounded-2xl p-5 sm:p-6 border border-border-main shadow-sm flex flex-col justify-between hover:border-primary/50 transition-colors">
+                    <div class="mb-4">
+                        <div class="flex items-center justify-between mb-2 gap-2">
+                            <h3 class="font-bold text-text-main text-base sm:text-lg truncate">@job.Id</h3>
+                            <span class="text-[10px] sm:text-xs px-2 py-0.5 sm:py-1 bg-primary/10 text-primary font-bold rounded-lg uppercase tracking-wider flex-shrink-0">
+                                @job.Queue
+                            </span>
+                        </div>
+                        <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mb-4 truncate">
+                            <span class="font-semibold">Cron:</span> @job.Cron
+                        </p>
+                        
+                        <div class="space-y-1.5 sm:space-y-1">
+                            <div class="flex justify-between text-xs text-slate-500">
+                                <span>Last Run:</span>
+                                <span class="font-semibold text-slate-700 dark:text-slate-300">@(job.LastExecution?.ToLocalTime().ToString("g") ?? "Never")</span>
+                            </div>
+                            <div class="flex justify-between text-xs text-slate-500">
+                                <span>Next Run:</span>
+                                <span class="font-semibold text-slate-700 dark:text-slate-300">@(job.NextExecution?.ToLocalTime().ToString("g") ?? "Not Scheduled")</span>
+                            </div>
+                            <div class="flex justify-between text-xs text-slate-500">
+                                <span>State:</span>
+                                <span class="font-semibold @(job.LastJobState == "Succeeded" ? "text-emerald-500" : "text-amber-500")">
+                                    @(string.IsNullOrEmpty(job.LastJobState) ? "Pending" : job.LastJobState)
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="flex justify-end gap-2 pt-3 sm:pt-4 border-t border-border-main">
+                        <button @onclick="() => TriggerJob(job)" class="p-2 text-emerald-500 hover:bg-emerald-50 dark:hover:bg-emerald-950/30 rounded-lg transition-colors" title="Trigger Now">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        </button>
+                        <button @onclick="() => OpenEditModal(job)" class="p-2 text-indigo-500 hover:bg-indigo-50 dark:hover:bg-indigo-950/30 rounded-lg transition-colors" title="Edit Job">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                        </button>
+                        <button @onclick="() => ConfirmDelete(job)" class="p-2 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/30 rounded-lg transition-colors" title="Delete Job">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                        </button>
+                    </div>
+                </div>
+            }
+        </div>
+    }
+</div>
+
+@if (showModal)
+{
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/50 backdrop-blur-sm transition-opacity">
+        <div class="bg-surface rounded-2xl w-full max-w-md shadow-2xl border border-border-main max-h-[90vh] overflow-y-auto animate-in zoom-in-95 duration-200">
+            <div class="p-4 sm:p-6 border-b border-border-main flex justify-between items-center sticky top-0 bg-surface z-10">
+                <h3 class="text-lg sm:text-xl font-bold text-text-main">@(isEditing ? "Edit" : "Create") Recurring Job</h3>
+                <button @onclick="CloseModal" class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-1">
+                    <svg class="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            
+            <form @onsubmit="SaveJob" class="p-4 sm:p-6 space-y-4">
+                @if(!string.IsNullOrEmpty(errorMessage))
+                {
+                    <div class="p-3 rounded-xl bg-rose-50 dark:bg-rose-950/30 text-rose-600 dark:text-rose-400 text-xs sm:text-sm font-medium border border-rose-200 dark:border-rose-900/50">
+                        @errorMessage
+                    </div>
+                }
+
+                <div class="space-y-1.5">
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Job ID</label>
+                    <input type="text" @bind="currentJob.JobId" disabled="@isEditing" required class="w-full px-3.5 py-2 bg-bg-app border border-border-main rounded-xl focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all text-xs sm:text-sm text-text-main disabled:opacity-50" placeholder="e.g. komiku-daily-scrape" />
+                </div>
+
+                <div class="space-y-1.5 pt-1 pb-1">
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Cron Expression</label>
+                    <CronBuilder @bind-CronExpression="currentJob.CronExpression" />
+                </div>
+
+                <div class="space-y-1.5">
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Provider</label>
+                    <select @bind="currentJob.Provider" required class="w-full px-3.5 py-2 bg-bg-app border border-border-main rounded-xl focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all text-xs sm:text-sm text-text-main">
+                        <option value="komiku">Komiku</option>
+                        <option value="kiryuu">Kiryuu</option>
+                    </select>
+                </div>
+
+                <div class="space-y-1.5">
+                    <label class="text-xs font-bold text-slate-500 uppercase tracking-widest">Pages to Scrape</label>
+                    <input type="number" min="1" max="10" @bind="currentJob.ScrapLastTotalPage" required class="w-full px-3.5 py-2 bg-bg-app border border-border-main rounded-xl focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all text-xs sm:text-sm text-text-main" />
+                </div>
+
+                <div class="flex justify-end gap-2.5 sm:gap-3 pt-4 sm:pt-6">
+                    <button type="button" @onclick="CloseModal" class="px-4 sm:px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300 bg-bg-app hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">Cancel</button>
+                    <button type="submit" disabled="@isSubmitting" class="px-4 sm:px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-white bg-primary hover:bg-primary/90 transition-colors disabled:opacity-50 flex items-center gap-2">
+                        @if (isSubmitting)
+                        {
+                            <span class="animate-spin w-4 h-4 border-2 border-white/20 border-t-white rounded-full"></span>
+                        }
+                        @(isEditing ? "Update Job" : "Create Job")
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+}
+
+@if (showDeleteConfirm)
+{
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/50 backdrop-blur-sm transition-opacity">
+        <div class="bg-surface rounded-2xl w-full max-w-sm shadow-2xl border border-border-main p-5 sm:p-6 text-center animate-in zoom-in-95 duration-200">
+            <div class="w-14 h-14 sm:w-16 sm:h-16 bg-rose-100 dark:bg-rose-500/10 rounded-full flex items-center justify-center mx-auto mb-4 text-rose-500">
+                <svg class="w-7 h-7 sm:w-8 sm:h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+            </div>
+            <h3 class="text-lg sm:text-xl font-bold text-text-main mb-2">Delete Job?</h3>
+            <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mb-6">Are you sure you want to delete <span class="font-bold text-text-main break-all">@jobToDelete?.Id</span>? This action cannot be undone.</p>
+            
+            <div class="flex justify-center gap-3">
+                <button @onclick="() => showDeleteConfirm = false" class="px-4 sm:px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-slate-600 dark:text-slate-300 bg-bg-app hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">Cancel</button>
+                <button @onclick="DeleteJob" disabled="@isDeleting" class="px-4 sm:px-5 py-2.5 rounded-xl text-xs sm:text-sm font-semibold text-white bg-rose-500 hover:bg-rose-600 transition-colors disabled:opacity-50">
+                    @(isDeleting ? "Deleting..." : "Yes, Delete")
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private List<RecurringJobDto> jobs = new();
+    private bool isLoading = true;
+    private bool showModal = false;
+    private bool showDeleteConfirm = false;
+    private bool isEditing = false;
+    private bool isSubmitting = false;
+    private bool isDeleting = false;
+    private string errorMessage = "";
+    
+    private JobRequest currentJob = new();
+    private RecurringJobDto? jobToDelete;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadJobs();
+    }
+
+    private async Task LoadJobs()
+    {
+        isLoading = true;
+        try
+        {
+            jobs = await Http.GetApiDataAsync<List<RecurringJobDto>>("/api/v1/recurring-jobs") ?? new();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading jobs: {ex.Message}");
+        }
+        finally
+        {
+            isLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    private void OpenCreateModal()
+    {
+        isEditing = false;
+        errorMessage = "";
+        currentJob = new JobRequest 
+        { 
+            Provider = "komiku",
+            ScrapLastTotalPage = 1,
+            CronExpression = "0 */4 * * *"
+        };
+        showModal = true;
+    }
+
+    private void OpenEditModal(RecurringJobDto job)
+    {
+        isEditing = true;
+        errorMessage = "";
+        
+        var provider = job.Id.ToLower().Contains("kiryuu") ? "kiryuu" : "komiku";
+        
+        currentJob = new JobRequest
+        {
+            JobId = job.Id,
+            CronExpression = job.Cron,
+            Provider = provider,
+            ScrapLastTotalPage = 1
+        };
+        showModal = true;
+    }
+
+    private void CloseModal()
+    {
+        showModal = false;
+    }
+
+    private async Task SaveJob()
+    {
+        isSubmitting = true;
+        errorMessage = "";
+
+        try
+        {
+            var response = await Http.PostAsJsonAsync("/api/v1/recurring-jobs", currentJob);
+            if (response.IsSuccessStatusCode)
+            {
+                showModal = false;
+                await LoadJobs();
+            }
+            else
+            {
+                errorMessage = "Failed to save job. Check your cron expression format.";
+            }
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            isSubmitting = false;
+        }
+    }
+
+    private void ConfirmDelete(RecurringJobDto job)
+    {
+        jobToDelete = job;
+        showDeleteConfirm = true;
+    }
+
+    private async Task DeleteJob()
+    {
+        if (jobToDelete == null) return;
+        
+        isDeleting = true;
+        try
+        {
+            var response = await Http.DeleteAsync($"/api/v1/recurring-jobs/{jobToDelete.Id}");
+            if (response.IsSuccessStatusCode)
+            {
+                showDeleteConfirm = false;
+                await LoadJobs();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error deleting job: {ex.Message}");
+        }
+        finally
+        {
+            isDeleting = false;
+        }
+    }
+
+    private async Task TriggerJob(RecurringJobDto job)
+    {
+        try
+        {
+            var response = await Http.GetAsync($"/api/v1/recurring-jobs/{job.Id}/trigger");
+            if (response.IsSuccessStatusCode)
+            {
+                await LoadJobs();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error triggering job: {ex.Message}");
+        }
+    }
+
+    public class RecurringJobDto
+    {
+        public string Id { get; set; } = string.Empty;
+        public string Cron { get; set; } = string.Empty;
+        public string Queue { get; set; } = string.Empty;
+        public DateTime? NextExecution { get; set; }
+        public DateTime? LastExecution { get; set; }
+        public string LastJobState { get; set; } = string.Empty;
+        public DateTime? CreatedAt { get; set; }
+    }
+
+    public class JobRequest
+    {
+        public string JobId { get; set; } = string.Empty;
+        public string CronExpression { get; set; } = string.Empty;
+        public string Provider { get; set; } = string.Empty;
+        public int ScrapLastTotalPage { get; set; } = 1;
+    }
+}

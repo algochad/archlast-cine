@@ -1,0 +1,17 @@
+@using MangaPanel.Client.Components
+@inherits LayoutComponentBase
+
+<div class="flex h-screen overflow-hidden bg-bg-app text-text-main transition-colors duration-300">
+    <!-- Desktop Sidebar -->
+    <AdminSidebar @rendermode="new InteractiveWebAssemblyRenderMode(prerender: false)" />
+
+    <!-- Main Content Area -->
+    <main class="flex-grow flex flex-col min-w-0 overflow-y-auto">
+        <!-- Header & Mobile Drawer -->
+        <AdminHeader @rendermode="new InteractiveWebAssemblyRenderMode(prerender: false)" />
+
+        <div class="p-4 sm:p-6 lg:p-8 flex-grow">
+            @Body
+        </div>
+    </main>
+</div>

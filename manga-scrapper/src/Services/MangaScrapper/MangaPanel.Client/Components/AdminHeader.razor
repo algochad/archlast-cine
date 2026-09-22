@@ -1,0 +1,363 @@
+@using MangaPanel.Client.Authentication
+@using Microsoft.AspNetCore.Components.Routing
+@using Microsoft.AspNetCore.SignalR.Client
+@using System.Net.Http.Json
+@implements IDisposable
+@inject NavigationManager Navigation
+@inject HttpClient Http
+@inject AuthenticationStateProvider AuthStateProvider
+@inject IJSRuntime JS
+
+<header class="sticky top-0 z-30 bg-surface/80 backdrop-blur-md border-b border-border-main px-4 sm:px-6 lg:px-8 py-3.5 flex items-center justify-between transition-colors duration-300">
+    <div class="flex items-center gap-3">
+        <!-- Hamburger Button (Mobile) -->
+        <button type="button" @onclick="ToggleMobileMenu" class="md:hidden p-2 rounded-xl bg-bg-app border border-border-main text-slate-600 dark:text-slate-300 hover:text-primary transition-all shadow-sm cursor-pointer">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+        </button>
+
+        <div>
+            <h2 class="text-base sm:text-lg font-bold text-text-main tracking-tight">Admin Dashboard</h2>
+            <p class="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-widest leading-none">Management Console</p>
+        </div>
+    </div>
+    
+    <div class="flex items-center gap-3 sm:gap-4 lg:gap-6">
+        <!-- Background Processes Monitor Button -->
+        <button type="button" @onclick="OpenProcessesModal" 
+                title="View background scraping processes & queue"
+                class="relative h-9 sm:h-10 px-2.5 sm:px-3 rounded-xl bg-bg-app border border-border-main flex items-center gap-2 text-slate-500 hover:text-primary hover:border-primary transition-all shadow-sm cursor-pointer group">
+            <div class="relative flex items-center justify-center">
+                @if (_activeProcessesCount > 0)
+                {
+                    <svg class="w-4 h-4 sm:w-5 sm:h-5 text-amber-500 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                    </svg>
+                }
+                else
+                {
+                    <svg class="w-4 h-4 sm:w-5 sm:h-5 text-slate-400 group-hover:text-primary transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                    </svg>
+                }
+            </div>
+            
+            <span class="text-xs font-bold hidden sm:inline text-text-main">
+                Tasks
+            </span>
+
+            @if (_activeProcessesCount > 0)
+            {
+                <span class="flex h-5 items-center justify-center px-1.5 rounded-full bg-amber-500 text-white text-[10px] font-black animate-pulse shadow-sm shadow-amber-500/30">
+                    @_activeProcessesCount
+                </span>
+            }
+        </button>
+
+        <!-- Theme Toggle -->
+        <button type="button" @onclick="ToggleTheme" class="h-9 w-9 sm:h-10 sm:w-10 rounded-xl bg-bg-app border border-border-main flex items-center justify-center text-slate-500 hover:text-primary hover:border-primary transition-all shadow-sm cursor-pointer">
+            @if (_isDarkMode)
+            {
+                <svg class="w-4 h-4 sm:w-5 sm:h-5 fill-amber-400" viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd" d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4 8a4 4 0 11-8 0 4 4 0 018 0zm-.464 4.95l.707.707a1 1 0 001.414-1.414l-.707-.707a1 1 0 00-1.414 1.414zm2.12-10.607a1 1 0 010 1.414l-.706.707a1 1 0 11-1.414-1.414l.707-.707a1 1 0 011.414 0zM17 11a1 1 0 100-2h-1a1 1 0 100 2h1zm-7 4a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zM5.05 6.464A1 1 0 106.465 5.05l-.708-.707a1 1 0 00-1.414 1.414l.707.707zm1.414 8.486l-.707.707a1 1 0 01-1.414-1.414l.707-.707a1 1 0 011.414 1.414zM4 11a1 1 0 100-2H3a1 1 0 000 2h1z" clip-rule="evenodd" />
+                </svg>
+            }
+            else
+            {
+                <svg class="w-4 h-4 sm:w-5 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+                </svg>
+            }
+        </button>
+
+        <div class="hidden sm:flex flex-col items-end">
+            <span class="text-xs sm:text-sm font-bold text-text-main">Administrator</span>
+            <span class="text-[10px] font-semibold text-emerald-500 flex items-center gap-1">
+                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                Active Session
+            </span>
+        </div>
+
+        <div class="relative group">
+            <div class="h-9 w-9 sm:h-10 sm:w-10 rounded-xl bg-bg-app border border-border-main flex items-center justify-center text-slate-400 cursor-pointer hover:border-primary transition-all shadow-sm">
+                <svg class="w-4 h-4 sm:w-5 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+            </div>
+        </div>
+    </div>
+</header>
+
+<!-- Mobile Drawer Sidebar (Interactive with Smooth Slide & Fade) -->
+<div class="fixed inset-0 z-50 md:hidden transition-all duration-300 ease-in-out @(_mobileMenuOpen ? "pointer-events-auto visible" : "pointer-events-none invisible")">
+    <!-- Backdrop with smooth fade -->
+    <div class="fixed inset-0 bg-black/60 backdrop-blur-sm transition-opacity duration-300 ease-in-out @(_mobileMenuOpen ? "opacity-100" : "opacity-0")" 
+         @onclick="CloseMobileMenu"></div>
+
+    <!-- Drawer Content with smooth slide-in/out transform -->
+    <aside class="fixed inset-y-0 left-0 w-72 max-w-[80vw] bg-surface h-full flex flex-col z-50 shadow-2xl border-r border-border-main transition-transform duration-300 ease-out transform @(_mobileMenuOpen ? "translate-x-0" : "-translate-x-full")">
+        <div class="p-6 pb-6 flex items-center justify-between border-b border-border-main">
+            <div class="flex items-center gap-3">
+                <div class="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-primary/80 text-white font-black shadow-md shadow-primary/20">
+                    M
+                </div>
+                <div>
+                    <h1 class="text-base font-black tracking-tight text-text-main">Manga<span class="text-primary">Panel</span></h1>
+                    <p class="text-[9px] font-bold text-slate-400 uppercase tracking-widest">v2.0 Admin</p>
+                </div>
+            </div>
+            <button type="button" @onclick="CloseMobileMenu" class="p-2 rounded-xl text-slate-400 hover:text-text-main hover:bg-bg-app transition-all cursor-pointer">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+            </button>
+        </div>
+
+        <div class="flex-grow px-3 py-4 space-y-6 overflow-y-auto">
+            <div>
+                <p class="px-3 mb-2 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Main Menu</p>
+                <nav class="space-y-1">
+                    @foreach (var item in _menuDatas)
+                    {
+                        <NavItem MenuData="item"></NavItem>
+                    }
+                </nav>
+            </div>
+
+            <div>
+                <p class="px-3 mb-2 text-[10px] font-bold text-slate-400 uppercase tracking-widest">System Management</p>
+                <nav class="space-y-1">
+                    <a href="/hangfire" target="_blank" @onclick="CloseMobileMenu" class="flex items-center gap-3 px-3 py-2.5 text-sm font-semibold text-slate-600 dark:text-slate-300 rounded-xl hover:bg-bg-app border border-transparent hover:border-border-main transition-all group">
+                        <div class="p-2 rounded-lg bg-indigo-50 dark:bg-indigo-950/40 text-indigo-500 group-hover:bg-indigo-500 group-hover:text-white transition-all shadow-sm">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+                        </div>
+                        <div class="flex flex-col">
+                            <span>Hangfire Jobs</span>
+                            <span class="text-[10px] text-slate-400 font-normal">Background Workers</span>
+                        </div>
+                    </a>
+                </nav>
+            </div>
+        </div>
+
+        <div class="p-3 mt-auto border-t border-border-main">
+            <button type="button" @onclick="Logout" class="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-semibold text-rose-500 transition-all hover:bg-rose-50 dark:hover:bg-rose-950/20 group cursor-pointer">
+                <div class="p-2 rounded-lg bg-rose-50 dark:bg-rose-950/40 text-rose-500 group-hover:bg-rose-500 group-hover:text-white transition-all shadow-sm">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+                    </svg>
+                </div>
+                <span>Logout Session</span>
+            </button>
+        </div>
+    </aside>
+</div>
+
+<RunningProcessesModal IsOpen="_processesModalOpen" 
+                       OnClose="CloseProcessesModal" 
+                       OnActiveCountChanged="UpdateActiveProcessesCount" />
+
+@code {
+
+    private List<MenuData> _menuDatas = new()
+    {
+        new ()
+        {
+            Href = "/admin/dashboard",
+            Label = "Dashboard",
+            Icon = @<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+                   </svg>
+        },
+        new ()
+        {
+            Href = "/admin/manga",
+            Label = "Manage Manga",
+            Icon = @<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                   </svg>
+        },
+        new ()
+        {
+            Href = "/admin/discover",
+            Label = "Discover Manga",
+            Icon = @<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                   </svg>
+        },
+        new ()
+        {
+            Href = "/admin/recurring-jobs",
+            Label = "Recurring Jobs",
+            Icon = @<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                   </svg>
+        },
+        new ()
+        {
+            Href = "/admin/users",
+            Label = "User Management",
+            Icon = @<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                   </svg>
+        }
+    };
+
+    private bool _isDarkMode;
+    private bool _mobileMenuOpen = false;
+    private bool _processesModalOpen = false;
+    private int _activeProcessesCount = 0;
+    private HubConnection? _hubConnection;
+
+    private readonly HashSet<Guid> _activeChapters = [];
+
+    protected override void OnInitialized()
+    {
+        Navigation.LocationChanged += OnLocationChanged;
+        _ = LoadInitialActiveCountAsync();
+        _ = InitializeSignalRAsync();
+    }
+
+    private void OpenProcessesModal() => _processesModalOpen = true;
+    private void CloseProcessesModal() => _processesModalOpen = false;
+    private void UpdateActiveProcessesCount(int count)
+    {
+        _activeProcessesCount = count;
+        StateHasChanged();
+    }
+
+    private async Task LoadInitialActiveCountAsync()
+    {
+        try
+        {
+            var res = await Http.GetFromJsonAsync<RunningProcessesModal.ProcessesApiResponse>("/api/v1/scrapper/processes");
+            if (res?.Data?.Processes != null)
+            {
+                lock (_activeChapters)
+                {
+                    _activeChapters.Clear();
+                    foreach (var p in res.Data.Processes.Where(p => p.Status is "InProgress" or "Starting" or "Queued"))
+                    {
+                        _activeChapters.Add(p.ChapterId);
+                    }
+                    _activeProcessesCount = _activeChapters.Count;
+                }
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error fetching initial active count: {ex.Message}");
+        }
+    }
+
+    private async Task InitializeSignalRAsync()
+    {
+        try
+        {
+            var hubUrl = Navigation.ToAbsoluteUri("/hubs/manga");
+            _hubConnection = new HubConnectionBuilder()
+                .WithUrl(hubUrl)
+                .WithAutomaticReconnect()
+                .Build();
+
+            _hubConnection.On<System.Text.Json.JsonElement>("ChapterScrapingProgress", async (payload) =>
+            {
+                try
+                {
+                    var chapterId = payload.TryGetProperty("chapterId", out var cId) && Guid.TryParse(cId.GetString(), out var cidVal) ? (Guid?)cidVal : null;
+                    if (!chapterId.HasValue) return;
+
+                    var status = payload.TryGetProperty("status", out var st) ? st.GetString() ?? "InProgress" : "InProgress";
+
+                    lock (_activeChapters)
+                    {
+                        if (status is "InProgress" or "Starting" or "Queued")
+                        {
+                            _activeChapters.Add(chapterId.Value);
+                        }
+                        else
+                        {
+                            _activeChapters.Remove(chapterId.Value);
+                        }
+                        _activeProcessesCount = _activeChapters.Count;
+                    }
+
+                    await InvokeAsync(StateHasChanged);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error processing ChapterScrapingProgress in AdminHeader: {ex.Message}");
+                }
+            });
+
+            await _hubConnection.StartAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"SignalR init error in AdminHeader: {ex.Message}");
+        }
+    }
+
+    private void OnLocationChanged(object? sender, LocationChangedEventArgs e)
+    {
+        if (_mobileMenuOpen)
+        {
+            _mobileMenuOpen = false;
+            StateHasChanged();
+        }
+    }
+
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _isDarkMode = await JS.InvokeAsync<bool>("themeManager.initTheme");
+            StateHasChanged();
+        }
+    }
+
+    private void ToggleMobileMenu()
+    {
+        _mobileMenuOpen = !_mobileMenuOpen;
+    }
+
+    private void CloseMobileMenu()
+    {
+        _mobileMenuOpen = false;
+    }
+
+    private async Task ToggleTheme()
+    {
+        _isDarkMode = await JS.InvokeAsync<bool>("themeManager.toggleDark");
+    }
+
+    private async Task Logout()
+    {
+        try
+        {
+            var response = await Http.PostAsync("api/v1/auth/logout", null);
+
+            if (response.IsSuccessStatusCode)
+            {
+                ((JwtAuthenticationStateProvider)AuthStateProvider).NotifyUserLogout();
+                Navigation.NavigateTo("/");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Logout error: {ex.Message}");
+        }
+    }
+
+    public void Dispose()
+    {
+        Navigation.LocationChanged -= OnLocationChanged;
+        if (_hubConnection != null)
+        {
+            _ = _hubConnection.DisposeAsync();
+        }
+    }
+}
+

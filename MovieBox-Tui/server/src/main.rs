@@ -629,6 +629,145 @@ async fn anime_recent(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Manga handlers (MangaScrapper-backed reader content)
+// ---------------------------------------------------------------------------
+
+async fn manga_trending(
+    State(state): State<AppState>,
+    Query(p): Query<AnimeBrowseParams>,
+) -> Response {
+    let page = p.page.unwrap_or(1);
+    match state.svc.manga_client.trending(page, 20).await {
+        Ok(summaries) => {
+            let items: Vec<_> = summaries
+                .iter()
+                .map(|s| {
+                    moviebox_tui::providers::manga::MangaProvider::to_catalog_item(s)
+                })
+                .collect();
+            Json(serde_json::json!({
+                "sort": "trending",
+                "page": page,
+                "items": items,
+            }))
+            .into_response()
+        }
+        Err(e) => provider_err_response_for(ProviderKind::Manga, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct MangaChaptersParams {
+    id: String,
+}
+
+async fn manga_chapters(
+    State(state): State<AppState>,
+    Query(p): Query<MangaChaptersParams>,
+) -> Response {
+    match state.svc.manga_client.chapters(&p.id).await {
+        Ok(chapters) => Json(serde_json::json!({
+            "id": p.id,
+            "chapters": chapters,
+        }))
+        .into_response(),
+        Err(e) => provider_err_response_for(ProviderKind::Manga, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct MangaChapterDetailParams {
+    id: String,
+    chapter_id: String,
+}
+
+async fn manga_chapter_detail(
+    State(state): State<AppState>,
+    Query(p): Query<MangaChapterDetailParams>,
+) -> Response {
+    match state.svc.manga_client.chapter_detail(&p.id, &p.chapter_id).await {
+        Ok(mut chapter) => {
+            // Rewrite page URLs to same-origin proxy paths (/api/manga/image)
+            // so the browser never needs to reach the internal MangaScrapper
+            // host; remote fallbacks travel through the same route.
+            for page in &mut chapter.pages {
+                let source = page
+                    .url
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| page.alternate_url.as_deref());
+                if let Some(url) = source {
+                    page.url = moviebox_tui::providers::manga::MangaProvider::proxy_image_path(url);
+                }
+            }
+            Json(serde_json::json!({
+                "id": p.id,
+                "chapter": {
+                    "id": chapter.id,
+                    "number": chapter.number,
+                    "language": chapter.language,
+                    "uploadDate": chapter.upload_date,
+                    "totalPages": chapter.total_pages,
+                    "pages": chapter.pages,
+                },
+            }))
+            .into_response()
+        }
+        Err(e) => provider_err_response_for(ProviderKind::Manga, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct MangaImageParams {
+    url: String,
+}
+
+/// Stream a manga page image through this backend so the browser only talks
+/// to the Rust server. Relative paths resolve against the MangaScrapper API
+/// host; absolute remote URLs are routed through its image proxy endpoint so
+/// this route can never act as an open proxy.
+async fn manga_image(State(state): State<AppState>, Query(p): Query<MangaImageParams>) -> Response {
+    let base = moviebox_tui::providers::manga::manga_api_url();
+    let Some(target) =
+        moviebox_tui::providers::manga::MangaProvider::resolve_image_url(&p.url)
+    else {
+        return api_error(StatusCode::BAD_REQUEST, "missing url");
+    };
+
+    let request = if target.starts_with(&base) {
+        state.svc.http_client().get(&target)
+    } else {
+        state
+            .svc
+            .http_client()
+            .get(format!("{base}/api/v1/images/proxy"))
+            .query(&[("url", &target)])
+    };
+
+    let upstream = match request.send().await {
+        Ok(r) => r,
+        Err(e) => return api_error(StatusCode::BAD_GATEWAY, e.to_string()),
+    };
+    if !upstream.status().is_success() {
+        return api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("manga image upstream returned {}", upstream.status()),
+        );
+    }
+    let content_type = upstream
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, content_type)
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 #[derive(Deserialize)]
 struct CaptionsParams {
     id: String,
@@ -691,6 +830,9 @@ async fn fetch_releases(
             "addon stream resolution is not part of this API yet".to_string(),
         )),
         ProviderKind::Anime => ReleaseProvider::episode_streams(&svc.anime_client, id, season, episode).await,
+        ProviderKind::Manga => Err(ProviderError::Unavailable(
+            "manga has no video streams; use /api/manga/{id}/chapters/{chapterId} instead".to_string(),
+        )),
     }
 }
 
@@ -2234,6 +2376,10 @@ async fn main() {
         .route("/api/anime/trending", get(anime_trending))
         .route("/api/anime/popular", get(anime_popular))
         .route("/api/anime/recent", get(anime_recent))
+        .route("/api/manga/trending", get(manga_trending))
+        .route("/api/manga/chapters", get(manga_chapters))
+        .route("/api/manga/chapter", get(manga_chapter_detail))
+        .route("/api/manga/image", get(manga_image))
         .route("/api/suggest", get(suggest))
         .route("/api/details", get(details))
         .route("/api/streams", get(streams))

@@ -1,0 +1,24 @@
+{
+  "ProviderName": "Manhwadesu",
+  "BaseUrl": "https://manhwadesu.wiki/",
+  "ProviderIcon": "https://manhwadesu.wiki/wp-content/themes/mangareader/assets/images/favicon.ico",
+  "MangaSelectors": {
+    "Title": "//h1[@class='entry-title']",
+    "Author": "//div[contains(@class,'tsinfo')]//div[contains(@class,'imptdt') and contains(.,'Author')]/i",
+    "Description": "//div[contains(@class,'entry-content')]/p",
+    "Type": "//div[contains(@class,'tsinfo')]//div[contains(@class,'imptdt') and contains(.,'Type')]//a",
+    "Status": "//div[contains(@class,'tsinfo')]//div[contains(@class,'imptdt') and contains(.,'Status')]/i",
+    "Genres": "//span[@class='mgen']/a",
+    "Thumbnail": "//div[@itemprop='image']/img"
+  },
+  "ChapterSelectors": {
+    "Rows": "//div[@id='chapterlist']//ul/li",
+    "Link": ".//div[@class='eph-num']/a",
+    "ChapterText": ".//div[@class='eph-num']/a/span[@class='chapternum']",
+    "Views": "",
+    "UploadDate": ".//div[@class='eph-num']/a/span[@class='chapterdate']"
+  },
+  "PageSelectors": {
+    "Images": "//div[@id='readerarea']//img"
+  }
+}

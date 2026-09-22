@@ -55,7 +55,7 @@ loadDotEnv(join(ROOT, ".env"));
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.MOVIEBOX_SERVER_PORT ?? 9797);
 const WEB_PORT = 3000;
-const MANIFEST = new URL("../MovieBox-Tui/server/Cargo.toml", import.meta.url).pathname;
+const MANIFEST = fileURLToPath(new URL("../MovieBox-Tui/server/Cargo.toml", import.meta.url));
 const BACKEND_URL = process.env.MB_BACKEND_URL ?? `http://${HOST}:${PORT}`;
 
 const API_DIR = join(ROOT, "api");
@@ -68,6 +68,18 @@ const DATABASE_URL =
 const REDIS_URL = process.env.REDIS_URL ?? `redis://127.0.0.1:${REDIS_HOST_PORT}`;
 const SCRAPER_PORT = Number(process.env.SCRAPER_PORT ?? 9798);
 const SCRAPER_URL = `http://${HOST}:${SCRAPER_PORT}`;
+const MANGA_API_PORT = Number(process.env.MANGA_API_PORT ?? 8080);
+const MANGA_API_URL = process.env.MANGA_API_URL ?? `http://${HOST}:${MANGA_API_PORT}`;
+const MANGA_DIR = join(ROOT, "manga-scrapper");
+const MANGA_PROJECT = join(
+  MANGA_DIR,
+  "src",
+  "Services",
+  "MangaScrapper",
+  "MangaScrapper.Api",
+  "MangaScrapper.Api.csproj",
+);
+const MANGA_INFRA_HINT = "docker compose up -d mongo-manga rabbitmq-manga flaresolverr";
 const COMPOSE_HINT = "docker compose up -d db redis";
 
 function portOpen(port, host = "127.0.0.1") {
@@ -280,6 +292,68 @@ async function startScraper() {
   console.log(`Anime scraper ready on ${SCRAPER_URL}`);
 }
 
+/** Poll the MangaScrapper /health endpoint until it answers or timeoutMs. */
+async function waitForMangaHealth(timeoutMs) {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    try {
+      const res = await fetch(`${MANGA_API_URL}/health`, { signal: AbortSignal.timeout(3_000) });
+      if (res.ok) return true;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
+  return false;
+}
+
+async function startMangaApi() {
+  if (!existsSync(MANGA_PROJECT)) return;
+  if (await portOpen(MANGA_API_PORT)) {
+    console.log(`Manga API already listening on ${HOST}:${MANGA_API_PORT} — reusing it.`);
+    return;
+  }
+  try {
+    await import("node:util").then(({ promisify }) =>
+      promisify(spawn)("dotnet", ["--version"], { stdio: "ignore" }),
+    );
+  } catch {
+    console.error("Manga API unavailable (dotnet SDK not installed) — continuing.");
+    console.error("Start the manga stack instead: docker compose -f docker-compose.dev.yml up -d manga-api");
+    return;
+  }
+
+  console.log(`Starting MangaScrapper API on ${HOST}:${MANGA_API_PORT}…`);
+  // --no-launch-profile: launchSettings.json would pin its own port and
+  // ignore ASPNETCORE_URLS.
+  const manga = spawn("dotnet", ["run", "--project", MANGA_PROJECT, "--no-launch-profile"], {
+    env: {
+      ...process.env,
+      ASPNETCORE_ENVIRONMENT: "Development",
+      ASPNETCORE_URLS: `http://${HOST}:${MANGA_API_PORT}`,
+      MongoDB__ConnectionString: process.env.MANGA_MONGO_URL ?? "mongodb://localhost:27017",
+      MongoDB__DatabaseName: "manga-scrap",
+      FlareSolverr__Host: process.env.FLARESOLVERR_HOST ?? "http://localhost:8191",
+      Messaging__RabbitMQ__Host: process.env.MANGA_RABBITMQ_HOST ?? "localhost",
+      Messaging__RabbitMQ__Port: "5672",
+      Messaging__RabbitMQ__Username: "guest",
+      Messaging__RabbitMQ__Password: "guest",
+      Scrapper__ImageStoragePath: join(MANGA_DIR, "images"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(manga);
+  prefix(manga, "manga");
+
+  const ready = await waitForMangaHealth(180_000);
+  if (!ready) {
+    console.error("Manga API failed to become healthy — is its infra running?");
+    console.error(`Start it with: ${MANGA_INFRA_HINT}`);
+    return;
+  }
+  console.log(`Manga API ready on ${MANGA_API_URL}`);
+}
+
 async function main() {
   const already = await portOpen(PORT);
   if (already) {
@@ -294,6 +368,7 @@ async function main() {
         MOVIEBOX_REGION: process.env.MOVIEBOX_REGION ?? "ph",
         MOVIEBOX_PROXY_BASE: process.env.MOVIEBOX_PROXY_BASE ?? `http://localhost:${WEB_PORT}`,
         RUST_LOG: process.env.RUST_LOG ?? "warn",
+        MANGA_API_URL,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -320,6 +395,8 @@ async function main() {
   await startApi();
 
   await startScraper();
+
+  await startMangaApi();
 
   const web = spawn("next", ["dev", "-p", String(WEB_PORT)], {
     env: { ...process.env, MB_BACKEND_URL: BACKEND_URL, API_URL },

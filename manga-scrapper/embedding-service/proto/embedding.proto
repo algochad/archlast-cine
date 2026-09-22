@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package embedding;
+
+option csharp_namespace = "MangaScrapper.Core.Protos";
+
+service EmbeddingService {
+  rpc GenerateEmbedding (EmbedRequest) returns (EmbedResponse);
+}
+
+message EmbedRequest {
+  string text = 1;
+  string mode = 2;
+}
+
+message EmbedResponse {
+  repeated float dense = 1;
+}

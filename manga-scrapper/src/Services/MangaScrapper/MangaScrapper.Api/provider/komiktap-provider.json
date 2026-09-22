@@ -1,0 +1,24 @@
+{
+  "ProviderName": "Komiktap",
+  "BaseUrl": "https://komiktap.info/",
+  "ProviderIcon": "https://komiktap.info/wp-content/uploads/2020/06/cropped-KT-192x192.png",
+  "MangaSelectors": {
+    "Title": "//h1[@class='entry-title']",
+    "Author": "//table[@class='infotable']//td[text()='Author']/following-sibling::td",
+    "Description": "//div[@itemprop='description']/p",
+    "Type": "//table[@class='infotable']//td[text()='Type']/following-sibling::td",
+    "Status": "//table[@class='infotable']//td[text()='Status']/following-sibling::td",
+    "Genres": "//div[@class='seriestugenre']/a",
+    "Thumbnail": "//div[@itemprop='image']/img"
+  },
+  "ChapterSelectors": {
+    "Rows": "//div[@id='chapterlist']//ul/li",
+    "Link": ".//div[@class='eph-num']/a",
+    "ChapterText": ".//div[@class='eph-num']/a/span[@class='chapternum']",
+    "Views": "",
+    "UploadDate": ".//div[@class='eph-num']/a/span[@class='chapterdate']"
+  },
+  "PageSelectors": {
+    "Images": "//div[@id='readerarea']//img"
+  }
+}

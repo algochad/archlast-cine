@@ -1,0 +1,421 @@
+@page "/admin/users"
+@rendermode @(new InteractiveWebAssemblyRenderMode(prerender: false))
+@layout Layout.AdminLayout
+@using NovaStack.Contracts.Responses
+@using MangaPanel.Client.Components
+@using Microsoft.AspNetCore.Authorization
+@attribute [Authorize]
+@inject HttpClient Http
+@inject IJSRuntime JS
+
+<PageTitle>User Management - MangaPanel</PageTitle>
+
+<div class="space-y-6 pb-12">
+    <!-- Header Section -->
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+        <div>
+            <h1 class="text-xl sm:text-2xl font-black tracking-tight text-text-main">User Management</h1>
+            <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-0.5">Track user activity, reading progression, and saved library collections.</p>
+        </div>
+        <div class="flex items-center gap-2">
+            <button @onclick="LoadUsers" class="px-3.5 py-2 bg-surface hover:bg-bg-app border border-border-main text-xs font-semibold text-text-main rounded-xl flex items-center gap-2 transition-all shadow-sm cursor-pointer">
+                <svg class="w-4 h-4 text-slate-400 @(_isLoading ? "animate-spin" : "")" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                <span>Refresh</span>
+            </button>
+        </div>
+    </div>
+
+    <!-- Quick Stats Cards -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-6">
+        <div class="bg-surface p-4 sm:p-5 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3 bg-blue-50 dark:bg-blue-950/40 rounded-xl text-blue-500 flex-shrink-0">
+                <svg class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Total Users</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-text-main truncate">@(_usersData?.TotalCount ?? 0)</h4>
+            </div>
+        </div>
+
+        <div class="bg-surface p-4 sm:p-5 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3 bg-emerald-50 dark:bg-emerald-950/40 rounded-xl text-emerald-500 flex-shrink-0">
+                <svg class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Active Accounts</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-text-main truncate">@(_usersData?.Items?.Count(u => u.IsActive) ?? 0)</h4>
+            </div>
+        </div>
+
+        <div class="bg-surface p-4 sm:p-5 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3 bg-amber-50 dark:bg-amber-950/40 rounded-xl text-amber-500 flex-shrink-0">
+                <svg class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Active Recently</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-text-main truncate">@(_usersData?.Items?.Count(u => IsOnlineRecently(u.LastActiveAt)) ?? 0)</h4>
+            </div>
+        </div>
+
+        <div class="bg-surface p-4 sm:p-5 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3 bg-purple-50 dark:bg-purple-950/40 rounded-xl text-purple-500 flex-shrink-0">
+                <svg class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Admins / Staff</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-text-main truncate">@(_usersData?.Items?.Count(u => u.Roles?.Contains("SuperUser") == true || u.Roles?.Contains("Admin") == true) ?? 0)</h4>
+            </div>
+        </div>
+    </div>
+
+    <!-- Search & Filter Controls -->
+    <div class="bg-surface p-4 rounded-2xl border border-border-main shadow-sm flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+        <div class="relative flex-grow max-w-md">
+            <span class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
+                <svg class="h-4 w-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+            </span>
+            <input type="text" @bind="_searchTerm" @bind:event="oninput" @onkeyup="HandleSearchKeyUp"
+                   placeholder="Search by username or email..."
+                   class="w-full pl-10 pr-4 py-2 bg-bg-app border border-border-main rounded-xl text-xs text-text-main focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all" />
+        </div>
+
+        <div class="flex items-center gap-2.5">
+            <select @bind="_sortBy" @bind:after="LoadUsers" class="px-3 py-2 bg-bg-app border border-border-main rounded-xl text-xs text-text-main outline-none focus:border-primary">
+                <option value="createdAt">Joined Date</option>
+                <option value="lastActiveAt">Last Active</option>
+                <option value="username">Username</option>
+                <option value="email">Email</option>
+            </select>
+
+            <select @bind="_orderBy" @bind:after="LoadUsers" class="px-3 py-2 bg-bg-app border border-border-main rounded-xl text-xs text-text-main outline-none focus:border-primary">
+                <option value="desc">Descending</option>
+                <option value="asc">Ascending</option>
+            </select>
+        </div>
+    </div>
+
+    <!-- Users List / Table -->
+    @if (_isLoading)
+    {
+        <div class="flex items-center justify-center min-h-[300px]">
+            <div class="animate-spin rounded-full h-10 w-10 border-b-2 border-primary"></div>
+        </div>
+    }
+    else if (_usersData == null || !_usersData.Items.Any())
+    {
+        <div class="bg-surface rounded-2xl border border-border-main p-12 text-center">
+            <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-400 flex items-center justify-center">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                </svg>
+            </div>
+            <h4 class="text-sm font-bold text-text-main">No Users Found</h4>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">No user accounts matched your search criteria.</p>
+        </div>
+    }
+    else
+    {
+        <!-- Desktop Table View -->
+        <div class="hidden md:block bg-surface rounded-2xl border border-border-main shadow-sm overflow-hidden">
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-bg-app/50 border-b border-border-main text-slate-400 uppercase tracking-wider font-bold text-[10px]">
+                        <tr>
+                            <th class="px-5 py-3.5">User</th>
+                            <th class="px-5 py-3.5">Roles</th>
+                            <th class="px-5 py-3.5">Status</th>
+                            <th class="px-5 py-3.5">Last Active</th>
+                            <th class="px-5 py-3.5">Joined</th>
+                            <th class="px-5 py-3.5 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-border-main/50">
+                        @foreach (var user in _usersData.Items)
+                        {
+                            <tr class="hover:bg-bg-app/40 transition-colors">
+                                <td class="px-5 py-3.5">
+                                    <div class="flex items-center gap-3">
+                                        <div class="h-9 w-9 rounded-xl bg-gradient-to-br from-primary/20 to-primary/10 text-primary font-bold flex items-center justify-center text-sm border border-primary/20 flex-shrink-0">
+                                            @(string.IsNullOrWhiteSpace(user.Username) ? "U" : user.Username[0].ToString().ToUpper())
+                                        </div>
+                                        <div class="min-w-0">
+                                            <p class="font-bold text-text-main truncate">@user.Username</p>
+                                            <p class="text-[11px] text-slate-400 truncate">@user.Email</p>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td class="px-5 py-3.5">
+                                    <div class="flex flex-wrap gap-1">
+                                        @if (user.Roles != null && user.Roles.Any())
+                                        {
+                                            @foreach (var role in user.Roles)
+                                            {
+                                                <span class="px-2 py-0.5 rounded-md text-[10px] font-bold @GetRoleClass(role)">
+                                                    @role
+                                                </span>
+                                            }
+                                        }
+                                        else
+                                        {
+                                            <span class="text-slate-400 text-[11px]">User</span>
+                                        }
+                                    </div>
+                                </td>
+                                <td class="px-5 py-3.5">
+                                    @if (user.IsActive)
+                                    {
+                                        <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[11px] font-semibold">
+                                            <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                                            Active
+                                        </span>
+                                    }
+                                    else
+                                    {
+                                        <span class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-500/10 text-rose-600 dark:text-rose-400 text-[11px] font-semibold">
+                                            <span class="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
+                                            Disabled
+                                        </span>
+                                    }
+                                </td>
+                                <td class="px-5 py-3.5">
+                                    @if (user.LastActiveAt.HasValue)
+                                    {
+                                        <div class="flex items-center gap-1.5" title="@user.LastActiveAt.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")">
+                                            @if (IsOnlineRecently(user.LastActiveAt))
+                                            {
+                                                <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                                                <span class="text-emerald-600 dark:text-emerald-400 font-semibold">Online now</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="text-slate-500 dark:text-slate-400">@FormatRelativeTime(user.LastActiveAt.Value)</span>
+                                            }
+                                        </div>
+                                    }
+                                    else
+                                    {
+                                        <span class="text-slate-400">—</span>
+                                    }
+                                </td>
+                                <td class="px-5 py-3.5 text-slate-500 dark:text-slate-400">
+                                    @user.CreatedAt.ToLocalTime().ToString("MMM dd, yyyy")
+                                </td>
+                                <td class="px-5 py-3.5 text-right">
+                                    <button @onclick="() => OpenUserDetail(user)" class="px-3 py-1.5 bg-primary/10 hover:bg-primary text-primary hover:text-white rounded-lg font-semibold text-xs transition-all flex items-center gap-1.5 ml-auto cursor-pointer">
+                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                        </svg>
+                                        <span>Details</span>
+                                    </button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Mobile Card View -->
+        <div class="md:hidden grid grid-cols-1 gap-3">
+            @foreach (var user in _usersData.Items)
+            {
+                <div class="bg-surface p-4 rounded-2xl border border-border-main shadow-sm space-y-3">
+                    <div class="flex items-start justify-between gap-2">
+                        <div class="flex items-center gap-3">
+                            <div class="h-10 w-10 rounded-xl bg-gradient-to-br from-primary/20 to-primary/10 text-primary font-bold flex items-center justify-center text-sm border border-primary/20 flex-shrink-0">
+                                @(string.IsNullOrWhiteSpace(user.Username) ? "U" : user.Username[0].ToString().ToUpper())
+                            </div>
+                            <div class="min-w-0">
+                                <h3 class="font-bold text-sm text-text-main truncate">@user.Username</h3>
+                                <p class="text-xs text-slate-400 truncate">@user.Email</p>
+                            </div>
+                        </div>
+
+                        <div>
+                            @if (user.IsActive)
+                            {
+                                <span class="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[10px] font-semibold">Active</span>
+                            }
+                            else
+                            {
+                                <span class="px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-600 dark:text-rose-400 text-[10px] font-semibold">Disabled</span>
+                            }
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-border-main/50">
+                        <div>
+                            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Last Active</span>
+                            <span class="text-text-main font-medium">@(user.LastActiveAt.HasValue ? FormatRelativeTime(user.LastActiveAt.Value) : "Never")</span>
+                        </div>
+                        <div>
+                            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Joined</span>
+                            <span class="text-text-main font-medium">@user.CreatedAt.ToLocalTime().ToString("MMM dd, yyyy")</span>
+                        </div>
+                    </div>
+
+                    <div class="flex items-center justify-between pt-2 border-t border-border-main/50">
+                        <div class="flex flex-wrap gap-1">
+                            @if (user.Roles != null && user.Roles.Any())
+                            {
+                                @foreach (var role in user.Roles)
+                                {
+                                    <span class="px-2 py-0.5 rounded-md text-[9px] font-bold @GetRoleClass(role)">@role</span>
+                                }
+                            }
+                        </div>
+
+                        <button @onclick="() => OpenUserDetail(user)" class="px-3 py-1.5 bg-primary text-white rounded-xl text-xs font-semibold shadow-sm flex items-center gap-1.5 cursor-pointer">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                            </svg>
+                            <span>Inspect</span>
+                        </button>
+                    </div>
+                </div>
+            }
+        </div>
+
+        <!-- Pagination Bar -->
+        <div class="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
+            <p class="text-xs text-slate-500 dark:text-slate-400 text-center sm:text-left">
+                Showing <span class="font-bold text-text-main">@((_page - 1) * _pageSize + 1)</span> to 
+                <span class="font-bold text-text-main">@(Math.Min(_page * _pageSize, _usersData.TotalCount))</span> of 
+                <span class="font-bold text-text-main">@_usersData.TotalCount</span> users
+            </p>
+
+            <div class="flex items-center gap-2">
+                <button @onclick="PreviousPage" disabled="@(!_usersData.HasPreviousPage)" class="px-3 py-1.5 bg-surface hover:bg-bg-app border border-border-main rounded-xl text-xs font-semibold text-text-main disabled:opacity-40 transition-all cursor-pointer">
+                    Previous
+                </button>
+                <span class="text-xs font-bold px-2 text-text-main">Page @_page of @_usersData.TotalPages</span>
+                <button @onclick="NextPage" disabled="@(!_usersData.HasNextPage)" class="px-3 py-1.5 bg-surface hover:bg-bg-app border border-border-main rounded-xl text-xs font-semibold text-text-main disabled:opacity-40 transition-all cursor-pointer">
+                    Next
+                </button>
+            </div>
+        </div>
+    }
+</div>
+
+<!-- Extracted User Detail Modal / Inspector Drawer Component -->
+<UserDetailModal User="_selectedUser" OnClose="CloseUserDetail" />
+
+@code {
+    private PagedResponse<UserResponse>? _usersData;
+    private bool _isLoading = true;
+
+    private string? _searchTerm;
+    private int _page = 1;
+    private int _pageSize = 10;
+    private string _sortBy = "lastActiveAt";
+    private string _orderBy = "desc";
+
+    // Inspector Modal State
+    private UserResponse? _selectedUser;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadUsers();
+    }
+
+    private async Task LoadUsers()
+    {
+        _isLoading = true;
+        try
+        {
+            var url = $"api/v1/users?page={_page}&pageSize={_pageSize}&sortBy={_sortBy}&orderBy={_orderBy}";
+            if (!string.IsNullOrWhiteSpace(_searchTerm))
+            {
+                url += $"&search={Uri.EscapeDataString(_searchTerm.Trim())}";
+            }
+
+            var res = await Http.GetFromJsonAsync<ApiResponse<PagedResponse<UserResponse>>>(url);
+            if (res?.Data != null)
+            {
+                _usersData = res.Data;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[UserManagement] Error loading users: {ex.Message}");
+        }
+        finally
+        {
+            _isLoading = false;
+        }
+    }
+
+    private async Task HandleSearchKeyUp(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+        {
+            _page = 1;
+            await LoadUsers();
+        }
+    }
+
+    private async Task PreviousPage()
+    {
+        if (_usersData?.HasPreviousPage == true)
+        {
+            _page--;
+            await LoadUsers();
+        }
+    }
+
+    private async Task NextPage()
+    {
+        if (_usersData?.HasNextPage == true)
+        {
+            _page++;
+            await LoadUsers();
+        }
+    }
+
+    private void OpenUserDetail(UserResponse user)
+    {
+        _selectedUser = user;
+    }
+
+    private void CloseUserDetail()
+    {
+        _selectedUser = null;
+    }
+
+    private static bool IsOnlineRecently(DateTime? lastActiveAt)
+    {
+        if (!lastActiveAt.HasValue) return false;
+        return (DateTime.UtcNow - lastActiveAt.Value).TotalMinutes <= 5;
+    }
+
+    private static string FormatRelativeTime(DateTime dt)
+    {
+        var diff = DateTime.UtcNow - dt;
+        if (diff.TotalSeconds < 60) return "Just now";
+        if (diff.TotalMinutes < 60) return $"{(int)diff.TotalMinutes}m ago";
+        if (diff.TotalHours < 24) return $"{(int)diff.TotalHours}h ago";
+        if (diff.TotalDays < 30) return $"{(int)diff.TotalDays}d ago";
+        return dt.ToLocalTime().ToString("MMM dd, yyyy");
+    }
+
+    private static string GetRoleClass(string role) => role switch
+    {
+        "SuperUser" => "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20",
+        "Admin" => "bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20",
+        _ => "bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20"
+    };
+}

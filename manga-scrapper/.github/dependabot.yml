@@ -1,0 +1,104 @@
+version: 2
+
+updates:
+  # ──────────────────────────────────────────────────
+  # NuGet – all C# projects (src/ & tests/)
+  # ──────────────────────────────────────────────────
+  - package-ecosystem: "nuget"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Bangkok"
+    open-pull-requests-limit: 10
+    groups:
+      microsoft-aspnetcore:
+        patterns:
+          - "Microsoft.AspNetCore.*"
+          - "Microsoft.Extensions.*"
+      hangfire:
+        patterns:
+          - "Hangfire.*"
+      masstransit:
+        patterns:
+          - "MassTransit.*"
+      mongodb:
+        patterns:
+          - "MongoDB.*"
+      testing:
+        patterns:
+          - "xunit*"
+          - "FluentAssertions*"
+          - "NetArchTest*"
+          - "Testcontainers*"
+          - "Microsoft.NET.Test*"
+    labels:
+      - "dependencies"
+      - "nuget"
+
+  # ──────────────────────────────────────────────────
+  # npm / pnpm – Tailwind CSS tooling (repo root)
+  # ──────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Bangkok"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "npm"
+
+  # ──────────────────────────────────────────────────
+  # pip – Python embedding service
+  # ──────────────────────────────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/embedding-service"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Bangkok"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+
+  # ──────────────────────────────────────────────────
+  # Docker – base images in all Dockerfiles
+  # ──────────────────────────────────────────────────
+  - package-ecosystem: "docker"
+    directory: "/src/Services/MangaScrapper/MangaScrapper.Api"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Bangkok"
+    labels:
+      - "dependencies"
+      - "docker"
+
+  - package-ecosystem: "docker"
+    directory: "/src/Workers/Scrapper.Worker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Bangkok"
+    labels:
+      - "dependencies"
+      - "docker"
+
+  - package-ecosystem: "docker"
+    directory: "/embedding-service"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Bangkok"
+    labels:
+      - "dependencies"
+      - "docker"

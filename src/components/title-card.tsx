@@ -5,7 +5,7 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Cover } from "@/components/cover";
 import { CheckIcon, InfoIcon, PlayIcon, XIcon } from "@/components/icons";
 import { useMyList } from "@/lib/session";
-import { api } from "@/lib/api";
+import { api, mbUrl } from "@/lib/api";
 import type { CatalogItem, MediaDetails } from "@/lib/types";
 
 const EXPAND_SCALE = 2.05; // expanded panel width relative to the base card
@@ -19,6 +19,8 @@ const PROVIDER_LABEL: Record<string, string> = {
   bdix_circleftp: "BDIX CIRCLEFTP",
   bdix_dhakaflix: "BDIX DHAKAFLIX",
   addons: "ADDON",
+  anime: "ANIME",
+  manga: "MANGA",
 };
 
 /** Mono meta line ("01 SEASONS · 2024" / "2024") shown under the title on hover. */
@@ -137,7 +139,18 @@ export const TitleCard = memo(function TitleCard({
 }) {
   const myList = useMyList();
   const href = `/title/${item.id.provider}/${item.id.value}`;
-  const watchHref = `/watch/${item.id.provider}/${item.id.value}`;
+  // Manga items have no video player — the primary action opens the reader.
+  const watchHref =
+    item.media_type === "manga"
+      ? `/read/${item.id.provider}/${item.id.value}`
+      : `/watch/${item.id.provider}/${item.id.value}`;
+  // Poster URLs are either absolute (movie providers) or backend-relative
+  // proxy paths (/api/manga/image?...) which need the /api/mb prefix.
+  const posterSrc = item.poster_url
+    ? item.poster_url.startsWith("/api/")
+      ? mbUrl(item.poster_url)
+      : item.poster_url
+    : null;
 
   const [open, setOpen] = useState(false);
   const [geom, setGeom] = useState<PopoverGeometry | null>(null);
@@ -400,7 +413,7 @@ export const TitleCard = memo(function TitleCard({
       >
         <div className="tick-corners relative aspect-[2/3] w-full overflow-hidden rounded-lg bg-surface">
           <Cover
-            src={item.poster_url}
+            src={posterSrc}
             alt={item.title}
             className="transition duration-300 group-hover:scale-[1.04]"
             sizes="(max-width: 640px) 45vw, (max-width: 1024px) 22vw, 13vw"
@@ -450,10 +463,10 @@ export const TitleCard = memo(function TitleCard({
             aria-label={`Open ${item.title}`}
             className="pointer-events-auto absolute inset-0 block overflow-hidden bg-surface-2"
           >
-            {item.poster_url ? (
+            {posterSrc ? (
               // eslint-disable-next-line @next/next/no-img-element
               <img
-                src={item.poster_url}
+                src={posterSrc}
                 alt=""
                 loading="lazy"
                 decoding="async"

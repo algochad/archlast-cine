@@ -1,0 +1,694 @@
+@page "/manga/{mangaId}"
+@rendermode @(new InteractiveServerRenderMode(prerender: true))
+@implements IAsyncDisposable
+@using MediatR
+@using Microsoft.AspNetCore.SignalR.Client
+@using MangaScrapper.Core.Features.Mangas.GetMangaById
+@using MangaScrapper.Core.Features.Mangas.GetAllChapters
+@using NovaStack.Contracts.Responses
+@inject ISender Sender
+@inject NavigationManager Navigation
+@inject IJSRuntime JS
+
+<PageTitle>@(Manga != null ? $"{Manga.Title} - MangaPanel" : "Manga Details - MangaPanel")</PageTitle>
+
+<HeadContent>
+    @if (Manga != null)
+    {
+        <meta name="description" content="@(string.IsNullOrWhiteSpace(Manga.Description) ? $"Read {Manga.Title} on MangaPanel" : (Manga.Description.Length > 200 ? Manga.Description[..197] + "..." : Manga.Description))" />
+        
+        <!-- Open Graph / Facebook / Discord / WhatsApp -->
+        <meta property="og:type" content="books.book" />
+        <meta property="og:title" content="@Manga.Title" />
+        <meta property="og:description" content="@(string.IsNullOrWhiteSpace(Manga.Description) ? $"Read {Manga.Title} on MangaPanel" : (Manga.Description.Length > 200 ? Manga.Description[..197] + "..." : Manga.Description))" />
+        <meta property="og:url" content="@Navigation.Uri" />
+        @if (!string.IsNullOrEmpty(AbsoluteCoverImageUrl))
+        {
+            <meta property="og:image" content="@AbsoluteCoverImageUrl" />
+            <meta property="og:image:alt" content="@Manga.Title Cover" />
+        }
+
+        <!-- Twitter -->
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta name="twitter:title" content="@Manga.Title" />
+        <meta name="twitter:description" content="@(string.IsNullOrWhiteSpace(Manga.Description) ? $"Read {Manga.Title} on MangaPanel" : (Manga.Description.Length > 200 ? Manga.Description[..197] + "..." : Manga.Description))" />
+        @if (!string.IsNullOrEmpty(AbsoluteCoverImageUrl))
+        {
+            <meta name="twitter:image" content="@AbsoluteCoverImageUrl" />
+        }
+    }
+</HeadContent>
+
+<div class="min-h-screen bg-bg-app text-text-main transition-colors duration-300 w-full overflow-x-hidden">
+    <!-- Top Navigation Bar -->
+    <header class="sticky top-0 z-40 bg-surface/80 backdrop-blur-md border-b border-border-main transition-colors duration-300">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-14 sm:h-16 flex items-center justify-between gap-3">
+            <div class="flex items-center gap-3">
+                <a href="/" class="flex items-center gap-2 group">
+                    <div class="flex h-8 w-8 sm:h-9 sm:w-9 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-primary/80 text-white font-black shadow-md shadow-primary/20 group-hover:scale-105 transition-transform text-sm sm:text-base">
+                        M
+                    </div>
+                    <span class="text-sm sm:text-base font-black tracking-tight text-text-main group-hover:text-primary transition-colors">
+                        Manga<span class="text-primary">Panel</span>
+                    </span>
+                </a>
+            </div>
+
+            <div class="flex items-center gap-2 sm:gap-3">
+                <button @onclick="GoBack" class="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 rounded-xl border border-border-main hover:bg-surface text-slate-600 dark:text-slate-300 text-xs font-semibold transition-all">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+                    </svg>
+                    <span>Back</span>
+                </button>
+                <button @onclick="ToggleTheme" class="h-8 w-8 sm:h-9 sm:w-9 rounded-xl bg-bg-app border border-border-main flex items-center justify-center text-slate-500 hover:text-primary hover:border-primary transition-all shadow-sm">
+                    @if (_isDarkMode)
+                    {
+                        <svg class="w-4 h-4 fill-amber-400" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4 8a4 4 0 11-8 0 4 4 0 018 0zm-.464 4.95l.707.707a1 1 0 001.414-1.414l-.707-.707a1 1 0 00-1.414 1.414zm2.12-10.607a1 1 0 010 1.414l-.706.707a1 1 0 11-1.414-1.414l.707-.707a1 1 0 011.414 0zM17 11a1 1 0 100-2h-1a1 1 0 100 2h1zm-7 4a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zM5.05 6.464A1 1 0 106.465 5.05l-.708-.707a1 1 0 00-1.414 1.414l.707.707zm1.414 8.486l-.707.707a1 1 0 01-1.414-1.414l.707-.707a1 1 0 011.414 1.414zM4 11a1 1 0 100-2H3a1 1 0 000 2h1z" clip-rule="evenodd" />
+                        </svg>
+                    }
+                    else
+                    {
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+                        </svg>
+                    }
+                </button>
+            </div>
+        </div>
+    </header>
+
+    @if (IsLoading)
+    {
+        <!-- Loading State Skeleton -->
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-10">
+            <div class="flex flex-col md:flex-row gap-6 sm:gap-8 animate-pulse items-center md:items-start">
+                <div class="w-44 sm:w-56 md:w-64 lg:w-72 aspect-[3/4] bg-slate-200 dark:bg-slate-800 rounded-2xl flex-shrink-0"></div>
+                <div class="flex-grow w-full space-y-4">
+                    <div class="h-8 bg-slate-200 dark:bg-slate-800 rounded-xl w-3/4"></div>
+                    <div class="h-4 bg-slate-200 dark:bg-slate-800 rounded-lg w-1/3"></div>
+                    <div class="flex gap-2 pt-2">
+                        <div class="h-6 w-16 bg-slate-200 dark:bg-slate-800 rounded-lg"></div>
+                        <div class="h-6 w-20 bg-slate-200 dark:bg-slate-800 rounded-lg"></div>
+                        <div class="h-6 w-14 bg-slate-200 dark:bg-slate-800 rounded-lg"></div>
+                    </div>
+                    <div class="h-24 bg-slate-200 dark:bg-slate-800 rounded-xl w-full pt-4"></div>
+                </div>
+            </div>
+        </div>
+    }
+    else if (HasError || Manga is null)
+    {
+        <!-- Error / Not Found State -->
+        <div class="max-w-xl mx-auto px-4 py-16 sm:py-24 text-center">
+            <div class="w-14 h-14 sm:w-16 sm:h-16 mx-auto mb-4 rounded-2xl bg-rose-500/10 text-rose-500 flex items-center justify-center">
+                <svg class="w-7 h-7 sm:w-8 sm:h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+            </div>
+            <h2 class="text-xl sm:text-2xl font-bold text-text-main mb-2">Manga Not Found</h2>
+            <p class="text-slate-500 dark:text-slate-400 text-xs sm:text-sm mb-6">The requested manga could not be loaded or doesn't exist.</p>
+            <button @onclick="GoBack" class="px-5 sm:px-6 py-2.5 bg-primary text-white font-bold text-xs uppercase tracking-wider rounded-xl hover:bg-primary/90 transition-all shadow-lg shadow-primary/20">
+                Return to Previous Page
+            </button>
+        </div>
+    }
+    else
+    {
+        <!-- Hero Section with Background Backdrop Effect -->
+        <div class="relative overflow-hidden border-b border-border-main bg-surface/50">
+            <!-- Ambient backdrop glow -->
+            @if (!string.IsNullOrEmpty(CoverImageUrl))
+            {
+                <div class="absolute inset-0 overflow-hidden pointer-events-none opacity-20 dark:opacity-25 filter blur-3xl scale-125 transform">
+                    <img src="@CoverImageUrl" alt="" class="w-full h-full object-cover" />
+                </div>
+            }
+
+            <div class="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-12">
+                <div class="flex flex-col md:flex-row gap-6 sm:gap-8 lg:gap-10 items-center md:items-start">
+                    
+                    <!-- Cover Card -->
+                    <div class="flex-shrink-0 w-44 sm:w-56 md:w-64 lg:w-72 mx-auto md:mx-0 group">
+                        <div class="aspect-[3/4] rounded-2xl overflow-hidden shadow-2xl border border-border-main bg-surface relative transition-all duration-300 group-hover:shadow-primary/10">
+                            @if (!string.IsNullOrEmpty(CoverImageUrl))
+                            {
+                                <img src="@CoverImageUrl" alt="@Manga.Title" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                            }
+                            else
+                            {
+                                <div class="w-full h-full flex flex-col items-center justify-center bg-slate-100 dark:bg-slate-800 text-slate-400">
+                                    <svg class="w-10 h-10 sm:w-12 sm:h-12 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                    </svg>
+                                    <span class="text-xs">No Cover</span>
+                                </div>
+                            }
+
+                            <!-- Type badge overlay -->
+                            @if (!string.IsNullOrEmpty(Manga.Type))
+                            {
+                                <div class="absolute top-2.5 sm:top-3 left-2.5 sm:left-3">
+                                    <span class="px-2 sm:px-2.5 py-0.5 sm:py-1 bg-surface/90 backdrop-blur-md text-primary text-[9px] sm:text-[10px] font-bold uppercase tracking-wider rounded-lg shadow-sm border border-border-main/50">
+                                        @Manga.Type
+                                    </span>
+                                </div>
+                            }
+
+                            @if (Manga.Nsfw == true)
+                            {
+                                <div class="absolute top-2.5 sm:top-3 right-2.5 sm:right-3">
+                                    <span class="px-2 py-0.5 bg-rose-500/90 backdrop-blur-md text-white text-[9px] sm:text-[10px] font-bold rounded shadow-sm">
+                                        18+
+                                    </span>
+                                </div>
+                            }
+                        </div>
+
+                        <!-- External Links -->
+                        @if (!string.IsNullOrEmpty(Manga.Url))
+                        {
+                            <div class="mt-3 sm:mt-4 flex flex-wrap items-center justify-center md:justify-start gap-1.5 sm:gap-2 text-xs">
+                                <a href="@Manga.Url" target="_blank" rel="noopener noreferrer" class="px-2.5 sm:px-3 py-1.5 bg-surface hover:bg-bg-app border border-border-main rounded-xl text-primary font-semibold flex items-center gap-1.5 transition-all shadow-sm text-xs">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                                    </svg>
+                                    <span>Source Site</span>
+                                </a>
+                            </div>
+                        }
+                    </div>
+
+                    <!-- Manga Info -->
+                    <div class="flex-grow min-w-0 w-full space-y-3 sm:space-y-4 text-center md:text-left">
+                        <!-- Badges Row -->
+                        <div class="flex flex-wrap items-center justify-center md:justify-start gap-1.5 sm:gap-2">
+                            @if (!string.IsNullOrEmpty(Manga.Status))
+                            {
+                                <span class="px-2.5 sm:px-3 py-0.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-bold uppercase tracking-wider @GetStatusClass(Manga.Status)">
+                                    @Manga.Status
+                                </span>
+                            }
+                            @if (Manga.Rating.HasValue)
+                            {
+                                <span class="px-2.5 sm:px-3 py-0.5 sm:py-1 bg-amber-500/10 text-amber-600 dark:text-amber-400 rounded-lg text-[10px] sm:text-xs font-bold flex items-center gap-1 sm:gap-1.5">
+                                    <svg class="w-3 sm:w-3.5 h-3 sm:h-3.5 fill-amber-500" viewBox="0 0 20 20">
+                                        <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />
+                                    </svg>
+                                    @Manga.Rating.Value.ToString("0.0")
+                                </span>
+                            }
+                            <span class="px-2.5 sm:px-3 py-0.5 sm:py-1 bg-surface border border-border-main text-slate-500 dark:text-slate-400 text-[10px] sm:text-xs font-bold rounded-lg">
+                                @Chapters.Count @(Chapters.Count == 1 ? "Chapter" : "Chapters")
+                            </span>
+
+                            @* Metadata Hotlink Badges *@
+                            @if (Manga.MalId > 0)
+                            {
+                                <a href="https://myanimelist.net/manga/@Manga.MalId" target="_blank" rel="noopener noreferrer" title="View on MyAnimeList" class="px-2.5 sm:px-3 py-0.5 sm:py-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-600 dark:text-blue-400 border border-blue-500/20 rounded-lg text-[10px] sm:text-xs font-bold flex items-center gap-1 transition-all shadow-sm group">
+                                    <span class="font-black text-blue-500">MAL</span>
+                                    <span>#@Manga.MalId</span>
+                                    <svg class="w-2.5 h-2.5 opacity-60 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                                </a>
+                            }
+                            @if (Manga.AnilistId.HasValue && Manga.AnilistId > 0)
+                            {
+                                <a href="https://anilist.co/manga/@Manga.AnilistId" target="_blank" rel="noopener noreferrer" title="View on AniList" class="px-2.5 sm:px-3 py-0.5 sm:py-1 bg-teal-500/10 hover:bg-teal-500/20 text-teal-600 dark:text-teal-400 border border-teal-500/20 rounded-lg text-[10px] sm:text-xs font-bold flex items-center gap-1 transition-all shadow-sm group">
+                                    <span class="font-black text-teal-500">AL</span>
+                                    <span>#@Manga.AnilistId</span>
+                                    <svg class="w-2.5 h-2.5 opacity-60 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                                </a>
+                            }
+                            @if (Manga.MangaUpdateId.HasValue && Manga.MangaUpdateId > 0)
+                            {
+                                <a href="https://www.mangaupdates.com/series.html?id=@Manga.MangaUpdateId" target="_blank" rel="noopener noreferrer" title="View on MangaUpdates" class="px-2.5 sm:px-3 py-0.5 sm:py-1 bg-purple-500/10 hover:bg-purple-500/20 text-purple-600 dark:text-purple-400 border border-purple-500/20 rounded-lg text-[10px] sm:text-xs font-bold flex items-center gap-1 transition-all shadow-sm group">
+                                    <span class="font-black text-purple-500">MU</span>
+                                    <span>#@Manga.MangaUpdateId</span>
+                                    <svg class="w-2.5 h-2.5 opacity-60 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                                </a>
+                            }
+                        </div>
+
+                        <!-- Title & Author -->
+                        <div>
+                            <h1 class="text-xl sm:text-3xl lg:text-4xl font-extrabold text-text-main tracking-tight leading-tight">
+                                @Manga.Title
+                            </h1>
+                            @if (Manga.Synonyms != null && Manga.Synonyms.Any())
+                            {
+                                <p class="text-xs sm:text-sm text-slate-400 dark:text-slate-500 italic mt-0.5">
+                                    Alt: @string.Join(" • ", Manga.Synonyms.Take(3))@(Manga.Synonyms.Count > 3 ? $" (+{Manga.Synonyms.Count - 3} more)" : "")
+                                </p>
+                            }
+                            <p class="text-xs sm:text-base text-slate-500 dark:text-slate-400 font-medium mt-1">
+                                By <span class="text-text-main font-semibold">@(string.IsNullOrWhiteSpace(Manga.Author) ? "Unknown" : Manga.Author)</span>
+                            </p>
+                        </div>
+
+                        <!-- Quick Stats Grid -->
+                        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3 pt-1 sm:pt-2 text-left">
+                            <div class="bg-surface rounded-xl p-2.5 sm:p-3 border border-border-main shadow-sm">
+                                <span class="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-0.5">Total Views</span>
+                                <p class="text-xs sm:text-sm font-bold text-text-main">@Manga.TotalView.ToString("N0")</p>
+                            </div>
+                            <div class="bg-surface rounded-xl p-2.5 sm:p-3 border border-border-main shadow-sm">
+                                <span class="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-0.5">Popularity Rank</span>
+                                <p class="text-xs sm:text-sm font-bold text-text-main">@(Manga.Popularity > 0 ? $"#{Manga.Popularity}" : "—")</p>
+                            </div>
+                            <div class="bg-surface rounded-xl p-2.5 sm:p-3 border border-border-main shadow-sm">
+                                <span class="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-0.5">Members</span>
+                                <p class="text-xs sm:text-sm font-bold text-text-main">@(Manga.Members > 0 ? Manga.Members.ToString("N0") : "—")</p>
+                            </div>
+                            <div class="bg-surface rounded-xl p-2.5 sm:p-3 border border-border-main shadow-sm">
+                                <span class="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-0.5">Release Date</span>
+                                <p class="text-xs sm:text-sm font-bold text-text-main">@(Manga.ReleaseDate.HasValue ? Manga.ReleaseDate.Value.ToString("yyyy-MM-dd") : "—")</p>
+                            </div>
+                        </div>
+
+                        <!-- Genres -->
+                        @if (Manga.Genres != null && Manga.Genres.Any())
+                        {
+                            <div class="space-y-1 sm:space-y-1.5 pt-1 sm:pt-2 text-left">
+                                <span class="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Genres</span>
+                                <div class="flex flex-wrap gap-1 sm:gap-1.5">
+                                    @foreach (var genre in Manga.Genres)
+                                    {
+                                        <span class="px-2 sm:px-2.5 py-0.5 sm:py-1 bg-surface border border-border-main text-slate-700 dark:text-slate-300 text-[11px] sm:text-xs font-semibold rounded-lg shadow-sm">
+                                            @genre
+                                        </span>
+                                    }
+                                </div>
+                            </div>
+                        }
+
+                        <!-- Categories / Tags -->
+                        @if (Manga.Categories != null && Manga.Categories.Any())
+                        {
+                            <div class="space-y-1 sm:space-y-1.5 text-left">
+                                <span class="text-[9px] sm:text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Tags & Categories</span>
+                                <div class="flex flex-wrap gap-1 sm:gap-1.5">
+                                    @foreach (var category in Manga.Categories)
+                                    {
+                                        <span class="px-2 py-0.5 bg-primary/5 text-primary text-[10px] sm:text-[11px] font-medium rounded-md border border-primary/10">
+                                            #@category
+                                        </span>
+                                    }
+                                </div>
+                            </div>
+                        }
+
+                        <!-- Description (Collapsible / Expandable) -->
+                        @if (!string.IsNullOrWhiteSpace(Manga.Description))
+                        {
+                            <div class="bg-surface rounded-2xl p-4 sm:p-5 border border-border-main shadow-sm space-y-2 mt-3 sm:mt-4 text-left">
+                                <div class="flex items-center justify-between">
+                                    <h3 class="text-[10px] sm:text-xs font-bold text-slate-400 uppercase tracking-wider">Synopsis / Description</h3>
+                                </div>
+                                <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed @(_isDescriptionExpanded ? "" : "line-clamp-4")">
+                                    @Manga.Description
+                                </p>
+                                @if (Manga.Description.Length > 250)
+                                {
+                                    <button @onclick="() => _isDescriptionExpanded = !_isDescriptionExpanded" class="text-xs font-bold text-primary hover:underline pt-1 inline-flex items-center gap-1">
+                                        <span>@(_isDescriptionExpanded ? "Read Less" : "Read More")</span>
+                                        <svg class="w-3.5 h-3.5 transform @(_isDescriptionExpanded ? "rotate-180" : "") transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                                        </svg>
+                                    </button>
+                                }
+                            </div>
+                        }
+
+                        <!-- Reading CTA Action Buttons -->
+                        <div class="flex flex-wrap items-center justify-center md:justify-start gap-3 pt-2 sm:pt-3">
+                            <a href="open-manga-reader://manga/@mangaId" class="w-full sm:w-auto px-6 py-3 bg-primary hover:bg-primary/90 text-white text-xs font-bold uppercase tracking-wider rounded-xl shadow-lg shadow-primary/20 flex items-center justify-center gap-2 transition-all">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                                </svg>
+                                <span>Read in App</span>
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Content Area: Chapters List -->
+        <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10 space-y-4 sm:space-y-6">
+            
+            <!-- Chapter Filter & Controls Bar -->
+            <div class="bg-surface p-4 sm:p-5 rounded-2xl border border-border-main shadow-sm flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 sm:gap-4 transition-colors duration-300">
+                <div class="flex items-center gap-2.5 sm:gap-3">
+                    <h2 class="text-base sm:text-lg font-bold text-text-main">Chapter List</h2>
+                    <span class="px-2.5 py-0.5 bg-primary/10 text-primary text-xs font-bold rounded-full">
+                        @FilteredChapters.Count()
+                    </span>
+                </div>
+
+                <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 sm:gap-3">
+                    <!-- Search Chapter Filter -->
+                    <div class="relative w-full sm:min-w-[200px]">
+                        <span class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
+                            <svg class="h-4 w-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                            </svg>
+                        </span>
+                        <input type="text" @bind="_chapterSearch" @bind:event="oninput" placeholder="Search chapter number..."
+                               class="w-full pl-10 pr-4 py-2 bg-bg-app border border-border-main rounded-xl focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all text-xs text-text-main" />
+                    </div>
+
+                    <!-- Sort Order Toggle -->
+                    <button @onclick="ToggleSortOrder" class="w-full sm:w-auto px-3.5 py-2 bg-bg-app hover:bg-surface border border-border-main rounded-xl text-xs font-semibold text-text-main flex items-center justify-center gap-2 transition-all">
+                        <svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+                        </svg>
+                        <span>@(_sortDescending ? "Newest First" : "Oldest First")</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Chapters Grid / List -->
+            @if (!FilteredChapters.Any())
+            {
+                <div class="bg-surface rounded-2xl border border-border-main p-8 sm:p-12 text-center">
+                    <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-400 flex items-center justify-center">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                        </svg>
+                    </div>
+                    <h4 class="text-sm font-bold text-text-main">No Chapters Found</h4>
+                    <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                        @(string.IsNullOrWhiteSpace(_chapterSearch) ? "No chapters have been released yet for this manga." : "No chapters match your search criteria.")
+                    </p>
+                </div>
+            }
+            else
+            {
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 sm:gap-3">
+                    @foreach (var chapter in FilteredChapters)
+                    {
+                        <div class="group bg-surface hover:bg-bg-app border border-border-main hover:border-primary/50 rounded-2xl p-3.5 sm:p-4 transition-all duration-200 shadow-sm flex flex-col justify-between cursor-pointer">
+                            
+                            <div class="flex items-start justify-between gap-2 mb-2">
+                                <div class="flex items-center gap-2 min-w-0">
+                                    <div class="flex h-7 w-7 sm:h-8 sm:w-8 items-center justify-center rounded-lg bg-primary/10 text-primary font-bold text-xs group-hover:bg-primary group-hover:text-white transition-colors flex-shrink-0">
+                                        #
+                                    </div>
+                                    <div class="min-w-0">
+                                        <span class="font-bold text-xs sm:text-sm text-text-main group-hover:text-primary transition-colors truncate block">
+                                            Chapter @chapter.Number
+                                        </span>
+                                        @if (!string.IsNullOrEmpty(chapter.Language))
+                                        {
+                                            <span class="inline-block mt-0.5 px-1.5 py-0.5 bg-slate-100 dark:bg-slate-800 text-slate-500 text-[9px] sm:text-[10px] font-bold rounded uppercase">
+                                                @chapter.Language
+                                            </span>
+                                        }
+                                    </div>
+                                </div>
+
+                                <!-- Pages / Availability status badge -->
+                                @if (chapter.TotalPages > 0 || (chapter.Pages != null && chapter.Pages.Count > 0))
+                                {
+                                    var pageCount = chapter.TotalPages > 0 ? chapter.TotalPages : chapter.Pages!.Count;
+                                    <span class="inline-flex items-center gap-1 px-2 py-0.5 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[9px] sm:text-[10px] font-bold rounded-full flex-shrink-0">
+                                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                                        @pageCount pgs
+                                    </span>
+                                }
+                                else
+                                {
+                                    <span class="inline-flex items-center gap-1 px-2 py-0.5 bg-slate-500/10 text-slate-400 text-[9px] sm:text-[10px] font-medium rounded-full flex-shrink-0">
+                                        Link only
+                                    </span>
+                                }
+                            </div>
+
+                            <div class="flex items-center justify-between pt-2 border-t border-border-main/50 text-[10px] sm:text-[11px] text-slate-500 dark:text-slate-400">
+                                <!-- Provider info -->
+                                <div class="flex items-center gap-1.5 truncate">
+                                    @if (!string.IsNullOrEmpty(chapter.ChapterProviderIcon))
+                                    {
+                                        <img src="@chapter.ChapterProviderIcon" class="w-3.5 h-3.5 rounded object-contain flex-shrink-0" alt="" />
+                                    }
+                                    <span class="truncate">@(string.IsNullOrEmpty(chapter.ChapterProvider) ? "Unknown Provider" : chapter.ChapterProvider)</span>
+                                </div>
+
+                                <!-- Upload Date -->
+                                <span class="flex-shrink-0 ml-2">
+                                    @chapter.UploadDate.ToLocalTime().ToString("MMM dd, yyyy")
+                                </span>
+                            </div>
+                        </div>
+                    }
+                </div>
+            }
+        </main>
+    }
+</div>
+
+@code {
+    [Parameter] public string? mangaId { get; set; }
+
+    private MangaSummaryResponse? Manga { get; set; }
+    private List<ChapterResponse> Chapters { get; set; } = new();
+    private bool IsLoading { get; set; } = true;
+    private bool HasError { get; set; } = false;
+
+    private bool _isDarkMode = false;
+    private bool _isDescriptionExpanded = false;
+    private string _chapterSearch = "";
+    private bool _sortDescending = true;
+
+    private string? CoverImageUrl =>
+        !string.IsNullOrEmpty(Manga?.LocalImageUrl)
+            ? $"/images/{Manga.LocalImageUrl}"
+            : Manga?.ImageUrl;
+
+    private string? AbsoluteCoverImageUrl
+    {
+        get
+        {
+            if (string.IsNullOrEmpty(CoverImageUrl)) return null;
+            if (CoverImageUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                CoverImageUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                return CoverImageUrl;
+            }
+            return Navigation.ToAbsoluteUri(CoverImageUrl).ToString();
+        }
+    }
+
+    private IEnumerable<ChapterResponse> FilteredChapters
+    {
+        get
+        {
+            var query = Chapters.AsEnumerable();
+
+            if (!string.IsNullOrWhiteSpace(_chapterSearch))
+            {
+                var term = _chapterSearch.Trim();
+                query = query.Where(c => c.Number.ToString().Contains(term, StringComparison.OrdinalIgnoreCase));
+            }
+
+            return _sortDescending
+                ? query.OrderByDescending(c => c.Number)
+                : query.OrderBy(c => c.Number);
+        }
+    }
+
+    private HubConnection? _hubConnection;
+    private string? _currentJoinedMangaId;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (Guid.TryParse(mangaId, out var id))
+        {
+            await LoadMangaDetails(id);
+            await UpdateSignalRGroup(id.ToString());
+        }
+        else
+        {
+            HasError = true;
+            IsLoading = false;
+        }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await SetupSignalR();
+        }
+    }
+
+    private async Task SetupSignalR()
+    {
+        try
+        {
+            _hubConnection = new HubConnectionBuilder()
+                .WithUrl(Navigation.ToAbsoluteUri("/hubs/manga"))
+                .WithAutomaticReconnect()
+                .Build();
+
+            _hubConnection.On<System.Text.Json.JsonElement>("ChaptersUpdated", async (payload) =>
+            {
+                if (Guid.TryParse(mangaId, out var currentId))
+                {
+                    var match = false;
+                    if (payload.TryGetProperty("mangaId", out var mangaIdProp))
+                    {
+                        if (mangaIdProp.ValueKind == System.Text.Json.JsonValueKind.String &&
+                            Guid.TryParse(mangaIdProp.GetString(), out var eventMangaId) &&
+                            eventMangaId == currentId)
+                        {
+                            match = true;
+                        }
+                    }
+
+                    if (match)
+                    {
+                        await RefreshChapters(currentId);
+                    }
+                }
+            });
+
+            await _hubConnection.StartAsync();
+
+            if (Guid.TryParse(mangaId, out var id))
+            {
+                await UpdateSignalRGroup(id.ToString());
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[PublicMangaDetailPage] SignalR error: {ex.Message}");
+        }
+    }
+
+    private async Task UpdateSignalRGroup(string newMangaId)
+    {
+        if (_hubConnection is { State: HubConnectionState.Connected })
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(_currentJoinedMangaId) && _currentJoinedMangaId != newMangaId)
+                {
+                    await _hubConnection.SendAsync("LeaveMangaGroup", _currentJoinedMangaId);
+                }
+
+                await _hubConnection.SendAsync("JoinMangaGroup", newMangaId);
+                _currentJoinedMangaId = newMangaId;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[PublicMangaDetailPage] Error updating SignalR group: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task RefreshChapters(Guid id)
+    {
+        try
+        {
+            var chaptersResult = await Sender.Send(new GetAllChaptersQuery(id));
+            if (chaptersResult.IsSuccess && chaptersResult.Value != null)
+            {
+                Chapters = chaptersResult.Value;
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[PublicMangaDetailPage] Error refreshing chapters via SignalR: {ex.Message}");
+        }
+    }
+
+    private async Task LoadMangaDetails(Guid id)
+    {
+        IsLoading = true;
+        HasError = false;
+
+        try
+        {
+            var mangaTask = Sender.Send(new GetMangaByIdQuery(id));
+            var chaptersTask = Sender.Send(new GetAllChaptersQuery(id));
+
+            await Task.WhenAll(mangaTask, chaptersTask);
+
+            var mangaResult = await mangaTask;
+            var chaptersResult = await chaptersTask;
+
+            if (mangaResult.IsSuccess && mangaResult.Value != null)
+            {
+                Manga = mangaResult.Value;
+                Chapters = chaptersResult.IsSuccess && chaptersResult.Value != null ? chaptersResult.Value : new();
+            }
+            else
+            {
+                HasError = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[PublicMangaDetailPage] Error loading manga: {ex.Message}");
+            HasError = true;
+        }
+        finally
+        {
+            IsLoading = false;
+        }
+    }
+
+    private async Task ToggleTheme()
+    {
+        try
+        {
+            _isDarkMode = await JS.InvokeAsync<bool>("themeManager.toggleDark");
+        }
+        catch
+        {
+            _isDarkMode = !_isDarkMode;
+        }
+    }
+
+    private void ToggleSortOrder()
+    {
+        _sortDescending = !_sortDescending;
+    }
+
+    private void GoBack()
+    {
+        Navigation.NavigateTo("/");
+    }
+
+    private static string GetStatusClass(string status) => status?.ToLower() switch
+    {
+        "ongoing" or "publishing" => "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20",
+        "completed" or "finished" => "bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/20",
+        "on hiatus" or "hiatus" => "bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20",
+        "discontinued" or "cancelled" => "bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20",
+        "upcoming" => "bg-violet-500/10 text-violet-600 dark:text-violet-400 border border-violet-500/20",
+        _ => "bg-slate-500/10 text-slate-500 dark:text-slate-400 border border-slate-500/20"
+    };
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_hubConnection != null)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(_currentJoinedMangaId))
+                {
+                    await _hubConnection.SendAsync("LeaveMangaGroup", _currentJoinedMangaId);
+                }
+                await _hubConnection.DisposeAsync();
+            }
+            catch
+            {
+                // Ignore disposal exceptions
+            }
+        }
+    }
+}

@@ -1,0 +1,552 @@
+@using System.Net.Http.Json
+@using Microsoft.AspNetCore.SignalR.Client
+@implements IAsyncDisposable
+@inject HttpClient Http
+@inject IJSRuntime JS
+@inject NavigationManager Navigation
+
+@if (IsOpen)
+{
+    <div class="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200">
+        <div class="bg-surface rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col border border-border-main animate-in zoom-in-95 duration-200">
+            
+            <!-- Modal Header -->
+            <div class="px-5 sm:px-6 py-4 border-b border-border-main flex items-center justify-between bg-surface shadow-sm z-10 flex-shrink-0">
+                <div class="flex items-center gap-3 min-w-0">
+                    <div class="h-10 w-10 rounded-xl bg-primary/10 text-primary flex items-center justify-center border border-primary/20 flex-shrink-0">
+                        @if (ActiveCount > 0)
+                        {
+                            <svg class="w-5 h-5 animate-spin text-primary" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+                            </svg>
+                        }
+                        else
+                        {
+                            <svg class="w-5 h-5 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                            </svg>
+                        }
+                    </div>
+                    <div class="min-w-0">
+                        <div class="flex items-center gap-2">
+                            <h2 class="text-base sm:text-lg font-bold text-text-main truncate">Scraping Tasks & Queue</h2>
+                            @if (ActiveCount > 0)
+                            {
+                                <span class="px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-500 text-[10px] font-bold flex items-center gap-1">
+                                    <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+                                    @ActiveCount Active
+                                </span>
+                            }
+                            else
+                            {
+                                <span class="px-2 py-0.5 rounded-full bg-slate-500/10 text-slate-400 text-[10px] font-bold">
+                                    Idle
+                                </span>
+                            }
+                        </div>
+                        <p class="text-xs text-slate-400 truncate">Real-time background workers & chapter download queue</p>
+                    </div>
+                </div>
+
+                <div class="flex items-center gap-2">
+                    <button type="button" @onclick="RefreshAsync" title="Refresh list"
+                            class="p-2 rounded-xl bg-bg-app border border-border-main text-slate-400 hover:text-text-main hover:border-primary transition-all shadow-sm cursor-pointer @(_isRefreshing ? "opacity-50 pointer-events-none" : "")">
+                        <svg class="w-4 h-4 @(_isRefreshing ? "animate-spin" : "")" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                        </svg>
+                    </button>
+
+                    @if (ActiveCount > 0 || TotalQueueReadyCount > 0)
+                    {
+                        <button type="button" @onclick="ConfirmCancelAll"
+                                class="px-3 py-1.5 bg-rose-500/10 hover:bg-rose-500 text-rose-500 hover:text-white border border-rose-500/20 text-xs font-bold rounded-xl transition-all flex items-center gap-1.5 shadow-sm cursor-pointer">
+                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                            <span>Cancel All</span>
+                        </button>
+                    }
+
+                    <button type="button" @onclick="CloseModal" class="p-2 hover:bg-bg-app rounded-full transition-colors text-slate-400 hover:text-text-main cursor-pointer">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Queue Health Status Banner -->
+            <div class="px-5 sm:px-6 py-3 bg-bg-app/70 border-b border-border-main flex flex-wrap items-center justify-between gap-3 text-xs flex-shrink-0">
+                <div class="flex items-center gap-4 flex-wrap">
+                    <div class="flex items-center gap-2">
+                        <span class="text-slate-400">RabbitMQ Queue:</span>
+                        <span class="font-mono font-bold text-text-main bg-surface px-2 py-0.5 rounded-md border border-border-main">scrape-chapter-pages</span>
+                    </div>
+                    @if (_queueStats.Any())
+                    {
+                        @foreach (var q in _queueStats)
+                        {
+                            <span class="px-2 py-0.5 rounded-md bg-indigo-500/10 text-indigo-500 font-semibold border border-indigo-500/20">
+                                @q.State
+                            </span>
+                        }
+                    }
+                </div>
+                @if (TotalQueueReadyCount > 0)
+                {
+                    <button type="button" @onclick="PurgeQueueAsync" class="text-rose-500 hover:underline font-bold text-[11px] cursor-pointer">
+                        Purge Queue Only
+                    </button>
+                }
+            </div>
+
+            <!-- Tab Filter Header -->
+            <div class="px-5 sm:px-6 border-b border-border-main bg-surface flex items-center justify-between gap-2 overflow-x-auto flex-shrink-0">
+                <div class="flex items-center gap-2">
+                    <button type="button" @onclick='() => _filter = "all"'
+                            class="py-3 px-3 text-xs font-bold border-b-2 transition-all cursor-pointer @(_filter == "all" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-text-main")">
+                        All Processes (@_processes.Count)
+                    </button>
+                    <button type="button" @onclick='() => _filter = "active"'
+                            class="py-3 px-3 text-xs font-bold border-b-2 transition-all cursor-pointer @(_filter == "active" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-text-main")">
+                        Active (@ActiveCount)
+                    </button>
+                    <button type="button" @onclick='() => _filter = "completed"'
+                            class="py-3 px-3 text-xs font-bold border-b-2 transition-all cursor-pointer @(_filter == "completed" ? "border-primary text-primary" : "border-transparent text-slate-500 hover:text-text-main")">
+                        Finished (@CompletedCount)
+                    </button>
+                </div>
+                @if (CompletedCount > 0)
+                {
+                    <button type="button" @onclick="ClearFinishedLocal" class="text-[11px] font-bold text-slate-400 hover:text-text-main transition-colors cursor-pointer">
+                        Clear History
+                    </button>
+                }
+            </div>
+
+            <!-- Process Items List -->
+            <div class="flex-grow overflow-y-auto p-4 sm:p-6 space-y-3 bg-bg-app">
+                @if (_isLoading)
+                {
+                    <div class="flex flex-col items-center justify-center py-16">
+                        <div class="animate-spin rounded-full h-9 w-9 border-b-2 border-primary mb-3"></div>
+                        <p class="text-xs text-slate-400 font-medium">Loading background processes...</p>
+                    </div>
+                }
+                else if (!FilteredProcesses.Any())
+                {
+                    <div class="flex flex-col items-center justify-center py-16 text-center">
+                        <div class="h-16 w-16 rounded-2xl bg-surface border border-border-main flex items-center justify-center text-slate-400 mb-3 shadow-sm">
+                            <svg class="w-8 h-8 opacity-60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                        </div>
+                        <h3 class="text-sm font-bold text-text-main">No processes running</h3>
+                        <p class="text-xs text-slate-400 mt-1 max-w-sm">All chapter scraping and background tasks are idle or completed.</p>
+                    </div>
+                }
+                else
+                {
+                    @foreach (var proc in FilteredProcesses)
+                    {
+                        <div class="p-4 bg-surface rounded-xl border border-border-main shadow-sm hover:border-slate-300 dark:hover:border-slate-700 transition-all">
+                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
+                                <div class="min-w-0 flex-grow">
+                                    <div class="flex items-center gap-2 flex-wrap">
+                                        <h4 class="text-sm font-bold text-text-main truncate max-w-md">@proc.MangaTitle</h4>
+                                        <span class="px-2 py-0.5 rounded-md bg-bg-app text-slate-500 dark:text-slate-400 font-mono text-[11px] font-bold border border-border-main">
+                                            Ch. @proc.ChapterNumber
+                                        </span>
+                                    </div>
+                                    <div class="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5">
+                                        <span>Started: @proc.StartedAt.ToLocalTime().ToString("HH:mm:ss")</span>
+                                        <span>•</span>
+                                        <span>Updated: @proc.UpdatedAt.ToLocalTime().ToString("HH:mm:ss")</span>
+                                    </div>
+                                </div>
+
+                                <div class="flex items-center gap-2 flex-shrink-0">
+                                    <span class="px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 @GetStatusBadgeClass(proc.Status)">
+                                        @if (proc.Status == "InProgress")
+                                        {
+                                            <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+                                        }
+                                        else if (proc.Status == "Starting" || proc.Status == "Queued")
+                                        {
+                                            <span class="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-ping"></span>
+                                        }
+                                        <span>@proc.Status</span>
+                                    </span>
+
+                                    @if (IsCancellable(proc.Status))
+                                    {
+                                        <button type="button" @onclick="() => CancelProcessAsync(proc)"
+                                                title="Cancel this scraping task"
+                                                class="px-2.5 py-1 bg-rose-500/10 hover:bg-rose-500 text-rose-500 hover:text-white border border-rose-500/20 text-xs font-bold rounded-lg transition-all flex items-center gap-1 shadow-sm cursor-pointer">
+                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                                            </svg>
+                                            <span>Cancel</span>
+                                        </button>
+                                    }
+                                </div>
+                            </div>
+
+                            <!-- Progress Bar -->
+                            <div class="space-y-1 mt-3">
+                                <div class="flex items-center justify-between text-xs">
+                                    <span class="text-slate-400 font-medium">
+                                        @if (proc.TotalPages > 0)
+                                        {
+                                            <span>@proc.DownloadedPages / @proc.TotalPages pages</span>
+                                        }
+                                        else if (proc.Status == "Starting")
+                                        {
+                                            <span>Fetching chapter page list...</span>
+                                        }
+                                        else if (proc.Status == "Queued")
+                                        {
+                                            <span>Waiting in RabbitMQ queue...</span>
+                                        }
+                                        else if (proc.Status == "Cancelled")
+                                        {
+                                            <span>Cancelled by user</span>
+                                        }
+                                        else
+                                        {
+                                            <span>@proc.DownloadedPages pages</span>
+                                        }
+                                    </span>
+                                    <span class="font-bold text-text-main font-mono">@proc.Percent%</span>
+                                </div>
+                                <div class="w-full h-2 bg-bg-app rounded-full overflow-hidden border border-border-main/50">
+                                    <div class="h-full rounded-full transition-all duration-300 @GetProgressBarColor(proc.Status)"
+                                         style="width: @(Math.Clamp(proc.Percent, 0, 100))%">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    }
+                }
+            </div>
+
+            <!-- Modal Footer -->
+            <div class="px-5 sm:px-6 py-3 border-t border-border-main bg-surface flex items-center justify-between text-xs text-slate-400 flex-shrink-0">
+                <div class="flex items-center gap-2">
+                    <span class="w-2 h-2 rounded-full @(_hubConnection?.State == HubConnectionState.Connected ? "bg-emerald-500" : "bg-amber-500")"></span>
+                    <span>@(_hubConnection?.State == HubConnectionState.Connected ? "Live SignalR Connected" : "Connecting to SignalR...")</span>
+                </div>
+                <button type="button" @onclick="CloseModal" class="px-4 py-2 bg-bg-app hover:bg-slate-200 dark:hover:bg-slate-800 text-text-main font-bold rounded-xl border border-border-main transition-colors cursor-pointer">
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public bool IsOpen { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public EventCallback<int> OnActiveCountChanged { get; set; }
+
+    private List<ProcessItemDto> _processes = new();
+    private List<QueueStatDto> _queueStats = new();
+    private HubConnection? _hubConnection;
+    private bool _isLoading = true;
+    private bool _isRefreshing = false;
+    private string _filter = "all";
+
+    private int ActiveCount => _processes.Count(p => p.Status is "InProgress" or "Starting" or "Queued");
+    private int CompletedCount => _processes.Count(p => p.Status is "Completed" or "Cancelled" or "Failed");
+    private int TotalQueueReadyCount
+    {
+        get
+        {
+            var total = 0;
+            foreach (var q in _queueStats)
+            {
+                // Parse "Enqueued (X ready, ...)"
+                if (q.State.Contains("ready"))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(q.State, @"(\d+)\s+ready");
+                    if (match.Success && int.TryParse(match.Groups[1].Value, out var n)) total += n;
+                }
+            }
+            return total;
+        }
+    }
+
+    private IEnumerable<ProcessItemDto> FilteredProcesses => _filter switch
+    {
+        "active" => _processes.Where(p => p.Status is "InProgress" or "Starting" or "Queued"),
+        "completed" => _processes.Where(p => p.Status is "Completed" or "Cancelled" or "Failed"),
+        _ => _processes
+    };
+
+    protected override async Task OnInitializedAsync()
+    {
+        await InitializeSignalRAsync();
+        await RefreshAsync();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (IsOpen)
+        {
+            await RefreshAsync();
+        }
+    }
+
+    private async Task InitializeSignalRAsync()
+    {
+        if (_hubConnection != null) return;
+
+        try
+        {
+            var hubUrl = Navigation.ToAbsoluteUri("/hubs/manga");
+            _hubConnection = new HubConnectionBuilder()
+                .WithUrl(hubUrl)
+
+                .WithAutomaticReconnect()
+                .Build();
+
+            _hubConnection.On<System.Text.Json.JsonElement>("ChapterScrapingProgress", async (payload) =>
+            {
+                try
+                {
+                    Guid? chapterId = null;
+                    if (payload.TryGetProperty("chapterId", out var chIdProp) && Guid.TryParse(chIdProp.GetString(), out var cid))
+                    {
+                        chapterId = cid;
+                    }
+
+                    if (!chapterId.HasValue) return;
+
+                    var mangaId = Guid.Empty;
+                    if (payload.TryGetProperty("mangaId", out var mIdProp) && Guid.TryParse(mIdProp.GetString(), out var mid))
+                        mangaId = mid;
+
+                    var mangaTitle = payload.TryGetProperty("mangaTitle", out var mtProp) ? mtProp.GetString() ?? "" : "";
+                    var chapterNum = payload.TryGetProperty("chapterNumber", out var cnProp) ? cnProp.GetDouble() : 0;
+                    var dlPages = payload.TryGetProperty("downloadedPages", out var dpProp) ? dpProp.GetInt32() : 0;
+                    var totPages = payload.TryGetProperty("totalPages", out var tpProp) ? tpProp.GetInt32() : 0;
+                    var pct = payload.TryGetProperty("percent", out var pctProp) ? pctProp.GetInt32() : 0;
+                    var status = payload.TryGetProperty("status", out var stProp) ? stProp.GetString() ?? "InProgress" : "InProgress";
+
+                    var existing = _processes.FirstOrDefault(p => p.ChapterId == chapterId.Value);
+                    if (existing != null)
+                    {
+                        existing.MangaTitle = string.IsNullOrWhiteSpace(existing.MangaTitle) ? mangaTitle : existing.MangaTitle;
+                        existing.DownloadedPages = dlPages;
+                        existing.TotalPages = totPages;
+                        existing.Percent = pct;
+                        existing.Status = status;
+                        existing.UpdatedAt = DateTime.UtcNow;
+                    }
+                    else
+                    {
+                        _processes.Insert(0, new ProcessItemDto
+                        {
+                            Id = chapterId.Value.ToString(),
+                            MangaId = mangaId,
+                            MangaTitle = mangaTitle,
+                            ChapterId = chapterId.Value,
+                            ChapterNumber = chapterNum,
+                            DownloadedPages = dlPages,
+                            TotalPages = totPages,
+                            Percent = pct,
+                            Status = status,
+                            StartedAt = DateTime.UtcNow,
+                            UpdatedAt = DateTime.UtcNow
+                        });
+                    }
+
+                    await OnActiveCountChanged.InvokeAsync(ActiveCount);
+                    await InvokeAsync(StateHasChanged);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error parsing ChapterScrapingProgress in modal: {ex.Message}");
+                }
+            });
+
+            await _hubConnection.StartAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error starting SignalR connection in RunningProcessesModal: {ex.Message}");
+        }
+    }
+
+    public async Task RefreshAsync()
+    {
+        _isRefreshing = true;
+        StateHasChanged();
+
+        try
+        {
+            var res = await Http.GetFromJsonAsync<ProcessesApiResponse>("/api/v1/scrapper/processes");
+            if (res?.Data != null)
+            {
+                _processes = res.Data.Processes ?? new();
+                _queueStats = res.Data.QueueStats ?? new();
+                await OnActiveCountChanged.InvokeAsync(ActiveCount);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to fetch processes: {ex.Message}");
+        }
+        finally
+        {
+            _isLoading = false;
+            _isRefreshing = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task CancelProcessAsync(ProcessItemDto proc)
+    {
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"Cancel scraping for {proc.MangaTitle} Chapter {proc.ChapterNumber}?");
+        if (!confirmed) return;
+
+        try
+        {
+            var payload = new { MangaId = proc.MangaId, ChapterId = proc.ChapterId, CancelAll = false };
+            var response = await Http.PostAsJsonAsync("/api/v1/scrapper/cancel", payload);
+            if (response.IsSuccessStatusCode)
+            {
+                proc.Status = "Cancelled";
+                proc.UpdatedAt = DateTime.UtcNow;
+                await OnActiveCountChanged.InvokeAsync(ActiveCount);
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error cancelling process: {ex.Message}");
+        }
+    }
+
+    private async Task ConfirmCancelAll()
+    {
+        var confirmed = await JS.InvokeAsync<bool>("confirm", "Are you sure you want to cancel all active scraping tasks and clear the queue?");
+        if (!confirmed) return;
+
+        try
+        {
+            var payload = new { CancelAll = true };
+            var response = await Http.PostAsJsonAsync("/api/v1/scrapper/cancel", payload);
+            if (response.IsSuccessStatusCode)
+            {
+                foreach (var p in _processes.Where(p => p.Status is "InProgress" or "Starting" or "Queued"))
+                {
+                    p.Status = "Cancelled";
+                    p.UpdatedAt = DateTime.UtcNow;
+                }
+                await RefreshAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error cancelling all processes: {ex.Message}");
+        }
+    }
+
+    private async Task PurgeQueueAsync()
+    {
+        var confirmed = await JS.InvokeAsync<bool>("confirm", "Purge all ready messages in the RabbitMQ scraping queue?");
+        if (!confirmed) return;
+
+        try
+        {
+            var response = await Http.PostAsync("/api/v1/scrapper/purge", null);
+            if (response.IsSuccessStatusCode)
+            {
+                await RefreshAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error purging queue: {ex.Message}");
+        }
+    }
+
+    private void ClearFinishedLocal()
+    {
+        _processes.RemoveAll(p => p.Status is "Completed" or "Cancelled" or "Failed");
+        StateHasChanged();
+    }
+
+    private async Task CloseModal()
+    {
+        await OnClose.InvokeAsync();
+    }
+
+    private static bool IsCancellable(string status) => status is "InProgress" or "Starting" or "Queued";
+
+    private static string GetStatusBadgeClass(string status) => status switch
+    {
+        "InProgress" => "bg-amber-500/10 text-amber-500 border border-amber-500/20",
+        "Starting" => "bg-blue-500/10 text-blue-500 border border-blue-500/20",
+        "Queued" => "bg-indigo-500/10 text-indigo-500 border border-indigo-500/20",
+        "Completed" => "bg-emerald-500/10 text-emerald-500 border border-emerald-500/20",
+        "Failed" => "bg-rose-500/10 text-rose-500 border border-rose-500/20",
+        "Cancelled" => "bg-slate-500/10 text-slate-400 border border-slate-500/20",
+        _ => "bg-slate-500/10 text-slate-400"
+    };
+
+    private static string GetProgressBarColor(string status) => status switch
+    {
+        "Completed" => "bg-emerald-500",
+        "Cancelled" => "bg-slate-400",
+        "Failed" => "bg-rose-500",
+        _ => "bg-gradient-to-r from-primary via-indigo-500 to-amber-500"
+    };
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_hubConnection != null)
+        {
+            try
+            {
+                await _hubConnection.DisposeAsync();
+            }
+            catch { }
+        }
+    }
+
+    public class ProcessesApiResponse
+    {
+        public ProcessesDataDto? Data { get; set; }
+    }
+
+    public class ProcessesDataDto
+    {
+        public List<ProcessItemDto>? Processes { get; set; }
+        public List<QueueStatDto>? QueueStats { get; set; }
+    }
+
+    public class ProcessItemDto
+    {
+        public string Id { get; set; } = string.Empty;
+        public Guid MangaId { get; set; }
+        public string MangaTitle { get; set; } = string.Empty;
+        public Guid ChapterId { get; set; }
+        public double ChapterNumber { get; set; }
+        public int DownloadedPages { get; set; }
+        public int TotalPages { get; set; }
+        public int Percent { get; set; }
+        public string Status { get; set; } = "InProgress";
+        public DateTime StartedAt { get; set; }
+        public DateTime UpdatedAt { get; set; }
+    }
+
+    public class QueueStatDto
+    {
+        public string Id { get; set; } = string.Empty;
+        public string JobName { get; set; } = string.Empty;
+        public string State { get; set; } = string.Empty;
+    }
+}

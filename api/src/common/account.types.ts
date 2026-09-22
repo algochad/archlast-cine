@@ -6,7 +6,7 @@ export type RegionId = (typeof REGION_IDS)[number];
 export const PROVIDER_IDS = ['moviebox', 'fourkhdhub'] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 
-export const MEDIA_TYPES = ['movie', 'series', 'anime'] as const;
+export const MEDIA_TYPES = ['movie', 'series', 'anime', 'manga'] as const;
 export type MediaType = (typeof MEDIA_TYPES)[number];
 
 export interface AccountUser {
@@ -52,6 +52,20 @@ export interface MyListItem {
   mediaType: MediaType;
   year: string | null;
   addedAt: number;
+}
+
+export interface ReadingEntry {
+  provider: string;
+  id: string;
+  title: string;
+  poster: string | null;
+  mediaType: MediaType;
+  year: string | null;
+  chapter: number;
+  page: number;
+  totalPages: number;
+  /** Unix ms of last update. */
+  updatedAt: number;
 }
 
 export function isRegionId(value: string): value is RegionId {

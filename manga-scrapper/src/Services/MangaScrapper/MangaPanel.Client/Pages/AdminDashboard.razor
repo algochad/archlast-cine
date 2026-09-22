@@ -1,0 +1,603 @@
+@page "/admin/dashboard"
+@rendermode @(new InteractiveWebAssemblyRenderMode(prerender: false))
+@layout Layout.AdminLayout
+@using MangaPanel.Client.Components
+@using Microsoft.AspNetCore.Authorization
+@attribute [Authorize]
+@inject HttpClient Http
+@inject IJSRuntime JS
+
+@if (isLoading)
+{
+    <div class="flex items-center justify-center min-h-[300px] sm:min-h-[400px]">
+        <div class="animate-spin rounded-full h-10 w-10 sm:h-12 sm:w-12 border-b-2 border-primary"></div>
+    </div>
+}
+else
+{
+    <!-- Feedback / Sync Alert Banner -->
+    @if (!string.IsNullOrEmpty(statusMessage))
+    {
+        <div class="mb-6 p-4 rounded-2xl border flex items-center justify-between transition-all duration-300 @(isStatusError ? "bg-rose-50 dark:bg-rose-950/40 border-rose-200 dark:border-rose-900 text-rose-700 dark:text-rose-300" : "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-900 text-emerald-700 dark:text-emerald-300")">
+            <div class="flex items-center gap-3">
+                @if (isStatusError)
+                {
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                }
+                else
+                {
+                    <svg class="w-5 h-5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                }
+                <span class="text-sm font-semibold">@statusMessage</span>
+            </div>
+            <button @onclick="() => statusMessage = null" class="p-1 rounded-lg hover:bg-black/5 dark:hover:bg-white/5 transition-colors">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+        </div>
+    }
+
+    <!-- Primary Metrics Grid -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-6 mb-6 sm:mb-8">
+        <!-- Total Manga -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3.5 bg-blue-50 dark:bg-blue-950/40 rounded-xl text-blue-500 flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Total Manga</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-secondary dark:text-text-main truncate">@stats.TotalManga.ToString("N0")</h4>
+            </div>
+        </div>
+
+        <!-- Total Chapters -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3.5 bg-indigo-50 dark:bg-indigo-950/40 rounded-xl text-indigo-500 flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Total Chapters</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-secondary dark:text-text-main truncate">@stats.TotalChapters.ToString("N0")</h4>
+            </div>
+        </div>
+        
+        <!-- Scrapped Today -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3.5 bg-emerald-50 dark:bg-emerald-950/40 rounded-xl text-emerald-500 flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Scrapped Today</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-secondary dark:text-text-main truncate">@stats.ScrappedToday.ToString("N0")</h4>
+            </div>
+        </div>
+
+        <!-- Month Scrap -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3.5 bg-purple-50 dark:bg-purple-950/40 rounded-xl text-purple-500 flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Month Scrap</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-secondary dark:text-text-main truncate">@stats.ScrappedThisMonth.ToString("N0")</h4>
+            </div>
+        </div>
+
+        <!-- Total Users -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3.5 bg-cyan-50 dark:bg-cyan-950/40 rounded-xl text-cyan-500 flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Total Users</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-secondary dark:text-text-main truncate">@stats.TotalUsers.ToString("N0")</h4>
+            </div>
+        </div>
+
+        <!-- Active Users -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3.5 bg-teal-50 dark:bg-teal-950/40 rounded-xl text-teal-500 flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5.121 17.804A13.937 13.937 0 0112 16c2.5 0 4.847.655 6.879 1.804M15 10a3 3 0 11-6 0 3 3 0 016 0zm6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Active Users (Today / 30d)</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-secondary dark:text-text-main truncate">@stats.ActiveUsersToday <span class="text-xs sm:text-sm font-normal text-slate-400">/ @stats.ActiveUsersThisMonth</span></h4>
+            </div>
+        </div>
+
+        <!-- Scrape Providers -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3.5 bg-amber-50 dark:bg-amber-950/40 rounded-xl text-amber-500 flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Active Providers</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-secondary dark:text-text-main truncate">@stats.TotalSourceProvider</h4>
+            </div>
+        </div>
+
+        <!-- Storage Used -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main flex items-center space-x-3 sm:space-x-4 transition-colors duration-300">
+            <div class="p-2.5 sm:p-3.5 bg-orange-50 dark:bg-orange-950/40 rounded-xl text-orange-500 flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 sm:h-6 sm:w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-slate-400 text-[10px] sm:text-xs font-semibold uppercase tracking-wider truncate">Storage Used</p>
+                <h4 class="text-lg sm:text-2xl font-bold text-secondary dark:text-text-main truncate">@FormatSize(stats.TotalStorageUsed)</h4>
+            </div>
+        </div>
+    </div>
+
+    <!-- Health & Quality Warning Banner (if anomalies exist) -->
+    @if (stats.TotalUnlinkedMetadata > 0 || stats.TotalUnavailableMangaChapter > 0)
+    {
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-6 mb-6 sm:mb-8">
+            @if (stats.TotalUnlinkedMetadata > 0)
+            {
+                <div class="bg-amber-500/10 border border-amber-500/20 rounded-2xl p-4 sm:p-5 flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <div class="p-2 rounded-xl bg-amber-500/20 text-amber-600 dark:text-amber-400">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+                        </div>
+                        <div>
+                            <h5 class="text-xs sm:text-sm font-bold text-text-main">Unlinked Metadata</h5>
+                            <p class="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400">@stats.TotalUnlinkedMetadata manga titles are missing Anilist metadata</p>
+                        </div>
+                    </div>
+                    <a href="/admin/manga?unlinkedAnilist=true" class="px-3 py-1.5 text-xs font-semibold text-amber-600 dark:text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 rounded-xl transition-colors">
+                        Review
+                    </a>
+                </div>
+            }
+
+            @if (stats.TotalUnavailableMangaChapter > 0)
+            {
+                <div class="bg-rose-500/10 border border-rose-500/20 rounded-2xl p-4 sm:p-5 flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <div class="p-2 rounded-xl bg-rose-500/20 text-rose-600 dark:text-rose-400">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                        </div>
+                        <div>
+                            <h5 class="text-xs sm:text-sm font-bold text-text-main">Missing Chapter Pages</h5>
+                            <p class="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400">@stats.TotalUnavailableMangaChapter titles contain chapters with 0 pages</p>
+                        </div>
+                    </div>
+                    <a href="/admin/manga" class="px-3 py-1.5 text-xs font-semibold text-rose-600 dark:text-rose-400 bg-rose-500/10 hover:bg-rose-500/20 rounded-xl transition-colors">
+                        Inspect
+                    </a>
+                </div>
+            }
+        </div>
+    }
+
+    <!-- System Maintenance & Quick Sync Hub -->
+    <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main mb-6 sm:mb-8 transition-colors duration-300">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4 sm:mb-6">
+            <div>
+                <h3 class="text-base sm:text-lg font-bold text-secondary dark:text-text-main flex items-center gap-2">
+                    <svg class="w-5 h-5 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    System Maintenance & Synchronization
+                </h3>
+                <p class="text-xs text-slate-400">Trigger background search indexing, embedding generations, and storage calculations</p>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+            <!-- Sync Meilisearch -->
+            <div class="p-4 rounded-xl bg-bg-app border border-border-main flex flex-col justify-between space-y-3">
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="text-xs sm:text-sm font-bold text-text-main">Meilisearch Index</span>
+                        <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-blue-500/10 text-blue-500">Full-Text</span>
+                    </div>
+                    <p class="text-[11px] sm:text-xs text-slate-400">Re-indexes all manga documents and metadata for fast client searching.</p>
+                </div>
+                <button @onclick="TriggerSyncMeilisearch" disabled="@isSyncingMeilisearch" class="w-full flex items-center justify-center gap-2 px-3 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-semibold rounded-xl transition-all shadow-sm cursor-pointer">
+                    @if (isSyncingMeilisearch)
+                    {
+                        <div class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                        <span>Syncing...</span>
+                    }
+                    else
+                    {
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                        <span>Sync Meilisearch</span>
+                    }
+                </button>
+            </div>
+
+            <!-- Sync Qdrant -->
+            <div class="p-4 rounded-xl bg-bg-app border border-border-main flex flex-col justify-between space-y-3">
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="text-xs sm:text-sm font-bold text-text-main">Qdrant Vector DB</span>
+                        <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-purple-500/10 text-purple-500">Embeddings</span>
+                    </div>
+                    <p class="text-[11px] sm:text-xs text-slate-400">Recomputes AI embeddings for recommendation & semantic similarity.</p>
+                </div>
+                <button @onclick="TriggerSyncQdrant" disabled="@isSyncingQdrant" class="w-full flex items-center justify-center gap-2 px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-xs font-semibold rounded-xl transition-all shadow-sm cursor-pointer">
+                    @if (isSyncingQdrant)
+                    {
+                        <div class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                        <span>Syncing...</span>
+                    }
+                    else
+                    {
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                        <span>Sync Qdrant</span>
+                    }
+                </button>
+            </div>
+
+            <!-- Sync Storage -->
+            <div class="p-4 rounded-xl bg-bg-app border border-border-main flex flex-col justify-between space-y-3">
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="text-xs sm:text-sm font-bold text-text-main">Storage Reconciliation</span>
+                        <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-orange-500/10 text-orange-500">Disk / Cloud</span>
+                    </div>
+                    <p class="text-[11px] sm:text-xs text-slate-400">Calculates accurate thumbnail and page byte sizes in database.</p>
+                </div>
+                <button @onclick="TriggerSyncStorage" disabled="@isSyncingStorage" class="w-full flex items-center justify-center gap-2 px-3 py-2 bg-orange-600 hover:bg-orange-700 disabled:opacity-50 text-white text-xs font-semibold rounded-xl transition-all shadow-sm cursor-pointer">
+                    @if (isSyncingStorage)
+                    {
+                        <div class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                        <span>Syncing...</span>
+                    }
+                    else
+                    {
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" /></svg>
+                        <span>Sync Storage</span>
+                    }
+                </button>
+            </div>
+
+            <!-- Sync AniList Metadata -->
+            <div class="p-4 rounded-xl bg-bg-app border border-border-main flex flex-col justify-between space-y-3">
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="text-xs sm:text-sm font-bold text-text-main">AniList Metadata</span>
+                        <span class="text-[10px] font-bold px-2 py-0.5 rounded bg-teal-500/10 text-teal-500">External</span>
+                    </div>
+                    <p class="text-[11px] sm:text-xs text-slate-400">Enriches titles, synonyms, status, ratings, and tags from AniList.</p>
+                </div>
+                <button @onclick="TriggerSyncAnilist" disabled="@isSyncingAnilist" class="w-full flex items-center justify-center gap-2 px-3 py-2 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white text-xs font-semibold rounded-xl transition-all shadow-sm cursor-pointer">
+                    @if (isSyncingAnilist)
+                    {
+                        <div class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                        <span>Syncing...</span>
+                    }
+                    else
+                    {
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                        <span>Sync AniList</span>
+                    }
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Distribution & Breakdown Analytics Grid -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6 mb-6 sm:mb-8">
+        <!-- Scraper Providers Distribution -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main transition-colors duration-300">
+            <h3 class="text-base sm:text-lg font-bold text-secondary dark:text-text-main mb-3 sm:mb-4 flex items-center justify-between">
+                <span>Chapters Scraped by Provider</span>
+                <span class="text-xs font-normal text-slate-400">@stats.ProviderChapterBreakdown.Count Sources</span>
+            </h3>
+            @if (stats.ProviderChapterBreakdown.Any())
+            {
+                <div class="space-y-3">
+                    @foreach (var provider in stats.ProviderChapterBreakdown.OrderByDescending(x => x.Value))
+                    {
+                        var percentage = stats.TotalChapters > 0 ? (provider.Value * 100.0 / stats.TotalChapters) : 0;
+                        <div>
+                            <div class="flex justify-between text-xs font-semibold mb-1">
+                                <span class="text-text-main uppercase tracking-wider">@provider.Key</span>
+                                <span class="text-slate-400">@provider.Value.ToString("N0") chapters (@percentage.ToString("0.#")%)</span>
+                            </div>
+                            <div class="w-full h-2 bg-bg-app rounded-full overflow-hidden border border-border-main/50">
+                                <div class="h-full bg-primary rounded-full transition-all duration-500" style="width: @($"{Math.Max(percentage, 2)}%")"></div>
+                            </div>
+                        </div>
+                    }
+                </div>
+            }
+            else
+            {
+                <p class="text-xs text-slate-400 py-4 text-center">No provider data available yet.</p>
+            }
+        </div>
+
+        <!-- Manga Types & Status Breakdown -->
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main transition-colors duration-300">
+            <h3 class="text-base sm:text-lg font-bold text-secondary dark:text-text-main mb-3 sm:mb-4">Catalog Breakdown</h3>
+            
+            <div class="mb-4">
+                <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Content Types</p>
+                <div class="grid grid-cols-3 gap-2">
+                    @foreach (var type in stats.MangaTypeBreakdown)
+                    {
+                        <div class="p-3 rounded-xl bg-bg-app border border-border-main text-center">
+                            <p class="text-[10px] font-bold text-slate-400 uppercase">@type.Key</p>
+                            <p class="text-base sm:text-lg font-bold text-text-main">@type.Value.ToString("N0")</p>
+                        </div>
+                    }
+                </div>
+            </div>
+
+            @if (stats.MangaStatusBreakdown.Any())
+            {
+                <div>
+                    <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">Publication Status</p>
+                    <div class="grid grid-cols-2 gap-2">
+                        @foreach (var status in stats.MangaStatusBreakdown)
+                        {
+                            <div class="p-3 rounded-xl bg-bg-app border border-border-main flex items-center justify-between">
+                                <span class="text-xs font-semibold text-text-main capitalize">@status.Key</span>
+                                <span class="text-xs font-bold px-2 py-0.5 rounded-lg bg-primary/10 text-primary">@status.Value.ToString("N0")</span>
+                            </div>
+                        }
+                    </div>
+                </div>
+            }
+        </div>
+    </div>
+
+    <!-- Monthly Scrap Activity Chart -->
+    @if (stats.MonthlyScrap != null && stats.MonthlyScrap.Any())
+    {
+        <div class="bg-surface p-4 sm:p-6 rounded-2xl shadow-sm border border-border-main mb-6 sm:mb-8 transition-colors duration-300">
+            <h3 class="text-base sm:text-lg font-bold text-secondary dark:text-text-main mb-4 sm:mb-6">Monthly Scrap Activity</h3>
+            <div class="h-[220px] sm:h-[300px] w-full">
+                <canvas id="scrapChart"></canvas>
+            </div>
+        </div>
+    }
+
+    <!-- Recent Manga -->
+    <div class="flex justify-between items-center mb-4 sm:mb-6">
+        <h3 class="text-base sm:text-lg font-bold text-secondary dark:text-text-main">Recent Manga</h3>
+        <a href="/admin/manga" class="text-primary font-bold text-xs sm:text-sm hover:underline">View All</a>
+    </div>
+
+    <div class="grid grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 2xl:grid-cols-5 gap-3 sm:gap-6">
+        @foreach (var manga in recentManga)
+        {
+            <MangaCard Manga="manga" OnDetailClick="OpenDetail" />
+        }
+    </div>
+
+    @if (selectedMangaId != Guid.Empty)
+    {
+        <MangaDetailModal MangaId="selectedMangaId" OnClosed="CloseDetail" OnSaved="OnMangaSaved" />
+    }
+}
+
+@code {
+    private DashboardStatistic stats = new();
+    private List<MangaSummary> recentManga = new();
+    private bool isLoading = true;
+    private Guid selectedMangaId = Guid.Empty;
+
+    private bool isSyncingMeilisearch = false;
+    private bool isSyncingQdrant = false;
+    private bool isSyncingStorage = false;
+    private bool isSyncingAnilist = false;
+
+    private string? statusMessage;
+    private bool isStatusError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadData();
+        isLoading = false;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!isLoading && stats.MonthlyScrap != null && stats.MonthlyScrap.Any())
+        {
+            await CreateChart();
+        }
+    }
+
+    private async Task CreateChart()
+    {
+        var labels = stats.MonthlyScrap.Select(x => x.Date.ToString("MMM dd")).ToArray();
+        var data = stats.MonthlyScrap.Select(x => x.TotalScrap).ToArray();
+
+        try
+        {
+            await JS.InvokeVoidAsync("createScrapChart", "scrapChart", labels, data);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error creating chart: {ex.Message}");
+        }
+    }
+
+    private void OpenDetail(MangaSummary manga)
+    {
+        selectedMangaId = manga.Id;
+    }
+
+    private void CloseDetail()
+    {
+        selectedMangaId = Guid.Empty;
+    }
+
+    private async Task OnMangaSaved()
+    {
+        await LoadData();
+    }
+
+    private async Task LoadData()
+    {
+        try
+        {
+            var statsTask = Http.GetApiDataAsync<DashboardStatistic>("/api/v1/dashboard/stats");
+            var mangaTask = Http.GetApiDataAsync<MangaListResponse>("/api/v1/manga?pageSize=5");
+
+            await Task.WhenAll(statsTask, mangaTask);
+
+            stats = await statsTask ?? new();
+            recentManga = (await mangaTask)?.Items?.ToList() ?? new();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading dashboard: {ex.Message}");
+        }
+    }
+
+    private async Task TriggerSyncMeilisearch()
+    {
+        isSyncingMeilisearch = true;
+        statusMessage = null;
+        try
+        {
+            var response = await Http.PostAsync("/api/v1/dashboard/sync-meilisearch", null);
+            if (response.IsSuccessStatusCode)
+            {
+                statusMessage = "Meilisearch sync event queued successfully.";
+                isStatusError = false;
+            }
+            else
+            {
+                statusMessage = $"Failed to trigger Meilisearch sync (HTTP {response.StatusCode}).";
+                isStatusError = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Error syncing Meilisearch: {ex.Message}";
+            isStatusError = true;
+        }
+        finally
+        {
+            isSyncingMeilisearch = false;
+        }
+    }
+
+    private async Task TriggerSyncQdrant()
+    {
+        isSyncingQdrant = true;
+        statusMessage = null;
+        try
+        {
+            var response = await Http.PostAsync("/api/v1/dashboard/sync-qdrant", null);
+            if (response.IsSuccessStatusCode)
+            {
+                statusMessage = "Qdrant vector embedding sync event queued successfully.";
+                isStatusError = false;
+            }
+            else
+            {
+                statusMessage = $"Failed to trigger Qdrant sync (HTTP {response.StatusCode}).";
+                isStatusError = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Error syncing Qdrant: {ex.Message}";
+            isStatusError = true;
+        }
+        finally
+        {
+            isSyncingQdrant = false;
+        }
+    }
+
+    private async Task TriggerSyncStorage()
+    {
+        isSyncingStorage = true;
+        statusMessage = null;
+        try
+        {
+            var response = await Http.PostAsync("/api/v1/dashboard/sync-storage", null);
+            if (response.IsSuccessStatusCode)
+            {
+                statusMessage = "Storage calculation & sync event queued successfully.";
+                isStatusError = false;
+                await LoadData();
+            }
+            else
+            {
+                statusMessage = $"Failed to trigger Storage sync (HTTP {response.StatusCode}).";
+                isStatusError = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Error syncing storage: {ex.Message}";
+            isStatusError = true;
+        }
+        finally
+        {
+            isSyncingStorage = false;
+        }
+    }
+
+    private async Task TriggerSyncAnilist()
+    {
+        isSyncingAnilist = true;
+        statusMessage = null;
+        try
+        {
+            var response = await Http.PostAsync("/api/v1/dashboard/sync-anilist", null);
+            if (response.IsSuccessStatusCode)
+            {
+                statusMessage = "AniList metadata background sync queued successfully.";
+                isStatusError = false;
+            }
+            else
+            {
+                statusMessage = $"Failed to trigger AniList sync (HTTP {response.StatusCode}).";
+                isStatusError = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            statusMessage = $"Error syncing AniList: {ex.Message}";
+            isStatusError = true;
+        }
+        finally
+        {
+            isSyncingAnilist = false;
+        }
+    }
+
+    private string FormatSize(long bytes)
+    {
+        string[] unit = { "B", "KB", "MB", "GB", "TB" };
+        int i = 0;
+        double dblSByte = bytes;
+        while (dblSByte >= 1024 && i < unit.Length - 1)
+        {
+            i++;
+            dblSByte /= 1024;
+        }
+        return $"{dblSByte:0.##} {unit[i]}";
+    }
+}

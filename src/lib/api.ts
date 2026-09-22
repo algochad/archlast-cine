@@ -5,6 +5,9 @@ import {
   DetailsResponse,
   HealthResponse,
   HomeResponse,
+  MangaChapterDetailResponse,
+  MangaChaptersResponse,
+  MangaTrendingResponse,
   PlayResponse,
   ProviderId,
   SearchResponse,
@@ -82,6 +85,17 @@ export const api = {
     request<{ removed: boolean }>(`/transcode/${encodeURIComponent(session)}`, {
       method: "DELETE",
     }),
+  /** Trending manga row for the home feed. */
+  mangaTrending: (page = 1) =>
+    request<MangaTrendingResponse>(`/manga/trending?page=${page}`),
+  /** Chapter list for a manga title. */
+  mangaChapters: (id: string) =>
+    request<MangaChaptersResponse>(`/manga/chapters?id=${encodeURIComponent(id)}`),
+  /** Chapter with page images (URLs already resolved to the backend proxy). */
+  mangaChapterDetail: (id: string, chapterId: string) =>
+    request<MangaChapterDetailResponse>(
+      `/manga/chapter?id=${encodeURIComponent(id)}&chapter_id=${encodeURIComponent(chapterId)}`,
+    ),
 };
 
 /** Status of an in-flight transcode session. */

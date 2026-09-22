@@ -1,0 +1,8 @@
+﻿<NavLink href=@MenuData.Href class="flex items-center space-x-3 rounded-lg p-3 transition-colors hover:bg-secondary hover:text-white" ActiveClass="bg-secondary shadow-md text-white">
+    @MenuData.Icon
+    <span>@MenuData.Label</span>
+</NavLink>
+@code {
+    [Parameter]
+    public MenuData MenuData { get; set; }
+}

@@ -1,14 +1,14 @@
 // Typed mirror of the Rust backend's JSON contract
 // (moviebox_tui::providers::models + server responses).
 
-export type ProviderId = "moviebox" | "fourkhdhub" | "bdix_circleftp" | "bdix_dhakaflix" | "addons" | "anime";
+export type ProviderId = "moviebox" | "fourkhdhub" | "bdix_circleftp" | "bdix_dhakaflix" | "addons" | "anime" | "manga";
 
 export interface ProviderRef {
   provider: ProviderId;
   value: string;
 }
 
-export type MediaType = "movie" | "series" | "anime";
+export type MediaType = "movie" | "series" | "anime" | "manga";
 
 export interface CatalogItem {
   id: ProviderRef;
@@ -149,6 +149,49 @@ export interface TranscodeStartResponse {
 export interface CaptionsResponse {
   id: string;
   subtitles: SubtitleOption[];
+}
+
+// ── Manga (MangaScrapper-backed reader content) ─────────────────────────────
+
+export interface MangaChapterSummary {
+  id: string;
+  number: number;
+  language: string;
+  uploadDate: string | null;
+  totalPages: number;
+}
+
+export interface MangaChapterPage {
+  url: string | null;
+  width: number;
+  height: number;
+  alternateUrl: string | null;
+  isFallback: boolean;
+}
+
+export interface MangaChapter {
+  id: string;
+  number: number;
+  language: string;
+  uploadDate: string | null;
+  totalPages: number;
+  pages: MangaChapterPage[];
+}
+
+export interface MangaTrendingResponse {
+  sort: string;
+  page: number;
+  items: CatalogItem[];
+}
+
+export interface MangaChaptersResponse {
+  id: string;
+  chapters: MangaChapterSummary[];
+}
+
+export interface MangaChapterDetailResponse {
+  id: string;
+  chapter: MangaChapter;
 }
 
 export interface HealthResponse {

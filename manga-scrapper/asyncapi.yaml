@@ -1,0 +1,647 @@
+asyncapi: 3.0.0
+info:
+  title: MangaScrapper Asynchronous & Real-Time API
+  version: 1.0.0
+  description: |
+    Comprehensive AsyncAPI specification for the MangaScrapper distributed system.
+    Defines asynchronous messaging via **RabbitMQ**, real-time duplex streaming via **ASP.NET Core SignalR**,
+    and mobile push notifications via **Firebase Cloud Messaging (FCM)**.
+  contact:
+    name: MangaScrapper Development Team
+  license:
+    name: MIT
+
+servers:
+  rabbitmq:
+    host: localhost:5672
+    pathname: /
+    protocol: amqp
+    description: RabbitMQ broker for asynchronous scraping workflows, sync jobs, and cross-service integration events.
+  signalr:
+    host: localhost:5000
+    pathname: /hubs/manga
+    protocol: wss
+    description: ASP.NET Core SignalR WebSockets hub for live scraping progress streaming and real-time chapter update notifications.
+  fcm:
+    host: fcm.googleapis.com
+    pathname: /v1/projects/{projectId}/messages:send
+    protocol: https
+    description: Firebase Cloud Messaging gateway for mobile push notifications to Flutter clients.
+
+channels:
+  # ==========================================
+  # RabbitMQ Worker Queues
+  # ==========================================
+  scrapeChapterPages:
+    address: scrape-chapter-pages
+    description: Queue for dispatching chapter page scraping jobs to Scrapper.Worker.
+    messages:
+      ScrapChapterPagesIntegrationEvent:
+        $ref: '#/components/messages/ScrapChapterPagesIntegrationEvent'
+
+  deleteManga:
+    address: delete-manga
+    description: Queue for deleting manga assets from filesystem, MongoDB, Meilisearch, and Qdrant.
+    messages:
+      DeleteMangaIntegrationEvent:
+        $ref: '#/components/messages/DeleteMangaIntegrationEvent'
+
+  deleteChapter:
+    address: delete-chapter
+    description: Queue for deleting specific chapter image directories and database records.
+    messages:
+      DeleteChapterIntegrationEvent:
+        $ref: '#/components/messages/DeleteChapterIntegrationEvent'
+
+  syncStorage:
+    address: sync-storage
+    description: Queue for triggering filesystem storage reconciliation.
+    messages:
+      SyncStorageIntegrationEvent:
+        $ref: '#/components/messages/SyncStorageIntegrationEvent'
+
+  syncQdrant:
+    address: sync-qdrant
+    description: Queue for synchronizing manga embeddings with Qdrant vector database.
+    messages:
+      SyncQdrantIntegrationEvent:
+        $ref: '#/components/messages/SyncQdrantIntegrationEvent'
+
+  syncMeilisearch:
+    address: sync-meilisearch
+    description: Queue for synchronizing manga documents with Meilisearch search index.
+    messages:
+      SyncMeilisearchIntegrationEvent:
+        $ref: '#/components/messages/SyncMeilisearchIntegrationEvent'
+
+  # ==========================================
+  # RabbitMQ -> API SignalR Broadcast Queues
+  # ==========================================
+  chapterPagesScraped:
+    address: chapter-pages-scraped
+    description: Published by Scrapper.Worker when a chapter is fully scraped; consumed by MangaScrapper.Api to broadcast SignalR refresh events.
+    messages:
+      ChapterPagesScrapedIntegrationEvent:
+        $ref: '#/components/messages/ChapterPagesScrapedIntegrationEvent'
+
+  chapterScrapingProgress:
+    address: chapter-scraping-progress
+    description: Published by Scrapper.Worker per downloaded page; consumed by MangaScrapper.Api to broadcast live progress bars over SignalR.
+    messages:
+      ChapterScrapingProgressIntegrationEvent:
+        $ref: '#/components/messages/ChapterScrapingProgressIntegrationEvent'
+
+  # ==========================================
+  # SignalR WebSockets Hub (/hubs/manga)
+  # ==========================================
+  signalrMangaHub:
+    address: /hubs/manga
+    description: Bi-directional SignalR channel for real-time progress streaming and chapter updates.
+    messages:
+      JoinMangaGroupMessage:
+        $ref: '#/components/messages/JoinMangaGroupMessage'
+      LeaveMangaGroupMessage:
+        $ref: '#/components/messages/LeaveMangaGroupMessage'
+      ChaptersUpdatedBroadcast:
+        $ref: '#/components/messages/ChaptersUpdatedBroadcast'
+      ChapterScrapingProgressBroadcast:
+        $ref: '#/components/messages/ChapterScrapingProgressBroadcast'
+
+  # ==========================================
+  # Firebase Cloud Messaging (FCM)
+  # ==========================================
+  fcmTopicNotifications:
+    address: /topics/manga_{mangaId}
+    description: FCM Topic channel for broadcasting new chapter releases to mobile Flutter clients.
+    parameters:
+      mangaId:
+        description: 32-character hexadecimal UUID of the manga aggregate.
+        schema:
+          type: string
+          format: uuid
+    messages:
+      NewChapterFcmNotification:
+        $ref: '#/components/messages/NewChapterFcmNotification'
+
+operations:
+  # RabbitMQ Operations
+  publishScrapChapterPages:
+    action: send
+    channel:
+      $ref: '#/channels/scrapeChapterPages'
+    summary: Queue chapter pages for scraping
+    description: Published by API or scraper services to request Scrapper.Worker to download and convert chapter images.
+    messages:
+      - $ref: '#/components/messages/ScrapChapterPagesIntegrationEvent'
+
+  consumeScrapChapterPages:
+    action: receive
+    channel:
+      $ref: '#/channels/scrapeChapterPages'
+    summary: Scrapper.Worker consumes scraping task
+    description: Scrapper.Worker downloads images, converts them to WebP, and saves them to local storage.
+    messages:
+      - $ref: '#/components/messages/ScrapChapterPagesIntegrationEvent'
+
+  publishChapterPagesScraped:
+    action: send
+    channel:
+      $ref: '#/channels/chapterPagesScraped'
+    summary: Notify chapter scraping completion
+    description: Published by Scrapper.Worker upon successful scraping of all chapter pages.
+    messages:
+      - $ref: '#/components/messages/ChapterPagesScrapedIntegrationEvent'
+
+  consumeChapterPagesScraped:
+    action: receive
+    channel:
+      $ref: '#/channels/chapterPagesScraped'
+    summary: API consumes scraping completion to trigger SignalR
+    description: MangaScrapper.Api consumes the event and broadcasts "ChaptersUpdated" to connected SignalR clients.
+    messages:
+      - $ref: '#/components/messages/ChapterPagesScrapedIntegrationEvent'
+
+  publishChapterScrapingProgress:
+    action: send
+    channel:
+      $ref: '#/channels/chapterScrapingProgress'
+    summary: Publish incremental page download progress
+    description: Published by Scrapper.Worker as each individual page is converted to WebP.
+    messages:
+      - $ref: '#/components/messages/ChapterScrapingProgressIntegrationEvent'
+
+  consumeChapterScrapingProgress:
+    action: receive
+    channel:
+      $ref: '#/channels/chapterScrapingProgress'
+    summary: API consumes incremental progress to stream to SignalR
+    description: MangaScrapper.Api broadcasts "ChapterScrapingProgress" to the specific manga group and all clients.
+    messages:
+      - $ref: '#/components/messages/ChapterScrapingProgressIntegrationEvent'
+
+  publishDeleteManga:
+    action: send
+    channel:
+      $ref: '#/channels/deleteManga'
+    summary: Publish manga deletion event
+    messages:
+      - $ref: '#/components/messages/DeleteMangaIntegrationEvent'
+
+  consumeDeleteManga:
+    action: receive
+    channel:
+      $ref: '#/channels/deleteManga'
+    summary: Worker consumes manga deletion
+    messages:
+      - $ref: '#/components/messages/DeleteMangaIntegrationEvent'
+
+  publishDeleteChapter:
+    action: send
+    channel:
+      $ref: '#/channels/deleteChapter'
+    summary: Publish chapter deletion event
+    messages:
+      - $ref: '#/components/messages/DeleteChapterIntegrationEvent'
+
+  consumeDeleteChapter:
+    action: receive
+    channel:
+      $ref: '#/channels/deleteChapter'
+    summary: Worker consumes chapter deletion
+    messages:
+      - $ref: '#/components/messages/DeleteChapterIntegrationEvent'
+
+  # SignalR Client & Server Operations
+  clientJoinMangaGroup:
+    action: send
+    channel:
+      $ref: '#/channels/signalrMangaHub'
+    summary: Client joins manga real-time group
+    description: Blazor/WASM client invokes JoinMangaGroup(mangaId) when opening a manga detail view.
+    messages:
+      - $ref: '#/components/messages/JoinMangaGroupMessage'
+
+  clientLeaveMangaGroup:
+    action: send
+    channel:
+      $ref: '#/channels/signalrMangaHub'
+    summary: Client leaves manga real-time group
+    description: Blazor/WASM client invokes LeaveMangaGroup(mangaId) when navigating away.
+    messages:
+      - $ref: '#/components/messages/LeaveMangaGroupMessage'
+
+  serverBroadcastChaptersUpdated:
+    action: receive
+    channel:
+      $ref: '#/channels/signalrMangaHub'
+    summary: Receive ChaptersUpdated notification
+    description: Clients receive real-time notice that a chapter has finished scraping and auto-refresh chapter lists.
+    messages:
+      - $ref: '#/components/messages/ChaptersUpdatedBroadcast'
+
+  serverBroadcastChapterScrapingProgress:
+    action: receive
+    channel:
+      $ref: '#/channels/signalrMangaHub'
+    summary: Receive ChapterScrapingProgress live metrics
+    description: Clients receive real-time percentage, downloaded pages, total pages, and status for live progress bars.
+    messages:
+      - $ref: '#/components/messages/ChapterScrapingProgressBroadcast'
+
+  # Firebase Cloud Messaging Operations
+  sendFcmNewChapterNotification:
+    action: send
+    channel:
+      $ref: '#/channels/fcmTopicNotifications'
+    summary: Send FCM push notification for new chapter
+    description: Backend dispatches multicast messages to user library subscribers and topic subscribers on mobile.
+    messages:
+      - $ref: '#/components/messages/NewChapterFcmNotification'
+
+components:
+  messages:
+    # ----------------------------------------
+    # RabbitMQ Messages
+    # ----------------------------------------
+    ScrapChapterPagesIntegrationEvent:
+      name: ScrapChapterPagesIntegrationEvent
+      title: Scrap Chapter Pages Integration Event
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ScrapChapterPagesPayload'
+
+    DeleteMangaIntegrationEvent:
+      name: DeleteMangaIntegrationEvent
+      title: Delete Manga Integration Event
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/DeleteMangaPayload'
+
+    DeleteChapterIntegrationEvent:
+      name: DeleteChapterIntegrationEvent
+      title: Delete Chapter Integration Event
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/DeleteChapterPayload'
+
+    SyncStorageIntegrationEvent:
+      name: SyncStorageIntegrationEvent
+      title: Sync Storage Integration Event
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/BaseEventPayload'
+
+    SyncQdrantIntegrationEvent:
+      name: SyncQdrantIntegrationEvent
+      title: Sync Qdrant Integration Event
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/BaseEventPayload'
+
+    SyncMeilisearchIntegrationEvent:
+      name: SyncMeilisearchIntegrationEvent
+      title: Sync Meilisearch Integration Event
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/BaseEventPayload'
+
+    ChapterPagesScrapedIntegrationEvent:
+      name: ChapterPagesScrapedIntegrationEvent
+      title: Chapter Pages Scraped Integration Event
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChapterPagesScrapedPayload'
+
+    ChapterScrapingProgressIntegrationEvent:
+      name: ChapterScrapingProgressIntegrationEvent
+      title: Chapter Scraping Progress Integration Event
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChapterScrapingProgressPayload'
+
+    # ----------------------------------------
+    # SignalR Hub Messages
+    # ----------------------------------------
+    JoinMangaGroupMessage:
+      name: JoinMangaGroup
+      title: Join Manga Group Hub Invocation
+      description: Client-to-server SignalR hub invocation to subscribe to group updates for a specific manga.
+      contentType: application/json
+      payload:
+        type: object
+        properties:
+          target:
+            type: string
+            example: JoinMangaGroup
+          arguments:
+            type: array
+            items:
+              type: string
+              format: uuid
+            example: ["019171b3-4f91-7489-8d26-6a567c9d1234"]
+
+    LeaveMangaGroupMessage:
+      name: LeaveMangaGroup
+      title: Leave Manga Group Hub Invocation
+      description: Client-to-server SignalR hub invocation to unsubscribe from group updates.
+      contentType: application/json
+      payload:
+        type: object
+        properties:
+          target:
+            type: string
+            example: LeaveMangaGroup
+          arguments:
+            type: array
+            items:
+              type: string
+              format: uuid
+            example: ["019171b3-4f91-7489-8d26-6a567c9d1234"]
+
+    ChaptersUpdatedBroadcast:
+      name: ChaptersUpdated
+      title: Chapters Updated Server Broadcast
+      description: Broadcast sent to group `manga-{mangaId}` and all clients upon successful chapter page scraping.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChaptersUpdatedPayload'
+
+    ChapterScrapingProgressBroadcast:
+      name: ChapterScrapingProgress
+      title: Chapter Scraping Progress Server Broadcast
+      description: Real-time progress metric sent to group `manga-{mangaId}` and all clients during page downloads.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/ChapterScrapingProgressPayload'
+
+    # ----------------------------------------
+    # Firebase Cloud Messaging
+    # ----------------------------------------
+    NewChapterFcmNotification:
+      name: NewChapterFcmNotification
+      title: New Chapter Push Notification
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/FcmPushPayload'
+
+  schemas:
+    BaseEventPayload:
+      type: object
+      required:
+        - eventId
+        - occurredOn
+        - eventType
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          description: Sequential UUIDv7 identifier for the integration event.
+          example: "019171b3-4f91-7489-8d26-6a567c9d1234"
+        occurredOn:
+          type: string
+          format: date-time
+          description: UTC timestamp when the event was published.
+          example: "2026-08-19T08:30:00Z"
+        eventType:
+          type: string
+          description: Type name of the integration event.
+          example: "SyncStorageIntegrationEvent"
+
+    ScrapChapterPagesPayload:
+      allOf:
+        - $ref: '#/components/schemas/BaseEventPayload'
+        - type: object
+          required:
+            - mangaId
+            - mangaTitle
+            - chapterNumber
+            - chapterId
+            - provider
+          properties:
+            mangaId:
+              type: string
+              format: uuid
+              description: Unique ID of the manga aggregate.
+              example: "019171b3-4f91-7489-8d26-6a567c9d1234"
+            mangaTitle:
+              type: string
+              description: Title of the manga.
+              example: "One Piece"
+            chapterNumber:
+              type: number
+              format: double
+              description: Floating-point chapter number (supports decimals like 1054.5).
+              example: 1105
+            chapterId:
+              type: string
+              description: Provider-specific chapter ID or detail URL fragment.
+              example: "chapter-1105"
+            provider:
+              type: string
+              description: Key of the provider scraper ("komiku", "kiryuu", "komikcast", "mangadex").
+              example: "komikcast"
+
+    DeleteMangaPayload:
+      allOf:
+        - $ref: '#/components/schemas/BaseEventPayload'
+        - type: object
+          required:
+            - mangaId
+            - mangaTitle
+          properties:
+            mangaId:
+              type: string
+              format: uuid
+              example: "019171b3-4f91-7489-8d26-6a567c9d1234"
+            mangaTitle:
+              type: string
+              example: "Naruto"
+
+    DeleteChapterPayload:
+      allOf:
+        - $ref: '#/components/schemas/BaseEventPayload'
+        - type: object
+          required:
+            - mangaId
+            - mangaTitle
+            - chapterId
+            - chapterNumber
+          properties:
+            mangaId:
+              type: string
+              format: uuid
+              example: "019171b3-4f91-7489-8d26-6a567c9d1234"
+            mangaTitle:
+              type: string
+              example: "Bleach"
+            chapterId:
+              type: string
+              format: uuid
+              example: "019171b5-89af-7abc-b210-2f981a5c6789"
+            chapterNumber:
+              type: number
+              format: double
+              example: 686
+
+    ChapterPagesScrapedPayload:
+      allOf:
+        - $ref: '#/components/schemas/BaseEventPayload'
+        - type: object
+          required:
+            - mangaId
+            - mangaTitle
+            - chapterId
+            - chapterNumber
+            - pageCount
+          properties:
+            mangaId:
+              type: string
+              format: uuid
+              example: "019171b3-4f91-7489-8d26-6a567c9d1234"
+            mangaTitle:
+              type: string
+              example: "Jujutsu Kaisen"
+            chapterId:
+              type: string
+              format: uuid
+              example: "019171b5-89af-7abc-b210-2f981a5c6789"
+            chapterNumber:
+              type: number
+              format: double
+              example: 260
+            pageCount:
+              type: integer
+              description: Total number of successfully downloaded and converted WebP pages.
+              example: 19
+
+    ChapterScrapingProgressPayload:
+      allOf:
+        - $ref: '#/components/schemas/BaseEventPayload'
+        - type: object
+          required:
+            - mangaId
+            - mangaTitle
+            - chapterId
+            - chapterNumber
+            - downloadedPages
+            - totalPages
+            - percent
+            - status
+          properties:
+            mangaId:
+              type: string
+              format: uuid
+              example: "019171b3-4f91-7489-8d26-6a567c9d1234"
+            mangaTitle:
+              type: string
+              example: "Solo Leveling"
+            chapterId:
+              type: string
+              format: uuid
+              example: "019171b5-89af-7abc-b210-2f981a5c6789"
+            chapterNumber:
+              type: number
+              format: double
+              example: 179
+            downloadedPages:
+              type: integer
+              description: Number of pages completed so far.
+              example: 12
+            totalPages:
+              type: integer
+              description: Total pages detected in the chapter.
+              example: 24
+            percent:
+              type: integer
+              minimum: 0
+              maximum: 100
+              description: Completion percentage (0 - 100).
+              example: 50
+            status:
+              type: string
+              enum:
+                - Starting
+                - InProgress
+                - Completed
+                - Failed
+              description: Current lifecycle phase of the scraping task.
+              example: "InProgress"
+
+    ChaptersUpdatedPayload:
+      type: object
+      required:
+        - mangaId
+        - mangaTitle
+        - chapterId
+        - chapterNumber
+        - pageCount
+      properties:
+        mangaId:
+          type: string
+          format: uuid
+          example: "019171b3-4f91-7489-8d26-6a567c9d1234"
+        mangaTitle:
+          type: string
+          example: "One Piece"
+        chapterId:
+          type: string
+          format: uuid
+          example: "019171b5-89af-7abc-b210-2f981a5c6789"
+        chapterNumber:
+          type: number
+          format: double
+          example: 1105
+        pageCount:
+          type: integer
+          example: 18
+
+    FcmPushPayload:
+      type: object
+      required:
+        - notification
+        - data
+      properties:
+        notification:
+          type: object
+          required:
+            - title
+            - body
+          properties:
+            title:
+              type: string
+              example: "New Chapter: Chainsaw Man"
+            body:
+              type: string
+              example: "Chapter 155 is now available to read!"
+            imageUrl:
+              type: string
+              format: uri
+              example: "https://domain.com/covers/chainsawman.webp"
+        data:
+          type: object
+          required:
+            - type
+            - mangaId
+            - mangaTitle
+            - chapterNumber
+            - click_action
+          properties:
+            type:
+              type: string
+              example: "new_chapter"
+            mangaId:
+              type: string
+              format: uuid
+              example: "019171b3-4f91-7489-8d26-6a567c9d1234"
+            mangaTitle:
+              type: string
+              example: "Chainsaw Man"
+            chapterNumber:
+              type: string
+              example: "155"
+            imageUrl:
+              type: string
+              example: "https://domain.com/covers/chainsawman.webp"
+            click_action:
+              type: string
+              example: "FLUTTER_NOTIFICATION_CLICK"

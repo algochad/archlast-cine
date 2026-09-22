@@ -1,0 +1,525 @@
+@page "/admin/manga"
+@rendermode @(new InteractiveWebAssemblyRenderMode(prerender: false))
+@layout Layout.AdminLayout
+@using MangaPanel.Client.Components
+@using MangaPanel.Client.Extensions
+@using NovaStack.Contracts.Requests
+@using System.Net.Http.Json
+@attribute [Authorize]
+@inject HttpClient Http
+
+<div class="space-y-4 sm:space-y-6 opacity-0 animate-backdrop-in">
+
+    <!-- Header Area -->
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+        <div>
+            <h1 class="text-xl sm:text-2xl font-bold text-text-main">Manga Management</h1>
+            <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400">Search, filter, and manage your manga collection</p>
+        </div>
+
+        <div class="flex items-center gap-3">
+            <button @onclick="ToggleAdvancedFilters" class="flex items-center justify-center gap-2 px-3.5 sm:px-4 py-2 bg-surface border border-border-main rounded-xl text-xs sm:text-sm font-semibold text-text-main hover:bg-bg-app transition-all shadow-sm w-full sm:w-auto">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"></path></svg>
+                @(showFilters ? "Hide Filters" : "Advanced Filters")
+                @if (ActiveFilterCount > 0)
+                {
+                    <span class="ml-1 px-2 py-0.5 text-[10px] font-bold bg-primary text-white rounded-full">@ActiveFilterCount</span>
+                }
+            </button>
+        </div>
+    </div>
+
+    <!-- Search & Quick Filters -->
+    <div class="bg-surface p-4 sm:p-5 rounded-2xl border border-border-main shadow-sm space-y-4 transition-colors duration-300">
+        <div class="flex flex-col sm:flex-row gap-3 sm:gap-4">
+            <div class="relative flex-grow">
+                <span class="absolute inset-y-0 left-0 pl-3.5 sm:pl-4 flex items-center pointer-events-none">
+                    <svg class="h-4 sm:h-5 w-4 sm:w-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
+                </span>
+                <input type="text" @bind="searchQuery" @bind:event="oninput" @onkeyup="HandleSearchKeyup" placeholder="Search by title or keyword..." class="w-full pl-10 sm:pl-11 pr-4 py-2.5 bg-bg-app border border-border-main rounded-xl focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all text-xs sm:text-sm text-text-main" />
+            </div>
+
+            <button @onclick="ApplyFilters" class="px-6 py-2.5 bg-primary text-white font-bold text-xs uppercase tracking-widest rounded-xl hover:bg-primary/90 transition-all shadow-lg shadow-primary/20 w-full sm:w-auto">
+                Search
+            </button>
+        </div>
+
+        @if (showFilters)
+        {
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 pt-4 border-t border-border-main animate-in slide-in-from-top-4 duration-300">
+                <!-- Type Filter -->
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">Type</label>
+                    <select @bind="selectedType" class="w-full px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main">
+                        <option value="">All Types</option>
+                        @foreach (var type in availableTypes)
+                        {
+                            <option value="@type">@type</option>
+                        }
+                    </select>
+                </div>
+
+                <!-- Status Filter -->
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">Status</label>
+                    <select @bind="selectedStatus" class="w-full px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main">
+                        <option value="">All Status</option>
+                        <option value="Ongoing">Ongoing</option>
+                        <option value="Completed">Completed</option>
+                        <option value="Hiatus">Hiatus</option>
+                        <option value="Discontinued">Discontinued</option>
+                        <option value="Upcoming">Upcoming</option>
+                    </select>
+                </div>
+
+                <!-- Author Filter -->
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">Author</label>
+                    <input type="text" @bind="authorFilter" placeholder="Filter by author..." class="w-full px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main" />
+                </div>
+
+                <!-- NSFW Filter -->
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">NSFW Content</label>
+                    <select @bind="selectedNsfw" class="w-full px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main">
+                        <option value="false">Safe (Non-NSFW)</option>
+                        <option value="true">NSFW (18+)</option>
+                        <option value="">All Content</option>
+                    </select>
+                </div>
+
+                <!-- Anilist Metadata Filter -->
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">Anilist Metadata</label>
+                    <select @bind="selectedMetadataStatus" class="w-full px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main">
+                        <option value="">All Metadata</option>
+                        <option value="unlinked">Missing / Unlinked Anilist</option>
+                        <option value="linked">Linked Anilist</option>
+                    </select>
+                </div>
+
+                <!-- Rating Range -->
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">Min Rating (0 - 10)</label>
+                    <input type="number" step="0.1" min="0" max="10" @bind="minRating" placeholder="e.g. 7.5" class="w-full px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main" />
+                </div>
+
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">Max Rating (0 - 10)</label>
+                    <input type="number" step="0.1" min="0" max="10" @bind="maxRating" placeholder="e.g. 10.0" class="w-full px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main" />
+                </div>
+
+                <!-- Min Chapters -->
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">Min Chapters</label>
+                    <input type="number" min="0" @bind="minChapters" placeholder="e.g. 20" class="w-full px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main" />
+                </div>
+
+                <!-- Sort Field & Direction -->
+                <div class="space-y-1.5">
+                    <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">Sort By</label>
+                    <div class="flex gap-2">
+                        <select @bind="sortBy" class="w-2/3 px-3 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main">
+                            <option value="updatedAt">Last Updated</option>
+                            <option value="createdAt">Date Created</option>
+                            <option value="title">Title</option>
+                            <option value="rating">Rating</option>
+                            <option value="popularity">Popularity</option>
+                            <option value="totalView">Total Views</option>
+                            <option value="totalChapters">Total Chapters</option>
+                            <option value="latestChapterNumber">Latest Chapter</option>
+                            <option value="releaseDate">Release Date</option>
+                            <option value="members">Members</option>
+                        </select>
+                        <select @bind="orderBy" class="w-1/3 px-2 py-2 bg-bg-app border border-border-main rounded-lg text-xs sm:text-sm outline-none focus:border-primary transition-all text-text-main">
+                            <option value="desc">Desc</option>
+                            <option value="asc">Asc</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Included Genres -->
+                <div class="sm:col-span-2 lg:col-span-4 space-y-2 pt-2 border-t border-border-main/50">
+                    <div class="flex items-center justify-between">
+                        <label class="text-[10px] font-bold text-slate-400 uppercase tracking-wider ml-1">
+                            Included Genres
+                            @if (selectedGenres.Any())
+                            {
+                                <span class="text-primary font-bold">(@selectedGenres.Count selected)</span>
+                            }
+                        </label>
+                        <div class="flex items-center gap-2">
+                            <span class="text-[10px] font-bold text-slate-400 uppercase">Match Mode:</span>
+                            <div class="flex rounded-lg border border-border-main overflow-hidden text-[11px] font-semibold">
+                                <button type="button" @onclick='() => genreMatchMode = "And"' class="px-2.5 py-0.5 @(genreMatchMode == "And" ? "bg-primary text-white" : "bg-bg-app text-slate-500 hover:text-text-main")">
+                                    AND (All)
+                                </button>
+                                <button type="button" @onclick='() => genreMatchMode = "Or"' class="px-2.5 py-0.5 @(genreMatchMode == "Or" ? "bg-primary text-white" : "bg-bg-app text-slate-500 hover:text-text-main")">
+                                    OR (Any)
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-wrap gap-1.5 sm:gap-2 p-2.5 sm:p-3 bg-bg-app rounded-xl border border-border-main max-h-36 overflow-y-auto">
+                        @foreach (var genre in availableGenres)
+                        {
+                            <button type="button" @onclick="() => ToggleGenre(genre)" class="px-2.5 py-1 rounded-lg text-[11px] sm:text-xs font-semibold transition-all @(selectedGenres.Contains(genre) ? "bg-primary text-white shadow-md shadow-primary/20" : "bg-surface text-slate-500 border border-border-main hover:border-slate-300 dark:hover:border-slate-600")">
+                                @genre
+                            </button>
+                        }
+                    </div>
+                </div>
+
+                <!-- Excluded Genres -->
+                <div class="sm:col-span-2 lg:col-span-4 space-y-1.5">
+                    <label class="text-[10px] font-bold text-rose-400 uppercase tracking-wider ml-1">
+                        Excluded Genres
+                        @if (excludedGenres.Any())
+                        {
+                            <span class="text-rose-500 font-bold">(@excludedGenres.Count excluded)</span>
+                        }
+                    </label>
+                    <div class="flex flex-wrap gap-1.5 sm:gap-2 p-2.5 sm:p-3 bg-bg-app rounded-xl border border-border-main max-h-28 overflow-y-auto">
+                        @foreach (var genre in availableGenres)
+                        {
+                            <button type="button" @onclick="() => ToggleExcludedGenre(genre)" class="px-2.5 py-1 rounded-lg text-[11px] sm:text-xs font-semibold transition-all @(excludedGenres.Contains(genre) ? "bg-rose-500 text-white shadow-md shadow-rose-500/20" : "bg-surface text-slate-500 border border-border-main hover:border-slate-300 dark:hover:border-slate-600")">
+                                @(excludedGenres.Contains(genre) ? $"✕ {genre}" : genre)
+                            </button>
+                        }
+                    </div>
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="sm:col-span-2 lg:col-span-4 flex justify-end gap-2 pt-2 border-t border-border-main">
+                    <button @onclick="ResetFilters" class="px-4 py-2 text-slate-500 dark:text-slate-400 text-xs font-bold uppercase hover:bg-bg-app rounded-lg transition-all">Reset All</button>
+                    <button @onclick="ApplyFilters" class="px-5 sm:px-6 py-2 bg-secondary text-white text-xs font-bold uppercase rounded-lg hover:bg-secondary/90 transition-all shadow-lg">Apply Filters</button>
+                </div>
+            </div>
+        }
+    </div>
+
+    <!-- Results Info -->
+    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400">
+            Showing <span class="font-bold text-text-main">@(response?.Items.Count ?? 0)</span> of <span class="font-bold text-text-main">@response?.TotalCount</span> manga
+        </p>
+
+        <div class="flex items-center gap-2 self-end sm:self-auto">
+            <label class="text-xs text-slate-400">Page Size:</label>
+            <select @onchange="HandlePageSizeChange" class="bg-transparent text-xs font-bold text-slate-600 dark:text-slate-300 outline-none">
+                <option value="10">10</option>
+                <option value="20" selected>20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+            </select>
+        </div>
+    </div>
+
+    @if (isLoading)
+    {
+        <div class="flex flex-col items-center justify-center py-16 sm:py-24">
+            <div class="animate-spin rounded-full h-10 w-10 sm:h-12 sm:w-12 border-b-2 border-primary mb-4"></div>
+            <p class="text-xs sm:text-sm text-slate-500 font-medium">Fetching manga collection...</p>
+        </div>
+    }
+    else if (response == null || !response.Items.Any())
+    {
+        <div class="bg-surface rounded-2xl border border-border-main p-8 sm:p-12 text-center space-y-4 transition-colors duration-300">
+            <div class="w-16 h-16 sm:w-20 sm:h-20 bg-bg-app rounded-full flex items-center justify-center mx-auto">
+                <svg class="w-8 h-8 sm:w-10 sm:h-10 text-slate-300 dark:text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.172 9.172a4 4 0 015.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+            </div>
+            <div class="max-w-xs mx-auto">
+                <h3 class="text-base sm:text-lg font-bold text-text-main">No manga found</h3>
+                <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400">We couldn't find any manga matching your current search and filters.</p>
+            </div>
+            <button @onclick="ResetFilters" class="px-5 py-2 bg-primary/10 text-primary font-bold text-xs uppercase cursor-pointer rounded-xl hover:bg-primary/20 transition-all">Clear Filters</button>
+        </div>
+    }
+    else
+    {
+        <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3 sm:gap-6">
+            @foreach (var manga in response.Items)
+            {
+                <MangaCard Manga="manga" OnDetailClick="OpenDetail" />
+            }
+        </div>
+
+        <!-- Pagination -->
+        @if (totalPages > 1)
+        {
+            <div class="flex items-center justify-center gap-1 sm:gap-2 py-6 sm:py-8 flex-wrap">
+                <button @onclick="() => GoToPage(currentPage - 1)" disabled="@(currentPage == 1)" class="p-1.5 sm:p-2 rounded-xl border border-border-main text-slate-600 dark:text-slate-400 hover:bg-bg-app disabled:opacity-30 disabled:hover:bg-transparent transition-all">
+                    <svg class="w-4 h-4 sm:w-5 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path></svg>
+                </button>
+
+                @foreach (var p in GetPageRange())
+                {
+                    if (p == -1)
+                    {
+                        <span class="px-1.5 sm:px-3 text-slate-300">...</span>
+                    }
+                    else
+                    {
+                        <button @onclick="() => GoToPage(p)" class="w-8 h-8 sm:w-10 sm:h-10 rounded-xl font-bold text-xs sm:text-sm transition-all @(currentPage == p ? "bg-primary text-white shadow-lg shadow-primary/20" : "bg-surface border border-border-main text-slate-600 dark:text-slate-400 hover:border-primary hover:text-primary")">
+                            @p
+                        </button>
+                    }
+                }
+
+                <button @onclick="() => GoToPage(currentPage + 1)" disabled="@(currentPage == totalPages)" class="p-1.5 sm:p-2 rounded-xl border border-border-main text-slate-600 dark:text-slate-400 hover:bg-bg-app disabled:opacity-30 disabled:hover:bg-transparent transition-all">
+                    <svg class="w-4 h-4 sm:w-5 sm:h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
+                </button>
+            </div>
+        }
+    }
+</div>
+
+@if (selectedMangaId != Guid.Empty)
+{
+    <MangaDetailModal MangaId="selectedMangaId" OnClosed="CloseDetail" OnSaved="OnMangaSaved" />
+}
+
+@code {
+    [SupplyParameterFromQuery(Name = "unlinkedAnilist")]
+    public bool? QueryUnlinkedAnilist { get; set; }
+
+    [SupplyParameterFromQuery(Name = "anilistId")]
+    public int? QueryAnilistId { get; set; }
+
+    private MangaListResponse? response;
+    private List<string> availableGenres = new();
+    private List<string> availableTypes = new();
+
+    private bool isLoading = true;
+    private bool showFilters = false;
+
+    // Filter State
+    private string searchQuery = "";
+    private string selectedType = "";
+    private string selectedStatus = "";
+    private string authorFilter = "";
+    private string selectedNsfw = "false";
+    private string selectedMetadataStatus = "";
+    private double? minRating;
+    private double? maxRating;
+    private int? minChapters;
+    private string sortBy = "updatedAt";
+    private string orderBy = "desc";
+    private string genreMatchMode = "And";
+    private List<string> selectedGenres = new();
+    private List<string> excludedGenres = new();
+    private int currentPage = 1;
+    private int pageSize = 20;
+
+    private Guid selectedMangaId = Guid.Empty;
+
+    private int totalPages => response != null ? (int)Math.Ceiling((double)response.TotalCount / pageSize) : 0;
+
+    private int ActiveFilterCount
+    {
+        get
+        {
+            int count = 0;
+            if (!string.IsNullOrWhiteSpace(selectedType)) count++;
+            if (!string.IsNullOrWhiteSpace(selectedStatus)) count++;
+            if (!string.IsNullOrWhiteSpace(authorFilter)) count++;
+            if (selectedNsfw != "false") count++;
+            if (!string.IsNullOrWhiteSpace(selectedMetadataStatus)) count++;
+            if (minRating.HasValue) count++;
+            if (maxRating.HasValue) count++;
+            if (minChapters.HasValue) count++;
+            if (selectedGenres.Count > 0) count++;
+            if (excludedGenres.Count > 0) count++;
+            return count;
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        if (QueryUnlinkedAnilist == true || QueryAnilistId == 0)
+        {
+            selectedMetadataStatus = "unlinked";
+            showFilters = true;
+        }
+        else if (QueryUnlinkedAnilist == false || (QueryAnilistId.HasValue && QueryAnilistId > 0))
+        {
+            selectedMetadataStatus = "linked";
+            showFilters = true;
+        }
+
+        await Task.WhenAll(LoadMetadata(), LoadManga());
+        isLoading = false;
+    }
+
+    private async Task LoadMetadata()
+    {
+        try
+        {
+            var genresTask = Http.GetApiDataAsync<List<string>>("/api/v1/manga/genres");
+            var typesTask = Http.GetApiDataAsync<List<string>>("/api/v1/manga/types");
+            await Task.WhenAll(genresTask, typesTask);
+            availableGenres = await genresTask ?? new();
+            availableTypes = await typesTask ?? new();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading metadata: {ex.Message}");
+        }
+    }
+
+    private async Task LoadManga()
+    {
+        isLoading = true;
+        try
+        {
+            bool? nsfwValue = string.IsNullOrWhiteSpace(selectedNsfw)
+                ? null
+                : bool.TryParse(selectedNsfw, out var parsedNsfw) ? parsedNsfw : null;
+
+            bool? unlinkedAnilistFilter = selectedMetadataStatus switch
+            {
+                "unlinked" => true,
+                "linked" => false,
+                _ => null
+            };
+
+            var request = new QueryPagedMangaRequest
+            {
+                Page = currentPage,
+                PageSize = pageSize,
+                Sorts = new List<MangaSortOption>
+                {
+                    new() { Field = sortBy, Direction = orderBy }
+                },
+                Filter = new MangaAdvancedFilter
+                {
+                    Search = string.IsNullOrWhiteSpace(searchQuery) ? null : searchQuery.Trim(),
+                    Types = string.IsNullOrWhiteSpace(selectedType) ? null : new List<string> { selectedType },
+                    Statuses = string.IsNullOrWhiteSpace(selectedStatus) ? null : new List<string> { selectedStatus },
+                    Author = string.IsNullOrWhiteSpace(authorFilter) ? null : authorFilter.Trim(),
+                    Nsfw = nsfwValue,
+                    UnlinkedAnilist = unlinkedAnilistFilter,
+                    MinRating = minRating,
+                    MaxRating = maxRating,
+                    MinChapters = minChapters,
+                    IncludedGenres = selectedGenres.Count > 0 ? selectedGenres.ToList() : null,
+                    GenreMatchMode = genreMatchMode,
+                    ExcludedGenres = excludedGenres.Count > 0 ? excludedGenres.ToList() : null
+                }
+            };
+
+            response = await Http.QueryApiDataAsync<QueryPagedMangaRequest, MangaListResponse>("/api/v1/manga", request);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading manga: {ex.Message}");
+        }
+        finally
+        {
+            isLoading = false;
+        }
+    }
+
+    private async Task ApplyFilters()
+    {
+        currentPage = 1;
+        await LoadManga();
+    }
+
+    private async Task ResetFilters()
+    {
+        searchQuery = "";
+        selectedType = "";
+        selectedStatus = "";
+        authorFilter = "";
+        selectedNsfw = "false";
+        selectedMetadataStatus = "";
+        minRating = null;
+        maxRating = null;
+        minChapters = null;
+        sortBy = "updatedAt";
+        orderBy = "desc";
+        genreMatchMode = "And";
+        selectedGenres.Clear();
+        excludedGenres.Clear();
+        currentPage = 1;
+        await LoadManga();
+    }
+
+    private void ToggleAdvancedFilters() => showFilters = !showFilters;
+
+    private void ToggleGenre(string genre)
+    {
+        if (selectedGenres.Contains(genre))
+        {
+            selectedGenres.Remove(genre);
+        }
+        else
+        {
+            selectedGenres.Add(genre);
+            excludedGenres.Remove(genre);
+        }
+    }
+
+    private void ToggleExcludedGenre(string genre)
+    {
+        if (excludedGenres.Contains(genre))
+        {
+            excludedGenres.Remove(genre);
+        }
+        else
+        {
+            excludedGenres.Add(genre);
+            selectedGenres.Remove(genre);
+        }
+    }
+
+    private async Task HandleSearchKeyup(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+        {
+            await ApplyFilters();
+        }
+    }
+
+    private async Task GoToPage(int page)
+    {
+        if (page < 1 || page > totalPages) return;
+        currentPage = page;
+        await LoadManga();
+    }
+
+    private async Task HandlePageSizeChange(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out int val))
+        {
+            pageSize = val;
+            currentPage = 1;
+            await LoadManga();
+        }
+    }
+
+    private List<int> GetPageRange()
+    {
+        var pages = new List<int>();
+        var delta = 2;
+
+        for (int i = 1; i <= totalPages; i++)
+        {
+            if (i == 1 || i == totalPages || (i >= currentPage - delta && i <= currentPage + delta))
+            {
+                pages.Add(i);
+            }
+            else if (pages.LastOrDefault() != -1)
+            {
+                pages.Add(-1);
+            }
+        }
+        return pages;
+    }
+
+    private void OpenDetail(MangaSummary manga) => selectedMangaId = manga.Id;
+    private void CloseDetail() => selectedMangaId = Guid.Empty;
+    private async Task OnMangaSaved() => await LoadManga();
+}

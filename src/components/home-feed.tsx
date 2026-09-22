@@ -10,7 +10,7 @@ import { mergeEntries } from "@/lib/history-merge";
 import { useServerHistory } from "@/lib/session";
 import type { WatchEntry } from "@/lib/account";
 import { buildMetricRows, buildTypeRows, metricOf, pickHero } from "@/lib/rows";
-import type { BrowseMetrics, CatalogItem, HomeResponse } from "@/lib/types";
+import type { BrowseMetrics, CatalogItem, HomeResponse, MangaTrendingResponse } from "@/lib/types";
 
 interface FeedProps {
   feed: CatalogItem[] | null;
@@ -28,6 +28,7 @@ export function HomeFeed({ feed, metrics, error }: FeedProps) {
   const [local, setLocal] = useState<WatchEntry[]>([]);
   const [localReady, setLocalReady] = useState(false);
   const [animeItems, setAnimeItems] = useState<CatalogItem[]>([]);
+  const [mangaItems, setMangaItems] = useState<CatalogItem[]>([]);
 
   // Trending Anime row: fetched from the anime provider alongside the
   // server-rendered movie/series feed.
@@ -37,6 +38,21 @@ export function HomeFeed({ feed, metrics, error }: FeedProps) {
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((data: HomeResponse) => {
         if (!cancelled) setAnimeItems(data.items ?? []);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Trending Manga row: MangaScrapper catalog via the Rust backend. Degrades
+  // to an absent row when the manga stack is down (dev without compose).
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/mb/manga/trending")
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((data: MangaTrendingResponse) => {
+        if (!cancelled) setMangaItems(data.items ?? []);
       })
       .catch(() => undefined);
     return () => {
@@ -155,6 +171,14 @@ export function HomeFeed({ feed, metrics, error }: FeedProps) {
             label="Trending Anime"
             items={animeItems}
             index={metricRows.length + typeRows.length + 1 + (hasContinue ? 1 : 0)}
+          />
+        )}
+        {mangaItems.length > 0 && (
+          <TitleRow
+            key="trending-manga"
+            label="Trending Manga"
+            items={mangaItems}
+            index={metricRows.length + typeRows.length + (animeItems.length > 0 ? 2 : 1) + (hasContinue ? 1 : 0)}
           />
         )}
       </div>

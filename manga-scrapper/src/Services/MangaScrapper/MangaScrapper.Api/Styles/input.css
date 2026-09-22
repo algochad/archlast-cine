@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+@layer base {
+    :root {
+        /* Mode Terang (Default) */
+        --brand-primary: #088395; /* Ocean Blue */
+        --brand-secondary: #7AB2B2; /* Muted Teal */
+        --brand-dark: #09637E; /* Deep Teal */
+        --brand-bg: #F8FAFC; /* Softer light background */
+        --brand-surface: #ffffff;
+        --brand-text: #0F172A; /* Slate 900 */
+        --brand-border: #E2E8F0; /* Slate 200 */
+    }
+
+    /* Bisa dipicu lewat class .dark atau otomatis (media query) */
+    :root.dark {
+        /* Mode Gelap */
+        --brand-primary: #0EA5E9; /* Sky 500 */
+        --brand-secondary: #088395;
+        --brand-dark: #F1F5F9; /* Slate 100 */
+        --brand-bg: #0F172A; /* Slate 900 */
+        --brand-surface: #1E293B; /* Slate 800 */
+        --brand-text: #F8FAFC; /* Slate 50 */
+        --brand-border: #334155; /* Slate 700 */
+    }
+
+    @media (prefers-color-scheme: dark) {
+        :root:not(.light) {
+            /* Mode Gelap */
+            --brand-primary: #0EA5E9;
+            --brand-secondary: #088395;
+            --brand-dark: #F1F5F9;
+            --brand-bg: #0F172A;
+            --brand-surface: #1E293B;
+            --brand-text: #F8FAFC;
+            --brand-border: #334155;
+        }
+    }
+}
+
+@theme {
+    /* Mapping variabel CSS ke utility Tailwind */
+    --color-primary: var(--brand-primary);
+    --color-secondary: var(--brand-secondary);
+    --color-dark: var(--brand-dark);
+    --color-bg-app: var(--brand-bg);
+    --color-surface: var(--brand-surface);
+    --color-text-main: var(--brand-text);
+    --color-border-main: var(--brand-border);
+
+    --font-sans: "Inter", ui-sans-serif, system-ui;
+    --font-display: "Clash Display", sans-serif;
+    --radius-xl: 1.5rem;
+    --radius-brand: 0.75rem;
+    --spacing-128: 32rem;
+    --shadow-soft: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+
+    /* Animation Definitions (Tailwind v4 style) */
+    --animate-modal-in: modal-zoom-in 0.35s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+    --animate-modal-out: modal-zoom-out 0.25s ease-in forwards;
+    --animate-backdrop-in: fade-in 0.3s ease-out forwards;
+    --animate-backdrop-out: fade-out 0.25s ease-in forwards;
+
+    @keyframes fade-in {
+        from { opacity: 0; }
+        to { opacity: 1; }
+    }
+    @keyframes fade-out {
+        from { opacity: 1; }
+        to { opacity: 0; }
+    }
+    @keyframes modal-zoom-in {
+        from { opacity: 0; transform: scale(0.95); }
+        to { opacity: 1; transform: scale(1); }
+    }
+    @keyframes modal-zoom-out {
+        from { opacity: 1; transform: scale(1); }
+        to { opacity: 0; transform: scale(0.95); }
+    }
+}
