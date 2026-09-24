@@ -33,6 +33,8 @@ function metaLine(item: CatalogItem): string {
         : "SERIES",
     );
     if (item.year) parts.push(item.year);
+  } else if (item.media_type === "manga") {
+    parts.push(item.year ?? "MANGA");
   } else {
     parts.push(item.year ?? "MOVIE");
   }

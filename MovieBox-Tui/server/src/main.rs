@@ -294,6 +294,10 @@ fn provider_err_response_for(provider: ProviderKind, err: ProviderError) -> Resp
         log::warn!("anime request failed ({status}): {err}");
         return api_error(status, anime_user_message(status));
     }
+    if provider == ProviderKind::Manga {
+        log::warn!("manga request failed ({status}): {err}");
+        return api_error(status, manga_user_message());
+    }
     api_error(status, err.to_string())
 }
 
@@ -305,6 +309,12 @@ fn anime_user_message(status: StatusCode) -> &'static str {
     } else {
         "This title isn't available right now. Try again or pick another source."
     }
+}
+
+/// Manga failures surface the same generic unavailable copy so a down
+/// MangaScrapper stack never leaks internal connection errors to the UI.
+fn manga_user_message() -> &'static str {
+    "Manga isn't available right now. Try again or pick another source."
 }
 
 /// Anime call sites render the generic copy; every other provider keeps its
@@ -491,6 +501,7 @@ async fn search_unified(
         ProviderKind::MovieBox,
         ProviderKind::FourKHdHub,
         ProviderKind::Anime,
+        ProviderKind::Manga,
     ];
     let mut set = tokio::task::JoinSet::new();
     for provider in providers {
@@ -517,6 +528,8 @@ async fn search_unified(
                 log::warn!("unified search: provider={provider} failed: {e}");
                 let message = if provider == ProviderKind::Anime {
                     anime_user_message(StatusCode::BAD_GATEWAY).to_string()
+                } else if provider == ProviderKind::Manga {
+                    manga_user_message().to_string()
                 } else {
                     e.to_string()
                 };

@@ -37,7 +37,9 @@ public sealed class RabbitMqEventBus : IEventBus, IDisposable
                 Port = _options.Port,
                 VirtualHost = _options.VirtualHost,
                 UserName = _options.Username,
-                Password = _options.Password
+                Password = _options.Password,
+                AutomaticRecoveryEnabled = true,
+                NetworkRecoveryInterval = TimeSpan.FromSeconds(10),
             };
 
             _connection = await factory.CreateConnectionAsync(ct);

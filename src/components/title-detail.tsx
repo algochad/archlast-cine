@@ -10,7 +10,15 @@ import type { MediaDetails, ProviderId, Season } from "@/lib/types";
 
 function catalogTag(provider: ProviderId, value: string): string {
   const prefix =
-    provider === "moviebox" ? "MB" : provider === "fourkhdhub" ? "4K" : provider === "anime" ? "AL" : "CT";
+    provider === "moviebox"
+      ? "MB"
+      : provider === "fourkhdhub"
+        ? "4K"
+        : provider === "anime"
+          ? "AL"
+          : provider === "manga"
+            ? "MG"
+            : "CT";
   const trimmed = value.replace(/^mb-|^4k-|^bdix[-_]/i, "");
   return `${prefix}-${trimmed}`;
 }
@@ -41,6 +49,7 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
   const seasons = details.seasons;
   const activeSeason: Season | null = seasons[seasonIdx] ?? null;
   const isAnime = details.media_type === "anime";
+  const isManga = details.media_type === "manga";
   const isSeries = details.media_type === "series" || seasons.length > 0;
   const runtime = formatRuntime(details.duration);
   const episodeCount = seasons.reduce((n, s) => n + s.episodes.length, 0);
@@ -64,14 +73,18 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
       isSeries || isAnime ? `?s=${season}&e=${episode}` : ""
     }`;
 
-  const startHref = watchHref(activeSeason?.number ?? 1, activeSeason?.episodes[0]?.number ?? 1);
+  const startHref = isManga
+    ? `/read/${details.id.provider}/${details.id.value}`
+    : watchHref(activeSeason?.number ?? 1, activeSeason?.episodes[0]?.number ?? 1);
 
   const metaStrip: string[] = [];
   if (details.imdb_rating) metaStrip.push(`${details.imdb_rating}★`);
   if (isAnime && animeStatusText) metaStrip.push(animeStatusText);
   if (isAnime && animeSeasonText) metaStrip.push(animeSeasonText);
   if (details.year && !(isAnime && animeSeasonText)) metaStrip.push(details.year);
-  if (!isAnime && runtime) metaStrip.push(runtime);
+  // Manga carries its latest chapter in `duration` ("Chapter N") — surface it raw.
+  if (!isAnime && !isManga && runtime) metaStrip.push(runtime);
+  if (isManga && details.duration) metaStrip.push(details.duration.toUpperCase());
   if ((isSeries || isAnime) && episodeCount > 0) metaStrip.push(`${episodeCount} EPS`);
 
   return (
@@ -103,14 +116,17 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
             </div>
             <p className="mono-meta mt-2.5 flex items-center justify-between text-[10px] uppercase tracking-[0.16em] text-zinc-500">
               <span>{catalogTag(details.id.provider, details.id.value)}</span>
-              <span className="text-zinc-600">{isAnime ? "ANIME" : isSeries ? "SERIES" : "FILM"}</span>
+              <span className="text-zinc-600">
+                {isAnime ? "ANIME" : isManga ? "MANGA" : isSeries ? "SERIES" : "FILM"}
+              </span>
             </p>
           </div>
 
           {/* Info column */}
           <div className="animate-fade-up min-w-0 flex-1 space-y-5">
             <p className="eyebrow">
-              {providerLabel(details.id.provider)} · {isAnime ? "Anime" : isSeries ? "Series" : "Film"}
+              {providerLabel(details.id.provider)} ·{" "}
+              {isAnime ? "Anime" : isManga ? "Manga" : isSeries ? "Series" : "Film"}
             </p>
 
             <h1 className="display-title text-balance text-[clamp(2.2rem,5vw,4.6rem)]">
@@ -156,7 +172,7 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
                 className="btn-solid mono-meta px-7 py-3 text-[13px] font-bold uppercase tracking-[0.14em]"
               >
                 <PlayIcon width={15} height={15} className="translate-x-px" />
-                {isAnime ? "Start Watching" : isSeries ? "Start Series" : "Play"}
+                {isManga ? "Start Reading" : isAnime ? "Start Watching" : isSeries ? "Start Series" : "Play"}
               </Link>
               <button
                 onClick={() => {
@@ -368,6 +384,8 @@ function providerLabel(p: ProviderId): string {
       return "BDIX DhakaFlix";
     case "anime":
       return "AniList";
+    case "manga":
+      return "MangaScrapper";
     default:
       return "Addon";
   }

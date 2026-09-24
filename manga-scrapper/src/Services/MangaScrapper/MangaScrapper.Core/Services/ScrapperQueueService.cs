@@ -76,7 +76,9 @@ public sealed class ScrapperQueueService : IScrapperQueueService
                 Port      = _rabbitMqOptions.Port,
                 VirtualHost = _rabbitMqOptions.VirtualHost,
                 UserName  = _rabbitMqOptions.Username,
-                Password  = _rabbitMqOptions.Password
+                Password  = _rabbitMqOptions.Password,
+                AutomaticRecoveryEnabled = true,
+                NetworkRecoveryInterval = TimeSpan.FromSeconds(10),
             };
 
             await using var connection = await factory.CreateConnectionAsync();

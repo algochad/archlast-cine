@@ -14,6 +14,7 @@ const SOURCES: { id: SourceFilter; label: string }[] = [
   { id: "moviebox", label: "MovieBox" },
   { id: "fourkhdhub", label: "4KHDHub" },
   { id: "anime", label: "Anime" },
+  { id: "manga", label: "Manga" },
 ];
 
 const TYPES: { id: TypeFilter; label: string }[] = [
@@ -21,6 +22,7 @@ const TYPES: { id: TypeFilter; label: string }[] = [
   { id: "movie", label: "Movies" },
   { id: "series", label: "Series" },
   { id: "anime", label: "Anime" },
+  { id: "manga", label: "Manga" },
 ];
 
 interface SearchState {
@@ -195,7 +197,7 @@ export default function SearchPage() {
                   setSuggestOpen(false);
                 }
               }}
-              placeholder="SEARCH MOVIES, SERIES & ANIME"
+              placeholder="SEARCH MOVIES, SERIES, ANIME & MANGA"
               className="mono-meta w-full bg-transparent text-[15px] text-white placeholder-zinc-500 outline-none"
               autoComplete="off"
               spellCheck={false}
@@ -401,7 +403,7 @@ export default function SearchPage() {
             // AWAITING QUERY
           </p>
           <p className="mx-auto mt-4 max-w-md font-mono text-[13px] leading-relaxed text-zinc-500">
-            Search movies, series and anime across all sources at once, then press{" "}
+            Search movies, series, anime and manga across all sources at once, then press{" "}
             <kbd className="rounded-[4px] border border-line bg-surface px-1.5 py-0.5 text-[11px] text-zinc-300">
               ENTER
             </kbd>{" "}

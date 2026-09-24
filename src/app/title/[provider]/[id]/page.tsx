@@ -11,6 +11,7 @@ const VALID: Record<string, true> = {
   bdix_circleftp: true,
   bdix_dhakaflix: true,
   anime: true,
+  manga: true,
 };
 
 export async function generateMetadata({
