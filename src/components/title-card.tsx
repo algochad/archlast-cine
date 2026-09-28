@@ -20,7 +20,6 @@ const PROVIDER_LABEL: Record<string, string> = {
   bdix_dhakaflix: "BDIX DHAKAFLIX",
   addons: "ADDON",
   anime: "ANIME",
-  manga: "MANGA",
 };
 
 /** Mono meta line ("01 SEASONS · 2024" / "2024") shown under the title on hover. */
@@ -33,8 +32,6 @@ function metaLine(item: CatalogItem): string {
         : "SERIES",
     );
     if (item.year) parts.push(item.year);
-  } else if (item.media_type === "manga") {
-    parts.push(item.year ?? "MANGA");
   } else {
     parts.push(item.year ?? "MOVIE");
   }
@@ -141,13 +138,9 @@ export const TitleCard = memo(function TitleCard({
 }) {
   const myList = useMyList();
   const href = `/title/${item.id.provider}/${item.id.value}`;
-  // Manga items have no video player — the primary action opens the reader.
-  const watchHref =
-    item.media_type === "manga"
-      ? `/read/${item.id.provider}/${item.id.value}`
-      : `/watch/${item.id.provider}/${item.id.value}`;
+  const watchHref = `/watch/${item.id.provider}/${item.id.value}`;
   // Poster URLs are either absolute (movie providers) or backend-relative
-  // proxy paths (/api/manga/image?...) which need the /api/mb prefix.
+  // proxy paths which need the /api/mb prefix.
   const posterSrc = item.poster_url
     ? item.poster_url.startsWith("/api/")
       ? mbUrl(item.poster_url)

@@ -16,18 +16,15 @@ pub enum ProviderKind {
     Addons,
     #[serde(rename = "anime", alias = "anilist")]
     Anime,
-    #[serde(rename = "manga")]
-    Manga,
 }
 
 impl ProviderKind {
-    pub const ENABLED: [Self; 6] = [
+    pub const ENABLED: [Self; 5] = [
         Self::MovieBox,
         Self::FourKHdHub,
         Self::BdixCircleFtp,
         Self::BdixDhakaFlix,
         Self::Anime,
-        Self::Manga,
     ];
 
     pub const fn cache_key(self) -> &'static str {
@@ -38,7 +35,6 @@ impl ProviderKind {
             Self::BdixDhakaFlix => "bdix_dhakaflix",
             Self::Addons => "addons",
             Self::Anime => "anime",
-            Self::Manga => "manga",
         }
     }
 
@@ -50,7 +46,6 @@ impl ProviderKind {
             Self::BdixDhakaFlix => "DhakaFlix (BDIX)",
             Self::Addons => "Addons",
             Self::Anime => "Anime",
-            Self::Manga => "Manga",
         }
     }
 
@@ -62,7 +57,6 @@ impl ProviderKind {
             "bdix_dhakaflix" | "dhakaflix (bdix)" => Some(Self::BdixDhakaFlix),
             "addons" | "addon" => Some(Self::Addons),
             "anime" | "anilist" => Some(Self::Anime),
-            "manga" => Some(Self::Manga),
             _ => None,
         }
     }
@@ -96,7 +90,6 @@ pub enum MediaType {
     Movie,
     Series,
     Anime,
-    Manga,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -273,7 +266,6 @@ impl Release {
                 ProviderKind::Addons => "Addon",
                 ProviderKind::MovieBox => "Direct",
                 ProviderKind::Anime => "AniList",
-                ProviderKind::Manga => "MangaScrapper",
             })
     }
 

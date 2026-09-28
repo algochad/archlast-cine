@@ -4,7 +4,6 @@ import { HealthModule } from './health/health.module';
 import { HistoryModule } from './history/history.module';
 import { MyListModule } from './my-list/my-list.module';
 import { PrismaModule } from './prisma/prisma.module';
-import { ReadingHistoryModule } from './reading-history/reading-history.module';
 import { RedisModule } from './redis/redis.module';
 import { UsersModule } from './users/users.module';
 
@@ -15,7 +14,6 @@ import { UsersModule } from './users/users.module';
     AuthModule,
     UsersModule,
     HistoryModule,
-    ReadingHistoryModule,
     MyListModule,
     HealthModule,
   ],

@@ -9,7 +9,7 @@
 // movie/series code never reads, writes, or depends on it.
 
 /** Coarse media classification shared by every surface. */
-export type MediaType = "movie" | "series" | "anime" | "manga";
+export type MediaType = "movie" | "series" | "anime";
 
 /** Providers that can serve media data. */
 export type ProviderSource =
@@ -18,8 +18,7 @@ export type ProviderSource =
   | "bdix_circleftp"
   | "bdix_dhakaflix"
   | "addons"
-  | "anime"
-  | "manga";
+  | "anime";
 
 /** Broadcast season anime metadata uses (AniList convention). */
 export type AnimeSeason = "winter" | "spring" | "summer" | "fall";

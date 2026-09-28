@@ -12,28 +12,27 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 
 ## Project Overview
 
-Archlast Cine is a self-hosted streaming web app. A Next.js front end browses/plays movies, series, and manga through a Rust media backend, with accounts (list, watch/reading progress, settings) synced via a NestJS API. It hosts no media; streams resolve from third-party sources and every stream byte is proxied same-origin.
+Archlast Cine is a self-hosted streaming web app. A Next.js front end browses/plays movies and series through a Rust media backend, with accounts (list, watch/reading progress, settings) synced via a NestJS API. It hosts no media; streams resolve from third-party sources and every stream byte is proxied same-origin.
 
-Polyglot monorepo: Next.js web (root), NestJS account API (`api/`), Rust media backend (`MovieBox-Tui/server/`, additive crate on a fork of upstream `mesamirh/MovieBox-Tui`), .NET manga stack (`manga-scrapper/`), Go/Node anime-scraper sidecar (`scripts/anime-scraper/`).
+Polyglot monorepo: Next.js web (root), NestJS account API (`api/`), Rust media backend (`MovieBox-Tui/server/`, additive crate on a fork of upstream `mesamirh/MovieBox-Tui`), Go/Node anime-scraper sidecar (`scripts/anime-scraper/`).
 
 ## Architecture & Data Flow
 
 - Web request flow: browser → Next App Router (`src/app/`) → same-origin route handlers (`src/app/api/mb/*`, `src/app/api/account/*`) → Rust backend (`MB_BACKEND_URL`, default `http://127.0.0.1:9797`) or Nest API (`API_PORT`, default `4100`) → Postgres + Redis.
 - Media proxy: `next.config.ts` rewrites `/api/proxy/:ticket` → backend; frontend helper `mbUrl()` in `src/lib/api.ts` maps backend `/api/*` paths to `/api/mb/*` so Range/DASH traffic stays same-origin.
-- Account flow: `src/lib/api-account.ts` → `/api/account/*` handlers (own httpOnly `mb_token` cookie) → Nest `auth`/`users`/`history`/`reading-history`/`my-list` modules → Prisma (Postgres) + Redis (token denylist, login rate limit). Client never sees a JWT.
+ - Account flow: `src/lib/api-account.ts` → `/api/account/*` handlers (own httpOnly `mb_token` cookie) → Nest `auth`/`users`/`history`/`my-list` modules → Prisma (Postgres) + Redis (token denylist, login rate limit). Client never sees a JWT.
 - Session state: `src/lib/session.tsx` exposes three React contexts (`Session`/`MyList`/`History`) implementing the contract in `src/lib/session-contract.ts`; region mirrored in readable `mb_region` cookie.
 - Nest bootstrap (`api/src/main.ts`): global `ValidationPipe({ transform: true, whitelist: true })`, shutdown hooks, dev-secret warning in production. Auth issues `{ ...toAccountState(user), accessToken }` with `sub/email/jti`.
 - Rust server (`MovieBox-Tui/server/src/main.rs`, axum + tokio): headless HTTP over the `moviebox-tui` crate; `MOVIEBOX_PROXY_BASE` must be the externally visible origin so DASH manifests survive the reverse proxy.
 
 ## Key Directories
 
-- `src/app/` — App Router pages: `page.tsx` (home), `watch/[provider]/`, `title/[provider]/`, `search/`, `read/[provider]/`, `login/`, `signup/`, `account/`, `mylist/`, `history/`, plus `api/mb/` and `api/account/` proxies.
-- `src/components/` — UI: `watch-player.tsx` (~88KB player), `title-card.tsx`, `title-detail.tsx`, `home-feed.tsx`, `title-row.tsx`, `billboard.tsx`, `nav.tsx`, `cover.tsx`, `icons.tsx`; behavior tests in `__tests__/`.
-- `src/lib/` — pure logic + clients: `api.ts` (media), `api-account.ts` (accounts), `session.tsx` / `session-contract.ts`, `playback.ts`, `captions.ts`, `watch-sync.ts`, `read-sync.ts`, `history*.ts`, `seek.ts`, `rows.ts`, `format.ts`, `types.ts`, `media-types.ts`; unit tests in `__tests__/`.
-- `api/src/` — Nest modules `auth/`, `users/`, `history/`, `reading-history/`, `my-list/`, `health/`, infra `prisma/`, `redis/`, shared `common/` (`env.ts`, `guards/`, `decorators/`, `types/`, `account.types.ts`).
-- `api/prisma/` — `schema.prisma`: `User` 1—N `WatchHistory`/`ReadingHistory`/`MyList`; composite uniques per `(userId, provider, mediaId, season/episode|chapter)`.
+ - `src/app/` — App Router pages: `page.tsx` (home), `watch/[provider]/`, `title/[provider]/`, `search/`, `login/`, `signup/`, `account/`, `mylist/`, `history/`, plus `api/mb/` and `api/account/` proxies.
+ - `src/components/` — UI: `watch-player.tsx` (~88KB player), `title-card.tsx`, `title-detail.tsx`, `home-feed.tsx`, `title-row.tsx`, `billboard.tsx`, `nav.tsx`, `cover.tsx`, `icons.tsx`; behavior tests in `__tests__/`.
+ - `src/lib/` — pure logic + clients: `api.ts` (media), `api-account.ts` (accounts), `session.tsx` / `session-contract.ts`, `playback.ts`, `captions.ts`, `watch-sync.ts`, `history*.ts`, `seek.ts`, `rows.ts`, `format.ts`, `types.ts`, `media-types.ts`; unit tests in `__tests__/`.
+ - `api/src/` — Nest modules `auth/`, `users/`, `history/`, `my-list/`, `health/`, infra `prisma/`, `redis/`, shared `common/` (`env.ts`, `guards/`, `decorators/`, `types/`, `account.types.ts`).
+ - `api/prisma/` — `schema.prisma`: `User` 1—N `WatchHistory`/`MyList`; composite uniques per `(userId, provider, mediaId, season/episode)`.
 - `MovieBox-Tui/server/` — Rust backend crate; parent `MovieBox-Tui/` is the vendored TUI fork (`src/`, `tests/`, `docs/`).
-- `manga-scrapper/src/` — .NET `Services/MangaScrapper/`, `Workers/Scrapper.Worker/`, `BuildingBlocks/NovaStack.*`; `tests/` holds xUnit suites.
 - `scripts/` — `dev.mjs` (dev orchestrator), `sync-backend.sh` (upstream merge), `docker-entrypoint.sh` (prod launcher), `anime-scraper/` (Go + Node sidecar).
 - `public/` — static assets (`logo.svg`); `.zcode/plans/` — design notes.
 
@@ -73,7 +72,7 @@ docker compose -f docker-compose.dev.yml up --build   # hot-reload dev (db/redis
 ## Runtime/Tooling Preferences
 
 - Node `>=20` (Docker uses `node:22-slim`); package manager is **npm** with lockfiles (`package-lock.json` at root and `api/`). Do not introduce Bun/pnpm workspaces.
-- Rust edition 2024 (server; TUI crate pins `rust-version 1.90`, Docker builds with `rust:1.97-bookworm`); .NET solution `manga-scrapper/*.sln` (`dotnet test`); Go module in `scripts/anime-scraper/`.
+- Rust edition 2024 (server; TUI crate pins `rust-version 1.90`, Docker builds with `rust:1.97-bookworm`); Go module in `scripts/anime-scraper/`.
 - Framework pins: Next `16.3.5` (read `node_modules/next/dist/docs/` before writing App Router code), React `19`, Tailwind `4.1`, Prisma `6.19.3`, Postgres `16-alpine`, Redis `7-alpine`. Runtime image needs `ffmpeg` (HEVC→H.264 live transcode).
 - Env knobs: `MB_BACKEND_URL`, `MOVIEBOX_SERVER_PORT`, `MOVIEBOX_PROXY_BASE` (public origin for manifests), `API_PORT`/`API_HOST`, `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`/`JWT_TTL`, `PRISMA_AUTO_PUSH`, `*_HOST_PORT` port overrides in `.env`.
 
@@ -82,4 +81,4 @@ docker compose -f docker-compose.dev.yml up --build   # hot-reload dev (db/redis
 - Root: **Vitest 5 + jsdom + @vitest/coverage-v8**. `vitest.config.ts`: `globals: true`, `include: ["src/**/*.{test,spec}.ts?(x)"]`, `setupFiles: ["./src/test-setup.ts"]` (matchMedia/rAF shims), alias `@` → `src`, coverage over `src/**/*.{ts,tsx}` with no thresholds.
 - Suites: 14 in `src/lib/__tests__/` (pure logic: `format`, `seek`, `playback`, `captions`, `history`, `history-merge`, `rows`, `watch-sync`, `types`, `media-types`, `session-contract`, `api`, `api-account`, `account`) + 5 in `src/components/__tests__/` (`transcode-window`, `seek-routing`, `seek-pin`, `seek-commit`, `raf-display`). Convention: `import { describe, it, expect } from "vitest"`, one `describe` per function, dense boundary cases (`null`/`undefined`/`0`/`NaN`/`Infinity`/rollover); component behavior tested headlessly against `src/lib` helpers, no DOM mounting.
 - No ESLint/Prettier/Biome, no root CI. Only CI is `MovieBox-Tui/.github/workflows/ci.yml` (fmt, clippy `-D warnings`, audit, matrix `cargo test --all-features --locked`, `--version` smoke); its `docs/testing.md` + `.githooks/pre-commit` define that fork's QA.
-- Gaps: `api/` (Nest) and `scripts/anime-scraper/` (Go) have zero tests; `api/tsconfig.build.json` excludes `*.spec.ts`/`*.test.ts` as a reserved-but-unimplemented contract. `manga-scrapper/tests/` are xUnit + FluentAssertions + Moq (`UnitTests`/`IntegrationTests`/`ArchitectureTests` via NetArchTest).
+- Gaps: `api/` (Nest) and `scripts/anime-scraper/` (Go) have zero tests; `api/tsconfig.build.json` excludes `*.spec.ts`/`*.test.ts` as a reserved-but-unimplemented contract.

@@ -10,7 +10,7 @@ import { mergeEntries } from "@/lib/history-merge";
 import { useServerHistory } from "@/lib/session";
 import type { WatchEntry } from "@/lib/account";
 import { buildMetricRows, buildTypeRows, metricOf, pickHero } from "@/lib/rows";
-import type { BrowseMetrics, CatalogItem, HomeResponse, MangaTrendingResponse } from "@/lib/types";
+import type { BrowseMetrics, CatalogItem, HomeResponse } from "@/lib/types";
 
 interface FeedProps {
   feed: CatalogItem[] | null;
@@ -28,7 +28,6 @@ export function HomeFeed({ feed, metrics, error }: FeedProps) {
   const [local, setLocal] = useState<WatchEntry[]>([]);
   const [localReady, setLocalReady] = useState(false);
   const [animeItems, setAnimeItems] = useState<CatalogItem[]>([]);
-  const [mangaItems, setMangaItems] = useState<CatalogItem[]>([]);
 
   // Trending Anime row: fetched from the anime provider alongside the
   // server-rendered movie/series feed.
@@ -45,27 +44,7 @@ export function HomeFeed({ feed, metrics, error }: FeedProps) {
     };
   }, []);
 
-  // Trending Manga row: MangaScrapper catalog via the Rust backend. Degrades
-  // to an absent row when the manga stack is down (dev without compose).
-  // mangaError keeps the failure visible instead of swallowing it silently.
-  const [mangaError, setMangaError] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/mb/manga/trending")
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-      .then((data: MangaTrendingResponse) => {
-        if (!cancelled) {
-          setMangaItems(data.items ?? []);
-          setMangaError(null);
-        }
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) setMangaError(e instanceof Error ? e.message : "Manga unavailable");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+
 
   useEffect(() => {
     // Anonymous / offline history mirrored into the account shape (updatedAt).
@@ -180,43 +159,7 @@ export function HomeFeed({ feed, metrics, error }: FeedProps) {
             index={metricRows.length + typeRows.length + 1 + (hasContinue ? 1 : 0)}
           />
         )}
-        {mangaItems.length > 0 && (
-          <div>
-            <TitleRow
-              key="trending-manga"
-              label="Trending Manga"
-              items={mangaItems}
-              index={metricRows.length + typeRows.length + (animeItems.length > 0 ? 2 : 1) + (hasContinue ? 1 : 0)}
-            />
-            <div className="mt-3 text-right">
-              <Link
-                href="/manga"
-                className="mono-meta text-[11px] font-bold uppercase tracking-[0.18em] text-brand transition hover:text-brand-hover"
-              >
-                Browse all manga →
-              </Link>
-            </div>
-          </div>
-        )}
-        {mangaItems.length === 0 && mangaError && (
-          <section aria-label="Trending Manga unavailable">
-            <header className="mb-4 flex items-center gap-3">
-              <h2 className="shrink-0 text-lg font-extrabold tracking-tight text-zinc-50">
-                Trending Manga
-              </h2>
-              <span aria-hidden="true" className="h-px min-w-6 flex-1 bg-line" />
-              <Link
-                href="/manga"
-                className="mono-meta shrink-0 text-[11px] font-bold uppercase tracking-[0.18em] text-brand transition hover:text-brand-hover"
-              >
-                Browse →
-              </Link>
-            </header>
-            <p className="mono-meta text-[11px] uppercase tracking-[0.14em] text-zinc-500">
-              Manga unavailable ({mangaError}) — the MangaScrapper stack may be down.
-            </p>
-          </section>
-        )}
+
       </div>
     </div>
   );

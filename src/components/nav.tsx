@@ -9,7 +9,6 @@ import { useSession } from "@/lib/session";
 const LINKS = [
   { href: "/", label: "Home" },
   { href: "/search", label: "Search" },
-  { href: "/manga", label: "Manga" },
 ];
 
 const ACCOUNT_LINKS = [
