@@ -601,6 +601,7 @@ async fn test_contextual_window_title() {
         genres: vec![],
         seasons: vec![],
         dubs: vec![],
+        anime_ids: None,
     });
     assert_eq!(app.contextual_title(), "MovieBox-Tui — Inception");
 }

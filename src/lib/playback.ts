@@ -408,3 +408,104 @@ export function rewriteRelativeTo(baseDir: string, text: string): string {
   });
   return out;
 }
+export interface SniffedSubtitle {
+  language: string;
+  url: string;
+  kind: 'subtitles' | 'captions';
+  forced?: boolean;
+  sdh?: boolean;
+  embedded?: boolean;
+}
+
+/**
+ * Extract soft subtitle references from an HLS or DASH manifest text.
+ * - HLS: parses `#EXT-X-MEDIA:TYPE=SUBTITLES` lines with URI/LANGUAGE/FORCED/CHARACTERISTICS.
+ * - DASH: parses `<AdaptationSet contentType="text">` blocks with lang + BaseURL/SegmentTemplate.
+ * Relative URLs are returned verbatim; callers should resolve them against the manifest base dir.
+ */
+export function sniffSubtitles(text: string, isHls: boolean): SniffedSubtitle[] {
+  if (typeof text !== 'string' || text === '') return [];
+  if (isHls) {
+    const out: SniffedSubtitle[] = [];
+    const lineRe = /^#EXT-X-MEDIA:.*$/gim;
+    let m: RegExpExecArray | null;
+    while ((m = lineRe.exec(text)) !== null) {
+      const line = m[0];
+      if (!/TYPE\s*=\s*SUBTITLES/i.test(line)) continue;
+      const attrRe = /([A-Z0-9-]+)\s*=\s*(?:"([^"]*)"|([^,\s]*))/gi;
+      let a: RegExpExecArray | null;
+      let uri: string | null = null;
+      let lang: string | null = null;
+      let forced: boolean | undefined;
+      let sdh: boolean | undefined;
+      let kind: 'subtitles' | 'captions' = 'subtitles';
+      let chars = '';
+      while ((a = attrRe.exec(line)) !== null) {
+        const key = a[1].toUpperCase();
+        const val = a[2] !== undefined ? a[2] : a[3];
+        if (key === 'URI') uri = val;
+        else if (key === 'LANGUAGE') lang = val;
+        else if (key === 'FORCED') forced = /^YES$/i.test(val);
+        else if (key === 'CHARACTERISTICS') chars = val;
+      }
+      if (!uri) continue;
+      if (chars && /transcribes-spoken-dialog|describes-music-and-sound/i.test(chars)) {
+        sdh = true;
+        kind = 'captions';
+      }
+      if (chars && /describes-video/i.test(chars)) kind = 'captions';
+      out.push({
+        language: (lang ?? 'und').trim() || 'und',
+        url: uri,
+        kind,
+        forced,
+        sdh,
+      });
+    }
+    return out;
+  } else {
+    const out: SniffedSubtitle[] = [];
+    const adaptRe = new RegExp(ADAPTATION_SET_RE.source, 'gi');
+    let am: RegExpExecArray | null;
+    while ((am = adaptRe.exec(text)) !== null) {
+      const block = am[0];
+      const lower = block.toLowerCase();
+      const isText =
+        /contenttype\s*=\s*["']text["']/i.test(block) ||
+        (/contenttype\s*=\s*["']application\/mp4["']/i.test(lower) && /codecs\s*=\s*["'][^"']*stpp/i.test(lower)) ||
+        (/mimetype\s*=\s*["'](text|application)\//i.test(lower) && /codecs\s*=\s*["'][^"']*(wvtt|stpp|ttml)/i.test(lower)) ||
+        /mimetype\s*=\s*["']text\//i.test(block);
+      const hasSubtitleRole =
+        /<Role\b[^>]*value\s*=\s*["'](?:subtitle|caption|forced-subtitle|alternate)[^"']*["']/i.test(block) ||
+        lower.includes('value="subtitle"') ||
+        lower.includes("value='subtitle'");
+      if (!isText && !hasSubtitleRole) continue;
+      let langMatch = block.match(/\blang\s*=\s*["']([^"']+)["']/i);
+      if (!langMatch) langMatch = block.match(/<Representation\b[^>]*\blang\s*=\s*["']([^"']+)["']/i);
+      const lang = (langMatch?.[1] ?? 'und').trim() || 'und';
+      let kind: 'subtitles' | 'captions' = 'subtitles';
+      let forced: boolean | undefined;
+      let sdh: boolean | undefined;
+      if (/value\s*=\s*["'][^"']*caption/i.test(block)) kind = 'captions';
+      if (/value\s*=\s*["'][^"']*forced/i.test(block)) forced = true;
+      if (/value\s*=\s*["'][^"']*sdh|describes/i.test(block)) sdh = true;
+      let url: string | null = null;
+      const baseMatch = block.match(/<BaseURL[^>]*>([\s\S]*?)<\/BaseURL>/i);
+      if (baseMatch) {
+        const v = baseMatch[1].trim();
+        if (v) url = v;
+      }
+      if (!url) {
+        const segMatch = block.match(/<(?:SegmentTemplate|SegmentList)[^>]*\bmedia\s*=\s*["']([^"']+)["']/i);
+        if (segMatch) url = segMatch[1];
+      }
+      if (!url) {
+        const initMatch = block.match(/<(?:SegmentTemplate|SegmentList)[^>]*\binitialization\s*=\s*["']([^"']+)["']/i);
+        if (initMatch) url = initMatch[1];
+      }
+      if (!url) continue;
+      out.push({ language: lang, url, kind, forced, sdh, embedded: false });
+    }
+    return out;
+  }
+}

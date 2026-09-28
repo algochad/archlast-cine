@@ -141,6 +141,7 @@ pub fn parse_details(id: &str, html: &str) -> Result<MediaDetails, FourKHdHubErr
         genres,
         seasons,
         dubs: vec![],
+        anime_ids: None,
     })
 }
 

@@ -11,6 +11,7 @@ import { saveProgress, clearProgress } from "@/lib/history";
 
 vi.mock("@/lib/history", () => ({
   entryKey: (p: string, id: string, s = 0, e = 0) => `${p}:${id}:${s}:${e}`,
+  isComplete: (position: number, duration: number) => duration > 0 && position / duration > 0.98,
   saveProgress: vi.fn(),
   clearProgress: vi.fn(),
 }));

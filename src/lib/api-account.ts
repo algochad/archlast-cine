@@ -77,7 +77,7 @@ export const accountApi = {
 
   me: () => request<AccountState>("/me"),
 
-  updateSettings: async (patch: { region?: string; provider?: string }) =>
+  updateSettings: async (patch: { region?: string; provider?: string; player?: import("@/lib/account").PlayerPrefsSubset }) =>
     (await request<{ settings: AccountSettings }>("/settings", { method: "PATCH", body: JSON.stringify(patch) }))
       .settings,
 

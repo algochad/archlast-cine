@@ -1310,6 +1310,7 @@ mod tests {
                     label: "Hindi".to_string(),
                 },
             ],
+            anime_ids: None,
         });
         app.state.selected_resources = vec![Release {
             provider: ProviderKind::MovieBox,

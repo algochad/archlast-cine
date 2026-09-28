@@ -190,6 +190,7 @@ pub fn meta_detail_to_media_details(detail: &MetaDetail) -> MediaDetails {
         },
         seasons,
         dubs: vec![],
+        anime_ids: None,
     }
 }
 

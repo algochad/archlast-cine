@@ -8,7 +8,10 @@ import {
   PlayResponse,
   ProviderId,
   SearchResponse,
+  SkipMarkersResponse,
   StreamsResponse,
+  SubtitleOption,
+  TranscodeSpritesResponse,
   TranscodeStartResponse,
 } from "@/lib/types";
 
@@ -45,7 +48,42 @@ export const api = {
     request<StreamsResponse>(
       `/streams?provider=${provider}&id=${encodeURIComponent(id)}&season=${season}&episode=${episode}`,
     ),
-  captions: (id: string) => request<CaptionsResponse>(`/captions?id=${encodeURIComponent(id)}`),
+  captions: (id: string, resourceId?: string | null) => {
+    const rid = resourceId ? `&resource_id=${encodeURIComponent(resourceId)}` : "";
+    return request<CaptionsResponse>(`/captions?id=${encodeURIComponent(id)}${rid}`);
+  },
+  subtitleSearch: (opts: {
+    provider: "opensubtitles" | "subscene" | "aniskip" | "jimaku";
+    title?: string;
+    episode?: string | number;
+    lang?: string;
+    hash?: string;
+  }) => {
+    const qs = new URLSearchParams();
+    qs.set("provider", opts.provider);
+    if (opts.title) qs.set("title", opts.title);
+    if (opts.episode != null && String(opts.episode).trim() !== "") qs.set("episode", String(opts.episode));
+    if (opts.lang) qs.set("lang", opts.lang);
+    if (opts.hash) qs.set("hash", opts.hash);
+    return request<{ provider: string; subtitles: SubtitleOption[] }>(`/subtitles/search?${qs.toString()}`);
+  },
+  skipMarkers: (opts: {
+    provider: ProviderId;
+    id: string;
+    season?: number;
+    episode?: number;
+    anilistId?: number | null;
+    malId?: number | null;
+  }) => {
+    const qs = new URLSearchParams();
+    qs.set("provider", opts.provider);
+    qs.set("id", opts.id);
+    if (opts.season != null) qs.set("season", String(opts.season));
+    if (opts.episode != null) qs.set("episode", String(opts.episode));
+    if (opts.anilistId != null) qs.set("anilistId", String(opts.anilistId));
+    if (opts.malId != null) qs.set("malId", String(opts.malId));
+    return request<SkipMarkersResponse>(`/skip-markers?${qs.toString()}`);
+  },
   play: (body: {
     provider: ProviderId;
     id: string;
@@ -77,6 +115,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ position_seconds: positionSeconds }),
     }),
+  transcodeSprites: (session: string) =>
+    request<TranscodeSpritesResponse>(`/transcode/${encodeURIComponent(session)}/sprites`),
+  /** Rotate the ticket's upstream mirror (stable ticket id, position-safe). */
+  proxyRotate: (ticket: string) =>
+    request<{ ticket: string; mirror_label: string; rotated: boolean }>(
+      `/proxy/${encodeURIComponent(ticket)}/rotate`,
+      { method: "POST" },
+    ),
   /** Stop and remove a transcode session (fire-and-forget friendly). */
   transcodeDelete: (session: string) =>
     request<{ removed: boolean }>(`/transcode/${encodeURIComponent(session)}`, {

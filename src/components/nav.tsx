@@ -2,8 +2,9 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useRef, useState } from "react";
 import { PlayIcon, SearchIcon } from "@/components/icons";
+import { useDismissable } from "@/hooks/use-dismissable";
 import { useSession } from "@/lib/session";
 
 const LINKS = [
@@ -16,28 +17,8 @@ const ACCOUNT_LINKS = [
   { href: "/history", label: "History" },
   { href: "/account", label: "Settings" },
 ];
-
 const MENU_ITEM =
   "block w-full px-4 py-2 text-left text-[13px] font-medium text-zinc-300 transition-colors duration-150 hover:bg-white/5 hover:text-white";
-
-/** Dismiss on outside pointer press or Escape while the menu is open. */
-function useDismissable(open: boolean, ref: RefObject<HTMLElement | null>, close: () => void) {
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (event: MouseEvent) => {
-      if (ref.current && !ref.current.contains(event.target as Node)) close();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open]);
-}
 
 function SignOutButton({ onSignOut }: { onSignOut: () => void }) {
   return (

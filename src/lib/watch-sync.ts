@@ -16,7 +16,7 @@
  * page and Continue Watching read stays in step with these writes.
  */
 
-import { clearProgress, entryKey, saveProgress, type WatchEntry } from "@/lib/history";
+import { clearProgress, entryKey, isComplete, saveProgress, type WatchEntry } from "@/lib/history";
 
 /** Max frequency of server upserts for one title. Local writes are never throttled. */
 export const SERVER_SYNC_INTERVAL_MS = 8_000;
@@ -59,9 +59,7 @@ export function recordWatch(patch: WatchProgress, authed: boolean, force = false
   const key = entryKey(patch.provider, patch.id, patch.season, patch.episode);
   saveProgress(key, patch);
   if (!authed || !transport) return;
-  // The local store drops finished rows; keep the account store in step
-  // instead of upserting a row that reads as complete.
-  if (patch.duration > 0 && patch.position / patch.duration > 0.98) {
+  if (isComplete(patch.position, patch.duration)) {
     removeWatch(patch.provider, patch.id, patch.season, patch.episode, true);
     return;
   }

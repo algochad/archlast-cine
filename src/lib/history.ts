@@ -18,6 +18,10 @@ export interface WatchEntry {
 
 const KEY = "moviebox.watch.v1";
 const MAX_ENTRIES = 50;
+export function isComplete(position: number, duration: number): boolean {
+  return duration > 0 && position / duration > 0.98;
+}
+
 
 export function entryKey(provider: ProviderId, id: string, season = 0, episode = 0): string {
   return `${provider}:${id}:${season}:${episode}`;
@@ -45,7 +49,7 @@ export function saveProgress(
     const map: Record<string, WatchEntry> = raw ? JSON.parse(raw) : {};
     const prev = map[key];
     // Finished watching: remove the row so it stops appearing.
-    if (patch.duration > 0 && patch.position / patch.duration > 0.98) {
+    if (isComplete(patch.position, patch.duration)) {
       delete map[key];
     } else {
       map[key] = { ...prev, ...patch, updated: Date.now() };

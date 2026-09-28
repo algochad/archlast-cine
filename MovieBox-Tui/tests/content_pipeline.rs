@@ -44,6 +44,7 @@ async fn test_stale_details_response_protection() {
         genres: vec![],
         seasons: vec![],
         dubs: vec![],
+        anime_ids: None,
     });
 
     let context_b = RequestContext {
@@ -72,6 +73,7 @@ async fn test_stale_details_response_protection() {
         genres: vec![],
         seasons: vec![],
         dubs: vec![],
+        anime_ids: None,
     });
 
     let stale_payload = MediaDetails {
@@ -94,6 +96,7 @@ async fn test_stale_details_response_protection() {
         genres: vec![],
         seasons: vec![],
         dubs: vec![],
+        anime_ids: None,
     };
     app.handle_action(Action::DetailsSuccess(
         context_a,
@@ -129,6 +132,7 @@ async fn test_stale_details_response_protection() {
         genres: vec![],
         seasons: vec![],
         dubs: vec![],
+        anime_ids: None,
     };
     app.handle_action(Action::DetailsSuccess(
         context_b,
@@ -320,6 +324,7 @@ async fn test_search_preview_and_details_metadata_isolation() {
         genres: vec!["Action".to_string()],
         seasons: vec![],
         dubs: vec![],
+        anime_ids: None,
     };
 
     let new_search_result = SearchResult {
@@ -364,6 +369,7 @@ async fn test_search_preview_and_details_metadata_isolation() {
         genres: vec!["Drama".to_string()],
         seasons: vec![],
         dubs: vec![],
+        anime_ids: None,
     };
     let matching_fallback =
         MediaDetails::from_search_result(&new_search_result, Some(&matching_preview));
@@ -422,6 +428,7 @@ async fn test_series_details_defaults_to_season_one_when_no_history() {
         genres: vec![],
         seasons,
         dubs: vec![],
+        anime_ids: None,
     };
 
     app.handle_action(Action::DetailsSuccess(
@@ -502,6 +509,7 @@ async fn test_series_details_resumes_watch_history() {
         genres: vec![],
         seasons,
         dubs: vec![],
+        anime_ids: None,
     };
 
     app.handle_action(Action::DetailsSuccess(
@@ -568,6 +576,7 @@ async fn test_series_details_preserves_season_and_episode_on_language_switch() {
         genres: vec![],
         seasons,
         dubs: vec![],
+        anime_ids: None,
     };
 
     app.handle_action(Action::DetailsSuccess(

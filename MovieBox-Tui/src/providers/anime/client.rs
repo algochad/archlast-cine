@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde::Deserialize;
 
 use crate::providers::models::{
-    AudioTrackOption, CatalogItem, Episode, MediaDetails, MediaType,
+    AnimeIds, AudioTrackOption, CatalogItem, Episode, MediaDetails, MediaType,
     ProviderError, ProviderKind, ProviderMediaId, Release, Season,
 };
 use crate::providers::ProviderCapabilities;
@@ -436,8 +436,9 @@ impl AnimeProvider {
                 .or_else(|| media.banner_image.clone()),
             duration,
             genres: media.genres.clone(),
-            seasons: Self::seasons_for(media),
+            seasons: Vec::new(),
             dubs: Vec::<AudioTrackOption>::new(),
+            anime_ids: Some(AnimeIds { anilist_id: Some(media.id), mal_id: media.id_mal }),
         }
     }
 
@@ -629,6 +630,7 @@ impl AnimeProvider {
             genres: card.genres.clone().unwrap_or_default(),
             seasons: Self::allanime_seasons_for(card),
             dubs: Vec::<AudioTrackOption>::new(),
+            anime_ids: None,
         }
     }
 

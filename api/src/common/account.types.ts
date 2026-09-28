@@ -20,7 +20,44 @@ export interface AccountUser {
 export interface AccountSettings {
   region: RegionId;
   provider: ProviderId;
+  player?: PlayerPrefsSubset;
 }
+
+export interface PlayerPrefsSubset {
+  seekStep?: 5 | 10 | 15 | 30 | 60;
+  playbackRate?: number;
+  autoplay?: boolean;
+  prefSubLang?: string[];
+  prefAudioLang?: string[];
+  subStyle?: SubStyle;
+  aspectMode?: 'contain' | 'cover' | 'fill';
+}
+
+export type PlayerPrefsDto = PlayerPrefsSubset;
+
+export interface SubStyle {
+  font: 'sans' | 'serif' | 'mono' | 'anime';
+  weight: 'normal' | 'bold';
+  scale: number;
+  color: string;
+  stroke: string;
+  shadow: string;
+  bg: string;
+  bgOpacity: number;
+  yOffset: number;
+}
+
+export const DEFAULT_SUB_STYLE: SubStyle = {
+  font: 'sans',
+  weight: 'normal',
+  scale: 1,
+  color: '#ffffff',
+  stroke: '#000000',
+  shadow: 'none',
+  bg: '#000000',
+  bgOpacity: 0.5,
+  yOffset: 0,
+};
 
 export interface AccountState {
   user: AccountUser;
@@ -76,11 +113,27 @@ export function toAccountUser(user: {
   };
 }
 
-export function toAccountSettings(user: { region: string; provider: string }): AccountSettings {
-  return {
+export function toAccountSettings(user: { region: string; provider: string; settings?: unknown }): AccountSettings {
+  const base: AccountSettings = {
     region: isRegionId(user.region) ? user.region : 'ph',
     provider: isProviderId(user.provider) ? user.provider : 'moviebox',
   };
+  if (user.settings && typeof user.settings === 'object' && user.settings !== null) {
+    const s = user.settings as Record<string, unknown>;
+    if (s.player && typeof s.player === 'object' && s.player !== null) {
+      const p = s.player as Record<string, unknown>;
+      const player: PlayerPrefsSubset = {};
+      if (typeof p.seekStep === 'number' && [5, 10, 15, 30, 60].includes(p.seekStep)) player.seekStep = p.seekStep as PlayerPrefsSubset['seekStep'];
+      if (typeof p.playbackRate === 'number' && Number.isFinite(p.playbackRate)) player.playbackRate = p.playbackRate;
+      if (typeof p.autoplay === 'boolean') player.autoplay = p.autoplay;
+      if (Array.isArray(p.prefSubLang)) player.prefSubLang = p.prefSubLang.map(String);
+      if (Array.isArray(p.prefAudioLang)) player.prefAudioLang = p.prefAudioLang.map(String);
+      if (typeof p.aspectMode === 'string' && ['contain', 'cover', 'fill'].includes(p.aspectMode)) player.aspectMode = p.aspectMode as PlayerPrefsSubset['aspectMode'];
+      if (p.subStyle && typeof p.subStyle === 'object' && p.subStyle !== null) player.subStyle = p.subStyle as SubStyle;
+      if (Object.keys(player).length > 0) base.player = player;
+    }
+  }
+  return base;
 }
 
 export function toAccountState(user: {
@@ -90,6 +143,7 @@ export function toAccountState(user: {
   region: string;
   provider: string;
   createdAt: Date;
+  settings?: unknown;
 }): AccountState {
   return { user: toAccountUser(user), settings: toAccountSettings(user) };
 }

@@ -1,4 +1,5 @@
 import type { MediaType } from "@/lib/media-types";
+import type { PlayerPrefsSubset } from "@/lib/account";
 // Account session + data hooks contract — implemented by the auth agent.
 // Consumed by nav / hover cards / detail / watch pages. All network calls go
 // through /api/account/* (Next route handlers proxy to the Nest backend and
@@ -10,14 +11,14 @@ export interface SessionState {
     email: string;
     name: string;
   } | null;
-  settings: { region: "ph" | "us" | "in" | "sg"; provider: string };
+  settings: { region: "ph" | "us" | "in" | "sg"; provider: string; player?: PlayerPrefsSubset };
   /** one of: 'loading' | 'anon' | 'authed' */
   status: "loading" | "anon" | "authed";
   refresh: () => Promise<void>;
   login: (email: string, password: string) => Promise<void>;
   register: (name: string, email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
-  updateSettings: (patch: { region?: string; provider?: string }) => Promise<void>;
+  updateSettings: (patch: { region?: string; provider?: string; player?: PlayerPrefsSubset }) => Promise<void>;
 }
 
 export interface MyListState {

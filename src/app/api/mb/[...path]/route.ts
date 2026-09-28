@@ -2,59 +2,70 @@ import type { NextRequest } from "next/server";
 
 // Proxies /api/mb/* to the Rust backend with a generous timeout for slow
 // anime resolves (sidecar fan-out can take 45s+ on cold cache).
-// Replaces the next.config.ts rewrite for this path, which has no timeout
-// control and drops the connection ~30s in (ECONNRESET -> browser 500).
+// Streams the response body directly via ReadableStream and
+// AbortSignal.timeout(120_000) — never calls arrayBuffer() on the media
+// path — so large transcode segments/manifests pipe without buffering
+// the whole body in the Next process and without the ~30s rewrite drop.
 const BACKEND = process.env.MB_BACKEND_URL ?? "http://127.0.0.1:9797";
 const TIMEOUT_MS = 120_000;
 
-async function proxy(req: NextRequest, method: string) {
+const PASS_HEADERS = [
+  "content-type",
+  "content-length",
+  "content-range",
+  "accept-ranges",
+  "etag",
+  "last-modified",
+  "cache-control",
+] as const;
+
+async function proxy(req: NextRequest) {
   const url = new URL(req.url);
   const path = url.pathname.replace(/^\/api\/mb/, "/api") + url.search;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  const headers = new Headers();
+  const contentType = req.headers.get("content-type");
+  if (contentType) headers.set("content-type", contentType);
+  const range = req.headers.get("range");
+  if (range) headers.set("range", range);
+  const accept = req.headers.get("accept");
+  if (accept) headers.set("accept", accept);
+
+  const hasBody = req.method !== "GET" && req.method !== "HEAD" && req.body !== null;
+
   try {
-    const headers = new Headers();
-    const contentType = req.headers.get("content-type");
-    if (contentType) headers.set("content-type", contentType);
-    const body = method === "GET" || method === "HEAD" ? undefined : await req.arrayBuffer();
     const res = await fetch(`${BACKEND}${path}`, {
-      method,
+      method: req.method,
       headers,
-      body,
-      signal: controller.signal,
+      body: hasBody ? (req.body as unknown as BodyInit) : undefined,
+      ...(hasBody ? ({ duplex: "half" } as unknown as Record<string, unknown>) : {}),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
       cache: "no-store",
     });
-    const buf = await res.arrayBuffer();
+
     const outHeaders = new Headers();
-    const ct = res.headers.get("content-type");
-    if (ct) outHeaders.set("content-type", ct);
-    return new Response(buf, { status: res.status, headers: outHeaders });
+    for (const name of PASS_HEADERS) {
+      const v = res.headers.get(name);
+      if (v) outHeaders.set(name, v);
+    }
+
+    // Stream backend body directly — never buffers whole segment/manifest.
+    return new Response(res.body, {
+      status: res.status,
+      headers: outHeaders,
+    });
   } catch (e) {
     if (e instanceof Error && e.name === "AbortError") {
       return Response.json({ error: "backend request timed out" }, { status: 504 });
     }
     return Response.json({ error: "backend unavailable" }, { status: 502 });
-  } finally {
-    clearTimeout(timer);
   }
 }
 
-export async function GET(req: NextRequest) {
-  return proxy(req, "GET");
-}
-
-export async function POST(req: NextRequest) {
-  return proxy(req, "POST");
-}
-
-export async function PUT(req: NextRequest) {
-  return proxy(req, "PUT");
-}
-
-export async function PATCH(req: NextRequest) {
-  return proxy(req, "PATCH");
-}
-
-export async function DELETE(req: NextRequest) {
-  return proxy(req, "DELETE");
-}
+export const GET = proxy;
+export const POST = proxy;
+export const PUT = proxy;
+export const PATCH = proxy;
+export const DELETE = proxy;
+export const HEAD = proxy;
+export const OPTIONS = proxy;

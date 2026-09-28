@@ -365,3 +365,55 @@ input[type="range"].player-range:active::-moz-range-thumb {
 .tick-corners:hover::after {
   opacity: 1;
 }
+
+/* Subtitle styling — native ::cue subset (color/bg/size only) */
+:root {
+  --sub-color: #ffffff;
+  --sub-bg: rgba(0,0,0,0.5);
+  --sub-size: calc(1rem * 1);
+}
+video::cue {
+  color: var(--sub-color);
+  background-color: var(--sub-bg);
+  font-size: var(--sub-size);
+}
+/* Overlay fallback when fullscreen container holds video */
+:fullscreen video::cue { color: var(--sub-color); background-color: var(--sub-bg); font-size: var(--sub-size); }
+
+/* Gesture layer — transparent overlay covering video, below controls (z 10 vs controls z 20/30) */
+.gesture-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  background: transparent;
+}
+
+/* Side flash for double-tap feedback (300ms) */
+@keyframes sideFlashFade {
+  from { opacity: 0.22; }
+  to { opacity: 0; }
+}
+.side-flash {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 30%;
+  pointer-events: none;
+  z-index: 11;
+  animation: sideFlashFade 300ms ease-out forwards;
+}
+.side-flash--left {
+  left: 0;
+  background: radial-gradient(ellipse at left center, rgba(34,197,94,0.22) 0%, transparent 70%);
+}
+.side-flash--right {
+  right: 0;
+  background: radial-gradient(ellipse at right center, rgba(34,197,94,0.22) 0%, transparent 70%);
+}
+
+/* Brightness overlay reuses dimmerRef; no extra class needed — bg-black opacity driven by JS */
+

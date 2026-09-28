@@ -15,20 +15,37 @@ import { api, mbUrl, type TranscodeStateResponse } from "@/lib/api";
 import {
   attachSubtitleTrack,
   ensureActiveCues,
+  parseAssCues,
   parseSubtitleCues,
+  parseTtmlCues,
   reattachSubtitleTrack,
+  shiftCues,
+  type SubtitleCue,
   type SubtitleTrackState,
 } from "@/lib/captions";
-import { formatClock } from "@/lib/format";
-import { getHistory } from "@/lib/history";
-import { browserSupportsHevc, parseMpdDuration, pickPlayableManifest, rewriteRelativeTo, sniffHls } from "@/lib/playback";
-import { clampSeekTarget, isSeekableDuration, resolveDisplayTime, seekProgressPct } from "@/lib/seek";
+import { formatClock, formatRemaining } from "@/lib/format";
+import { getHistory, isComplete } from "@/lib/history";
+import { browserSupportsHevc, parseMpdDuration, pickPlayableManifest, rewriteRelativeTo, sniffHls, sniffSubtitles } from "@/lib/playback";
+import { applyScrubSensitivity, chapterLeftPct, chapterWidthPct, clampSeekTarget, isSeekableDuration, resolveDisplayTime, seekProgressPct, resolveSeekStep } from "@/lib/seek";
 import { useMyList, useServerHistory, useSession } from "@/lib/session";
-import type { MediaDetails, Release, StreamsResponse, SubtitleOption } from "@/lib/types";
+import type { Chapter, MediaDetails, Release, StreamsResponse, SubtitleOption } from "@/lib/types";
 import { ApiError } from "@/lib/types";
 import { recordWatch, removeWatch, setWatchSyncTransport } from "@/lib/watch-sync";
-import { ArrowLeft, CheckIcon, FullscreenIcon, FullscreenExitIcon, PlayIcon, Spinner, VolumeIcon, VolumeMuteIcon } from "@/components/icons";
-
+import { ArrowLeft, AspectIcon, BoostIcon, CastIcon, CcIcon, CheckIcon, ForwardIcon, FullscreenIcon, FullscreenExitIcon, GearIcon, LockIcon, NextEpIcon, PipIcon, PlayIcon, PrevEpIcon, ReplayIcon, RewindIcon, Spinner, StatsIcon, UnlockIcon, VolumeIcon, VolumeMuteIcon } from "@/components/icons";
+import { nextEpisode, prevEpisode } from "@/lib/episode-nav";
+import { getPrefs, setPrefs, subscribePrefs } from "@/lib/player-prefs";
+import { clampRate, frameStep, nearestPreset, SPEED_PRESETS } from "@/lib/playback-rate";
+import type { AspectMode, BackBuffer, FilterMode, HoldBoostRate, SeekStep, TimeMode } from "@/lib/player-prefs";
+import { StatsOverlay } from "@/components/StatsOverlay";
+import { sampleStats, type StatsSnapshot } from "@/lib/stats";
+import { bufferTargetFor, estimate, type BandwidthSample } from "@/lib/bandwidth";
+import { useDismissable } from "@/hooks/use-dismissable";
+import { useGestures } from "@/hooks/use-gestures";
+import { SubtitleOverlay } from "@/components/SubtitleOverlay";
+import { DEFAULT_SUB_STYLE, coerceSubStyle, styleToCssVars, type SubStyle } from "@/lib/sub-style";
+import { createSmartSpeed, type SmartSpeedHandle } from "@/lib/smart-speed";
+import { findThumb, parseThumbsVtt, type ThumbCue } from "@/lib/thumbs";
+import { attachJassub, destroyJassub } from "@/lib/jassub";
 type Provider = "moviebox" | "fourkhdhub" | "bdix_circleftp" | "bdix_dhakaflix" | "anime";
 
 interface Props {
@@ -81,6 +98,16 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   const [transcodeActive, setTranscodeActiveState] = useState(false);
   // source the player is currently bound to (for the watchdog fallback)
   const currentSourceRef = useRef<string | null>(null);
+  const bwSamplesRef = useRef<BandwidthSample[]>([]);
+  const lastBwEstimateRef = useRef<number>(0);
+  const lastAppliedTargetRef = useRef<number | null>(null);
+  const lastTargetChangeAtRef = useRef<number>(0);
+  const bwTickRef = useRef<number | null>(null);
+  const startSourceRef = useRef<((wantResolution: number | null, candidateOrder: Release[]) => Promise<void>) | null>(null);
+  const heapWarnedRef = useRef(false);
+  const excludedLabelsRef = useRef<Set<string>>(new Set());
+  const failoverPendingRef = useRef(false);
+  const lastFailoverAtRef = useRef(0);
 
   // Absolute-source timeline for the transcode (HLS live) path. The media
   // element only exposes the sliding live window (video.duration = window
@@ -108,19 +135,202 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   const [controls, setControls] = useState(true);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(1);
+  const [volumeBoost, setVolumeBoost] = useState(false);
+  const [normalizeOn, setNormalizeOn] = useState(false);
+  const [volPopoverOpen, setVolPopoverOpen] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  const volMenuRef = useRef<HTMLDivElement>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const audioSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const gainRef = useRef<GainNode | null>(null);
+  const compRef = useRef<DynamicsCompressorNode | null>(null);
+  const graphReadyRef = useRef(false);
+  const volumeBoostRef = useRef(false);
+  const normalizeGainRef = useRef(false);
   const [resumeAsk, setResumeAsk] = useState<{ position: number } | null>(null);
   const [nextUp, setNextUp] = useState<{ season: number; episode: number; title: string } | null>(null);
   const [qualityChoices, setQualityChoices] = useState<{ label: string; release: Release }[]>([]);
   const [tick, setTick] = useState(0);
-  // captions: available subtitle tracks (moviebox only) + the active pick
+  // captions: available subtitle tracks (api + manifest) + the active pick
   const [subOptions, setSubOptions] = useState<SubtitleOption[]>([]);
   const [chosenSub, setChosenSub] = useState<SubtitleOption | null>(null);
   const [subsOpen, setSubsOpen] = useState(false);
-  // remote (pipeline-restart) seek state
+  // capability gating: null = unknown/loading, false = provider hides CC entirely
+  const [supportsSubs, setSupportsSubs] = useState<boolean | null>(null);
+  const supportsSubsRef = useRef<boolean | null>(null);
+  supportsSubsRef.current = supportsSubs;
+  const healthFetchedRef = useRef(false);
+  // side-load hidden file input + local cues that survive teardown
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const localCuesRef = useRef<SubtitleOption | null>(null);
+  // loaded/active refs for stale-free caption loading (used before ensureSubtitleCap defined)
+  const loadedRef = useRef<Loaded | null>(null);
+  const activeRef = useRef(active);
+  useEffect(() => { loadedRef.current = loaded; }, [loaded]);
+  useEffect(() => { activeRef.current = active; }, [active]);
   const [remoteSeeking, setRemoteSeeking] = useState(false);
   const [seekNotice, setSeekNotice] = useState<string | null>(null);
   const subsMenuRef = useRef<HTMLDivElement>(null);
+  const [speedOpen, setSpeedOpen] = useState(false);
+  const speedMenuRef = useRef<HTMLDivElement>(null);
+  const [playbackRate, setPlaybackRateState] = useState<number>(() => {
+    try { return clampRate(getPrefs().playbackRate); } catch { return 1; }
+  });
+  const [pitchLock, setPitchLockState] = useState<boolean>(() => {
+    try { return getPrefs().pitchLock; } catch { return true; }
+  });
+  const pitchLockRef = useRef(pitchLock);
+  pitchLockRef.current = pitchLock;
+  const playbackRateRef = useRef(playbackRate);
+  playbackRateRef.current = playbackRate;
+  const frameStepWarnedRef = useRef(false);
+  const [smartSpeed, setSmartSpeedState] = useState<boolean>(() => { try { return getPrefs().smartSpeed; } catch { return false; } });
+  const smartSpeedRef = useRef(smartSpeed);
+  smartSpeedRef.current = smartSpeed;
+  const smartHandleRef = useRef<SmartSpeedHandle | null>(null);
+  // rate/persist debounce: a slider drag fires dozens of changes per second,
+  // so the pref write trails the last move instead of landing on each one.
+  const ratePersistTimerRef = useRef<number | null>(null);
+  // Safari spells it webkitPreservesPitch; feature-detect both so a pitch-lock
+  // toggle is never a silent no-op on older WebKit.
+  const applyPreservesPitch = useCallback((video: HTMLVideoElement, lock: boolean) => {
+    try { (video as unknown as { preservesPitch?: boolean }).preservesPitch = lock; } catch {}
+    try {
+      const webkit = video as unknown as { webkitPreservesPitch?: boolean };
+      if ("webkitPreservesPitch" in video) webkit.webkitPreservesPitch = lock;
+    } catch {}
+  }, []);
+  /** Re-apply rate + pitch after a source (re)bind: load() resets both. */
+  const restorePlaybackRate = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    try { video.playbackRate = clampRate(playbackRateRef.current); } catch {}
+    applyPreservesPitch(video, pitchLockRef.current);
+  }, [applyPreservesPitch]);
+  const [episodeDrawerOpen, setEpisodeDrawerOpen] = useState(false);
+  const episodeDrawerRef = useRef<HTMLDivElement>(null);
+  const [activeSeasonTab, setActiveSeasonTab] = useState<number | null>(null);
+  const lastChosenSubRef = useRef<SubtitleOption | null>(null);
+  // Dual subtitles (P2)
+  const dualSubRef = useRef<SubtitleOption | null>(null);
+  const chosenSub2Ref = useRef<SubtitleOption | null>(null);
+  const [chosenSub2, setChosenSub2] = useState<SubtitleOption | null>(null);
+  const [dualSubs, setDualSubsState] = useState<boolean>(() => { try { return getPrefs().dualSubs; } catch { return false; } });
+  const dualSubsRef2 = useRef(dualSubs);
+  dualSubsRef2.current = dualSubs;
+  const dualTrackRef = useRef<SubtitleTrackState | null>(null);
+  // subtitle offset + style (P2)
+  const [subOffsetMs, setSubOffsetMs] = useState<number>(() => { try { return getPrefs().subOffsetMs; } catch { return 0; } });
+  const [subOffsetMs2, setSubOffsetMs2] = useState<number>(() => { try { return getPrefs().subOffsetMs2; } catch { return 0; } });
+  const subOffsetMsRef = useRef(subOffsetMs);
+  subOffsetMsRef.current = subOffsetMs;
+  const subOffsetMs2Ref = useRef(subOffsetMs2);
+  subOffsetMs2Ref.current = subOffsetMs2;
+  const [subStyle, setSubStyleState] = useState<SubStyle>(() => { try { return coerceSubStyle(getPrefs().subStyle); } catch { return DEFAULT_SUB_STYLE; } });
+  const subStyleRef = useRef(subStyle);
+  subStyleRef.current = subStyle;
+  const [subFilter, setSubFilterState] = useState<'all'|'signs'>(() => { try { return getPrefs().subFilter; } catch { return 'all'; } });
+  const subFilterRef = useRef(subFilter);
+  subFilterRef.current = subFilter;
+  // overlay clock: rAF subscription for dual/ASS scheduling
+  const [overlayNow, setOverlayNow] = useState(0);
+  const overlayNowRef = useRef(0);
+  // cue cache for overlay rendering
+  const [primaryCues, setPrimaryCues] = useState<SubtitleCue[]>([]);
+  const primaryCuesRef = useRef<SubtitleCue[]>([]);
+  // keep ref in sync with state for fast access in callbacks
+  // (state drives render, ref drives logic)
+  const [secondaryCues, setSecondaryCues] = useState<SubtitleCue[]>([]);
+  const secondaryCuesRef = useRef<SubtitleCue[]>([]);
+  const setPrimaryCuesSync = (cues: SubtitleCue[]) => { primaryCuesRef.current = cues; setPrimaryCues(cues); };
+  const setSecondaryCuesSync = (cues: SubtitleCue[]) => { secondaryCuesRef.current = cues; setSecondaryCues(cues); };
+  // P4: word lookup (pause + token selection only, no dictionary fetch)
+  const [lookup, setLookup] = useState<{ word: string; cueText: string } | null>(null);
+  const jassubAssRef = useRef<string | null>(null);
+  const jassubActiveRef = useRef(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchProvider, setSearchProvider] = useState<'opensubtitles'|'subscene'|'aniskip'|'jimaku'>('opensubtitles');
+  const [searchResults, setSearchResults] = useState<SubtitleOption[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [autoplay, setAutoplay] = useState<boolean>(() => {
+    try { return getPrefs().autoplay; } catch { return true; }
+  });
+  const [autoplayDelay, setAutoplayDelay] = useState<number>(() => {
+    try { return getPrefs().autoplayDelay; } catch { return 10; }
+  });
+  const [skipChapter, setSkipChapter] = useState<Chapter | null>(null);
+  // P1System — screen lock + aspect + filter + stats + PiP
+  const [locked, setLocked] = useState(false);
+  const lockedRef = useRef(false);
+  const lockTapCountRef = useRef(0);
+  const lockTapTimerRef = useRef<number | null>(null);
+  const lockHoldTimerRef = useRef<number | null>(null);
+  const lockHintTimerRef = useRef<number | null>(null);
+  const [lockHint, setLockHint] = useState(false);
+  const [aspectModeState, setAspectModeState] = useState<AspectMode>(() => {
+    try { return getPrefs().aspectMode; } catch { return "contain"; }
+  });
+  const [filterMode, setFilterMode] = useState<FilterMode>(() => {
+    try { return getPrefs().filter; } catch { return "none"; }
+  });
+  const [nightDim, setNightDimState] = useState<number>(() => {
+    try { return getPrefs().nightDim; } catch { return 0; }
+  });
+  const [statsOpen, setStatsOpen] = useState<boolean>(() => {
+    try { return getPrefs().statsOpen; } catch { return false; }
+  });
+  const statsSnapshotRef = useRef<StatsSnapshot>({ fps: null, bitrate: null, codec: null, buffered: 0, dropped: 0, resolution: "—" });
+  const [statsTick, setStatsTick] = useState(0);
+  const statsTimerRef = useRef<number | null>(null);
+  const [pipActive, setPipActive] = useState(false);
+  const [aspectOpen, setAspectOpen] = useState(false);
+  const [filterOpen, setFilterOpen] = useState(false);
+  const aspectMenuRef = useRef<HTMLDivElement>(null);
+  const filterMenuRef = useRef<HTMLDivElement>(null);
+  const dimmerRef = useRef<HTMLDivElement>(null);
+  // P3 gesture brightness + hold boost + side flash
+  const [brightness, setBrightnessState] = useState<number>(() => {
+    try { return getPrefs().brightness; } catch { return 1; }
+  });
+  const brightnessRef = useRef(brightness);
+  brightnessRef.current = brightness;
+  const [sideFlash, setSideFlash] = useState<"left" | "right" | null>(null);
+  const sideFlashTimerRef = useRef<number | null>(null);
+  const prevRateRef = useRef<number | null>(null);
+  const boostActiveRef = useRef(false);
+  const pinchAppliedRef = useRef<AspectMode | null>(null);
+  const gestureVolumeStartRef = useRef<number | null>(null);
+  const gestureBrightnessStartRef = useRef<number | null>(null);
+  // P1Seek — seek step + time mode (direct + transcode, frame-accurate via refs)
+  const [seekStep, setSeekStepState] = useState<SeekStep>(() => {
+    try { return resolveSeekStep(getPrefs().seekStep); } catch { return 10; }
+  });
+  const seekStepRef = useRef(seekStep);
+  seekStepRef.current = seekStep;
+  const [timeMode, setTimeModeState] = useState<TimeMode>(() => {
+    try {
+      const m = getPrefs().timeMode;
+      return m === 'elapsed' || m === 'remaining' ? m : 'elapsed';
+    } catch { return 'elapsed'; }
+  });
+  const timeModeRef = useRef(timeMode);
+  timeModeRef.current = timeMode;
+  // P3Scrub — fine-scrub + hover tooltip + sub-parse worker (separate concerns, shared refs)
+  const seekWrapRef = useRef<HTMLDivElement>(null);
+  const scrubTooltipRef = useRef<HTMLDivElement>(null);
+  const scrubTooltipImgRef = useRef<HTMLDivElement>(null);
+  const thumbCuesRef = useRef<ThumbCue[]>([]);
+  const thumbBaseRef = useRef<string | null>(null);
+  const thumbLoadedRef = useRef(false);
+  const scrubStartXRef = useRef<number | null>(null);
+  const scrubStartYRef = useRef<number | null>(null);
+  const scrubGrabTimeRef = useRef<number | null>(null);
+  const scrubModeRef = useRef<'normal' | 'fine' | 'ultra'>('normal');
+  const subParseWorkerRef = useRef<Worker | null>(null);
+  const subParseReqIdRef = useRef(0);
+  const subParsePendingRef = useRef<Map<number, (cues: SubtitleCue[]) => void>>(new Map());
+
+
 
   const controlsTimer = useRef<number | null>(null);
   const volumeRef = useRef(volume);
@@ -185,12 +395,159 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       setSeekNotice((cur) => (cur === text ? null : cur));
     }, 2000);
   }, []);
+  // ---- P3 buffer/ABR helpers (low-level, no startSource dep) ----
+  const checkHeapAndPruneInternal = useCallback(() => {
+    try {
+      const perf = performance as unknown as { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } };
+      const mem = perf.memory;
+      if (!mem || !Number.isFinite(mem.usedJSHeapSize) || !Number.isFinite(mem.jsHeapSizeLimit)) return;
+      if (mem.usedJSHeapSize > 0.8 * mem.jsHeapSizeLimit) {
+        if (heapWarnedRef.current) return;
+        heapWarnedRef.current = true;
+        flashNotice("Memory saver");
+        window.setTimeout(() => {
+          heapWarnedRef.current = false;
+        }, 30000);
+        const h = hlsRef.current;
+        if (h) {
+          try {
+            const v = videoRef.current;
+            if (v && Number.isFinite(v.currentTime)) {
+              (h.config as unknown as { backBufferLength: number }).backBufferLength = 15;
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }, [flashNotice]);
 
+  const persistLastBps = useCallback((bps: number) => {
+    if (!Number.isFinite(bps) || bps <= 0) return;
+    lastBwEstimateRef.current = bps;
+    try {
+      const cur = getPrefs().lastBps;
+      if (Math.abs(cur - bps) / Math.max(cur, 1) < 0.15) return;
+      setPrefs({ lastBps: Math.round(bps) });
+    } catch {}
+  }, []);
+
+  const applyBufferTarget = useCallback(
+    (bps: number) => {
+      if (!Number.isFinite(bps) || bps <= 0) return;
+      const target = bufferTargetFor(bps);
+      const now = Date.now();
+      const last = lastAppliedTargetRef.current;
+      const lastAt = lastTargetChangeAtRef.current;
+      if (last != null && last === target) return;
+      if (last != null && now - lastAt < 5000) return;
+      lastAppliedTargetRef.current = target;
+      lastTargetChangeAtRef.current = now;
+      const h = hlsRef.current;
+      if (h) {
+        try {
+          (h.config as unknown as { maxBufferLength: number }).maxBufferLength = target;
+        } catch {}
+      }
+      const dash = dashRef.current;
+      if (dash) {
+        try {
+          let keep: number;
+          try {
+            const b = getPrefs().backBuffer as BackBuffer;
+            keep = b === 0 ? 30 : b;
+          } catch {
+            keep = 30;
+          }
+          dash.updateSettings({
+            streaming: { buffer: { stableBufferTime: target / 2, bufferToKeep: keep } },
+          });
+        } catch {}
+      }
+    },
+    [],
+  );
+
+  const applyBackBufferPref = useCallback((b: BackBuffer) => {
+    const len = b === 0 ? Infinity : b;
+    const h = hlsRef.current;
+    if (h) {
+      try {
+        (h.config as unknown as { backBufferLength: number }).backBufferLength = len;
+      } catch {}
+    }
+    const dash = dashRef.current;
+    if (dash) {
+      try {
+        const keep = b === 0 ? 30 : b;
+        const cur = lastAppliedTargetRef.current ?? bufferTargetFor(lastBwEstimateRef.current || getPrefs().lastBps);
+        dash.updateSettings({
+          streaming: { buffer: { stableBufferTime: cur / 2, bufferToKeep: keep } },
+        });
+      } catch {}
+    }
+    checkHeapAndPruneInternal();
+  }, [checkHeapAndPruneInternal]);
+
+  const pushBwSample = useCallback(
+    (sample: BandwidthSample) => {
+      if (!sample || typeof sample.bytes !== "number" || typeof sample.ms !== "number") return;
+      if (!Number.isFinite(sample.bytes) || !Number.isFinite(sample.ms)) return;
+      if (sample.bytes <= 0 || sample.ms <= 0) return;
+      bwSamplesRef.current.push(sample);
+      if (bwSamplesRef.current.length > 12) bwSamplesRef.current.shift();
+      const bps = estimate(bwSamplesRef.current);
+      if (bps > 0) {
+        applyBufferTarget(bps);
+        persistLastBps(bps);
+      }
+      checkHeapAndPruneInternal();
+    },
+    [applyBufferTarget, persistLastBps, checkHeapAndPruneInternal],
+  );
+
+  const maybeMirrorFailoverInner = useCallback(
+    async (reason: string, httpCode?: number, loadMs?: number) => {
+      const now = Date.now();
+      if (now - lastFailoverAtRef.current < 8000) return;
+      if (failoverPendingRef.current) return;
+      const isSlow = typeof loadMs === "number" && loadMs > 1500;
+      const isBlocked = httpCode === 403 || httpCode === 504;
+      if (!isSlow && !isBlocked) return;
+      const releases = loadedRef.current?.streams.releases ?? [];
+      if (!releases.length) return;
+      const curKey = activeRef.current?.releaseKey;
+      let curLabel: string | null = null;
+      if (curKey) {
+        const rel = releases.find((r) => `${r.provider}:${r.filename}` === curKey);
+        curLabel = rel?.mirrors[0]?.label ?? null;
+      }
+      if (curLabel) excludedLabelsRef.current.add(curLabel);
+      lastFailoverAtRef.current = now;
+      failoverPendingRef.current = true;
+      const ticket = (() => {
+        try {
+          const src = currentSourceRef.current ?? "";
+          const m = src.match(/\/api\/proxy\/([0-9a-f]{16,40})\//i);
+          return m ? m[1] : null;
+        } catch { return null; }
+      })();
+      if (ticket) {
+        try {
+          await api.proxyRotate(ticket);
+        } catch {}
+      }
+      // client fallback via exclude param is backend-future; for now rotate + notice
+      failoverPendingRef.current = false;
+      flashNotice(isSlow ? "Slow connection" : "Source error — retrying");
+    },
+    [flashNotice],
+  );
+  const maybeMirrorFailover = maybeMirrorFailoverInner;
+  const authedRef = useRef(false);
   // ---- account session -------------------------------------------------
   // Mirrors the (async) session status so callbacks bound to a single render
   // (rAF loop, media events, unmount cleanup) always see the current auth
   // state. Flipping to anon mid-watch simply degrades to local-only writes.
-  const authedRef = useRef(false);
   // End-of-title cleanup, callable from the empty-deps rAF loop.
   const removeWatchRef = useRef<() => void>(() => undefined);
   // Server half of the progress bridge. The provider's record/remove are
@@ -279,6 +636,8 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     [provider, id, season, episode, loaded, label, absolutePosition, absoluteDuration],
   );
 
+  // refs to avoid TDZ with setupMediaSession (defined before seekBy/setRate)
+  const setRateRef = useRef<(r: number) => void>(() => undefined);
   // ---------------- media session (OS media keys + lock screen) ----------------
   const setupMediaSession = useCallback(() => {
     if (!("mediaSession" in navigator)) return;
@@ -295,6 +654,21 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       ms.setActionHandler("seekto", (d) => {
         if (d.seekTime != null) seekAbsoluteRef.current(d.seekTime);
       });
+      // OS speed control (lock screen / headset remote). The action name is
+      // not in every lib.dom's MediaSessionAction union yet, and browsers
+      // throw NotSupportedError for handlers they don't implement — hence
+      // the cast and the guard.
+      const setHandler = (ms as unknown as {
+        setActionHandler: (action: string, handler: ((details: unknown) => void) | null) => void;
+      }).setActionHandler.bind(ms);
+      try {
+        setHandler("playbackrate", (details) => {
+          const r = (details as { playbackRate?: number })?.playbackRate;
+          if (typeof r === "number" && Number.isFinite(r)) setRateRef.current(r);
+        });
+      } catch {
+        /* browser has no playback-rate control */
+      }
     } catch {
       /* unsupported */
     }
@@ -302,6 +676,22 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
 
   // ---------------- source loading ----------------
   const teardown = useCallback(() => {
+    if (ratePersistTimerRef.current != null) {
+      window.clearTimeout(ratePersistTimerRef.current);
+      ratePersistTimerRef.current = null;
+    }
+    if (bwTickRef.current != null) {
+      window.clearInterval(bwTickRef.current);
+      bwTickRef.current = null;
+    }
+    if (jassubActiveRef.current) {
+      jassubActiveRef.current = false;
+      jassubAssRef.current = null;
+      void destroyJassub().catch(() => undefined);
+    }
+    if (smartHandleRef.current) {
+      try { smartHandleRef.current.disable(); } catch {}
+    }
     // NB: the caption track is deliberately NOT torn down here — it is owned
     // by the user's subtitle selection and survives source switches (the same
     // video element keeps addTextTrack tracks across load()/src changes).
@@ -390,28 +780,435 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   }, [setTranscodeActive]);
 
   // ---------------- captions ----------------
-  /** Load the available subtitle options once per title (moviebox only). */
-  const loadSubtitleOptions = useCallback(async () => {
-    if (provider !== "moviebox") {
-      setSubOptions([]);
+  /** Helpers for format/overlay decisions */
+  const isAssFormat = (fmt?: string | null) => fmt === 'ass' || fmt === 'ssa';
+  const ttmlFormat = (fmt?: string | null) => fmt === 'ttml';
+  const needsOverlay = (
+    primaryFmt?: string | null,
+    secondaryFmt?: string | null,
+    dual?: boolean | null,
+    filter?: string | null
+  ) => {
+    if (dual) return true;
+    if (filter && filter !== 'all') return true;
+    if (isAssFormat(primaryFmt)) return true;
+    if (secondaryFmt && isAssFormat(secondaryFmt)) return true;
+    return false;
+  };
+  const parseByFormat = (text: string, fmt?: string | null): import("@/lib/captions").SubtitleCue[] => {
+    const lower = (fmt ?? '').toLowerCase();
+    if (lower === 'ass' || lower === 'ssa') {
+      const a = parseAssCues(text);
+      if (a.length) return a;
+      return parseSubtitleCues(text);
+    }
+    if (lower === 'ttml') {
+      const tt = parseTtmlCues(text);
+      if (tt.length) return tt;
+      return parseSubtitleCues(text);
+    }
+    // auto-sniff: ASS has [Script Info] / Dialogue:
+    if (text.includes('[Script Info]') && text.includes('Dialogue:')) {
+      const a = parseAssCues(text);
+      if (a.length) return a;
+    }
+    if (text.includes('<tt') && text.includes('<p')) {
+      const tt = parseTtmlCues(text);
+      if (tt.length) return tt;
+    }
+    return parseSubtitleCues(text);
+  };
+  // ---- P3 sub-parse worker (strings only; VTTCues not transferable) ----
+  const getSubParseWorker = useCallback((): Worker | null => {
+    if (typeof window === "undefined") return null;
+    if (subParseWorkerRef.current) return subParseWorkerRef.current;
+    try {
+      const w = new Worker(new URL("../workers/sub-parse.ts", import.meta.url));
+      w.onmessage = (e: MessageEvent<{ id: number; cues: SubtitleCue[] }>) => {
+        const cb = subParsePendingRef.current.get(e.data.id);
+        if (cb) {
+          subParsePendingRef.current.delete(e.data.id);
+          cb(e.data.cues);
+        }
+      };
+      w.onerror = () => {
+        for (const [, cb] of subParsePendingRef.current) {
+          try { cb([]); } catch {}
+        }
+        subParsePendingRef.current.clear();
+      };
+      subParseWorkerRef.current = w;
+      return w;
+    } catch {
+      return null;
+    }
+  }, []);
+  const parseViaWorker = useCallback((text: string, format?: string | null): Promise<SubtitleCue[]> => {
+    const lower = (format ?? "").toLowerCase();
+    const isHeavy = lower === "ass" || lower === "ssa" || lower === "ttml" || (text.includes("[Script Info]") && text.includes("Dialogue:")) || (text.includes("<tt") && text.includes("<p"));
+    if (!isHeavy) return Promise.resolve(parseByFormat(text, format));
+    const worker = getSubParseWorker();
+    if (!worker) return Promise.resolve(parseByFormat(text, format));
+    return new Promise<SubtitleCue[]>((resolve) => {
+      const id = (subParseReqIdRef.current = (subParseReqIdRef.current + 1) & 0x7fffffff);
+      const timeout = window.setTimeout(() => {
+        subParsePendingRef.current.delete(id);
+        try { resolve(parseByFormat(text, format)); } catch { resolve([]); }
+      }, 4000);
+      subParsePendingRef.current.set(id, (cues) => {
+        window.clearTimeout(timeout);
+        resolve(cues);
+      });
+      try {
+        worker.postMessage({ id, text, format });
+      } catch {
+        window.clearTimeout(timeout);
+        subParsePendingRef.current.delete(id);
+        try { resolve(parseByFormat(text, format)); } catch { resolve([]); }
+      }
+    });
+  }, [getSubParseWorker]);
+  // ---- P3 hover tooltip (timecode only) + fine-scrub window move ----
+  const handleSeekHoverMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (draggingRef.current) return;
+    const wrap = seekWrapRef.current;
+    const tip = scrubTooltipRef.current;
+    if (!wrap || !tip) return;
+    const dur = absoluteDuration();
+    if (!isSeekableDuration(dur)) {
+      tip.style.display = "none";
       return;
     }
-    try {
-      const subs = await api.captions(id);
-      setSubOptions(subs.subtitles);
-    } catch {
-      setSubOptions([]); // captions are optional
+    const rect = wrap.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const clampedX = Math.max(0, Math.min(rect.width, x));
+    if (!thumbLoadedRef.current && transcodeSessionRef.current) void loadThumbsForSession(transcodeSessionRef.current);
+    const tt = (clampedX / Math.max(rect.width, 1)) * dur;
+    const cues = thumbCuesRef.current;
+    const thumb = cues.length ? findThumb(cues, tt) : null;
+    const imgBox = scrubTooltipImgRef.current;
+    if (thumb && thumbBaseRef.current) {
+      const spriteUrl = `${thumbBaseRef.current}${thumb.sprite}`;
+      if (imgBox) {
+        imgBox.style.display = "block";
+        imgBox.style.width = "160px";
+        imgBox.style.height = "90px";
+        imgBox.style.backgroundImage = `url(${spriteUrl})`;
+        imgBox.style.backgroundPosition = `-${thumb.x}px -${thumb.y}px`;
+        imgBox.style.backgroundSize = "1600px 900px";
+        imgBox.style.backgroundRepeat = "no-repeat";
+      }
+      // keep time label as second line
+      const label = tip.querySelector("[data-thumb-time]") as HTMLElement | null;
+      if (label) label.textContent = formatClock(tt);
+      else tip.textContent = formatClock(tt);
+    } else {
+      if (imgBox) imgBox.style.display = "none";
+      tip.textContent = formatClock(tt);
     }
-  }, [provider, id]);
+    tip.style.display = "block";
+    const tipW = tip.offsetWidth || 48;
+    const left = Math.max(4, Math.min(rect.width - tipW - 4, clampedX - tipW / 2));
+    tip.style.left = `${left}px`;
+  }, [absoluteDuration]);
+  const handleSeekHoverLeave = useCallback(() => {
+    const tip = scrubTooltipRef.current;
+    if (tip) tip.style.display = "none";
+  }, []);
+  const loadThumbsForSession = useCallback(async (session: string) => {
+    if (thumbLoadedRef.current || !session) return;
+    try {
+      const info = await api.transcodeSprites(session);
+      const vttUrl = mbUrl(info.vtt_url);
+      thumbBaseRef.current = vttUrl.slice(0, vttUrl.lastIndexOf("/")+1);
+      const res = await fetch(vttUrl, { cache: "no-store" });
+      if (!res.ok) return;
+      const text = await res.text();
+      const cues = parseThumbsVtt(text);
+      if (cues.length) { thumbCuesRef.current = cues; thumbLoadedRef.current = true; }
+    } catch {}
+  }, []);
+  // window pointermove during dragging: fine-scrub sensitivity + preview; release via commitSeekFromRange
+  useEffect(() => {
+    const onWindowMove = (e: PointerEvent) => {
+      if (!draggingRef.current) return;
+      const wrap = seekWrapRef.current;
+      const startX = scrubStartXRef.current;
+      const startY = scrubStartYRef.current;
+      const grab = scrubGrabTimeRef.current;
+      if (!wrap || startX == null || startY == null || grab == null) return;
+      const rect = wrap.getBoundingClientRect();
+      const dur = transcodeActiveRef.current ? (totalDurationRef.current ?? manifestTotalRef.current ?? 0) : (videoRef.current?.duration ?? 0);
+      const durVal = Number.isFinite(dur) && dur > 0 ? dur : 0;
+      if (!isSeekableDuration(durVal)) return;
+      const w = Math.max(rect.width, 1);
+      const pxPerSec = w / durVal;
+      const dxPx = e.clientX - startX;
+      const dyPx = e.clientY - startY;
+      const { previewTime: delta, mode } = applyScrubSensitivity(dxPx, pxPerSec, dyPx);
+      const previewAbs = grab + delta;
+      const clamped = clampSeekTarget(previewAbs, durVal);
+      const v = clamped != null ? clamped : previewAbs;
+      const pct = seekProgressPct(v, durVal);
+      if (playedFillRef.current) playedFillRef.current.style.width = `${pct}%`;
+      if (timeRef.current) timeRef.current.textContent = timeModeRef.current === 'remaining' ? formatRemaining(v, durVal) : formatClock(v);
+      if (seekRef.current) {
+        seekRef.current.value = String(Math.floor(v));
+        seekRef.current.style.setProperty("--progress", `${pct}%`);
+      }
+      const tip = scrubTooltipRef.current;
+      if (tip) {
+        tip.textContent = formatClock(v);
+        tip.style.display = "block";
+        const tipW = tip.offsetWidth || 48;
+        const clampedX = Math.max(0, Math.min(w, e.clientX - rect.left));
+        const left = Math.max(4, Math.min(w - tipW - 4, clampedX - tipW / 2));
+        tip.style.left = `${left}px`;
+      }
+      if (scrubModeRef.current !== mode) {
+        scrubModeRef.current = mode;
+        if (mode === 'fine') flashNotice("Fine scrub 0.5×");
+        else if (mode === 'ultra') flashNotice("Fine scrub 0.1×");
+      }
+    };
+    window.addEventListener("pointermove", onWindowMove);
+    return () => window.removeEventListener("pointermove", onWindowMove);
+  }, [flashNotice]);
+  useEffect(() => {
+    return () => {
+      const w = subParseWorkerRef.current;
+      if (w) {
+        try { w.terminate(); } catch {}
+        subParseWorkerRef.current = null;
+      }
+      subParsePendingRef.current.clear();
+    };
+  }, []);
+  const clampOffset = (ms: number) => Math.max(-2000, Math.min(2000, Math.round(ms)));
+  const persistOffset = (field: 'subOffsetMs' | 'subOffsetMs2', ms: number) => {
+    try { setPrefs({ [field]: clampOffset(ms) } as Partial<import("@/lib/player-prefs").PlayerPrefs>); } catch {}
+  };
+  const syncPrimaryToNativeOrOverlay = (cues: import("@/lib/captions").SubtitleCue[], opt: SubtitleOption | null) => {
+    const video = videoRef.current;
+    if (!video || !opt) return;
+    const dualActive = dualSubsRef2.current && !!chosenSub2Ref.current;
+    const filterOn = (subFilterRef?.current ?? subFilter) !== 'all';
+    const need = needsOverlay(opt.format ?? null, (chosenSub2Ref.current?.format ?? null), dualActive, filterOn ? 'signs' : 'all');
+    if (need) {
+      // overlay path: clean native, expose via state
+      subTrackRef.current?.cleanup();
+      subTrackRef.current = null;
+      setPrimaryCuesSync(cues);
+      overlayNowRef.current = video.currentTime;
+      setOverlayNow(video.currentTime);
+    } else {
+      // native path: attach with offset (attach handles shift), clear overlay cues
+      setPrimaryCuesSync([]);
+      primaryCuesRef.current = cues;
+      subTrackRef.current?.cleanup();
+      const state = attachSubtitleTrack(video, opt.name, cues, { offsetMs: subOffsetMsRef.current, source: 'native' });
+      subTrackRef.current = state;
+      // apply CSS vars subset for native ::cue
+      const vars = styleToCssVars(subStyleRef.current);
+      try { Object.entries(vars).forEach(([k,v]) => { try{ video.style.setProperty(k, v);}catch{}; try{ document.documentElement.style.setProperty(k, v);}catch{}; }); } catch {}
+    }
+  };
+  const syncSecondaryToOverlay = (cues: import("@/lib/captions").SubtitleCue[], opt: SubtitleOption | null) => {
+    if (!opt) { setSecondaryCuesSync([]); dualTrackRef.current?.cleanup(); dualTrackRef.current=null; return; }
+    const video = videoRef.current;
+    // secondary always overlay when dual active
+    setSecondaryCuesSync(cues);
+    if (video) { overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime); }
+  };
+  /** Resolve health capability for this provider (cached). */
+  const ensureSubtitleCap = useCallback(async (): Promise<boolean> => {
+    if (healthFetchedRef.current && supportsSubsRef.current != null) return supportsSubsRef.current;
+    try {
+      const h = await api.health();
+      const cap = h.providers.find((pp) => pp.key === provider)?.capabilities.supports_subtitles;
+      const supports = cap ?? (provider === "moviebox" ? true : false);
+      setSupportsSubs(supports);
+      healthFetchedRef.current = true;
+      return supports;
+    } catch {
+      const fallback = provider === "moviebox";
+      setSupportsSubs(fallback);
+      healthFetchedRef.current = true;
+      return fallback;
+    }
+  }, [provider]);
+
+  /** Pick best auto-select candidate from available options per prefs. */
+  const pickAutoSubtitle = useCallback((options: SubtitleOption[]): SubtitleOption | null => {
+    if (!options.length) return null;
+    let prefLangs: string[] = ['en'];
+    let preferForced = true;
+    let preferSDH = false;
+    try {
+      const prefs = getPrefs();
+      prefLangs = (prefs.prefSubLang ?? ['en']).map((l) => l.toLowerCase());
+      preferForced = prefs.prefForced ?? true;
+      preferSDH = prefs.preferSDH ?? false;
+    } catch {
+      // use defaults above
+    }
+    const langOf = (opt: SubtitleOption) => (opt.language ?? opt.name ?? '').toLowerCase();
+    const nameOf = (opt: SubtitleOption) => (opt.name ?? '').toLowerCase();
+    for (const want of prefLangs) {
+      const candidates = options.filter((o) => {
+        const l = langOf(o);
+        return l === want || l.startsWith(want + '-') || l.startsWith(want + '_') || nameOf(o).includes(want);
+      });
+      if (!candidates.length) continue;
+      const forcedCandidates = candidates.filter((c) => !!c.forced === preferForced);
+      const pool = forcedCandidates.length ? forcedCandidates : candidates;
+      const sdhCandidates = pool.filter((c) => !!c.sdh === preferSDH);
+      const pool2 = sdhCandidates.length ? sdhCandidates : pool;
+      return pool2[0] ?? candidates[0];
+    }
+    const english = options.find((o) => {
+      const l = langOf(o);
+      return l === 'en' || l === 'eng' || l === 'english' || nameOf(o).includes('english');
+    });
+    if (english) return english;
+    if (preferForced) {
+      const forced = options.find((o) => !!o.forced);
+      if (forced) return forced;
+    }
+    return options[0] ?? null;
+  }, []);
+
+  const tryAutoSelect = useCallback((options: SubtitleOption[]) => {
+    if (chosenSubRef.current) return;
+    if (options.length === 0) return;
+    const best = pickAutoSubtitle(options);
+    if (!best) return;
+    chosenSubRef.current = best;
+    setChosenSub(best);
+    setTimeout(() => { void applyChosenCaptionsRef.current?.(best); }, 0);
+  }, [pickAutoSubtitle]);
+
+  const applyChosenCaptionsRef = useRef<((opt: SubtitleOption | null) => Promise<void>) | null>(null);
+  const applySecondRef = useRef<((opt: SubtitleOption | null) => Promise<void>) | null>(null);
+
+  /** Load the available subtitle options once per title, capability-driven. */
+  const loadSubtitleOptions = useCallback(async () => {
+    const supports = await ensureSubtitleCap();
+    if (!supports) {
+      setSubOptions([]);
+      setSupportsSubs(false);
+      return;
+    }
+    setSupportsSubs(true);
+    try {
+      const rel = (loadedRef.current?.streams.releases ?? []) as Release[];
+      const activeRel = activeRef.current ? rel.find((r) => `${r.provider}:${r.filename}` === activeRef.current?.releaseKey) ?? rel[0] : rel[0];
+      const rid = activeRel?.resource_id ?? null;
+      const subs = await api.captions(id, rid);
+      const tagged: SubtitleOption[] = subs.subtitles.map((o) => ({ ...o, source: 'api' as const }));
+      setSubOptions((prev) => {
+        const manifestPrev = prev.filter((p) => p.source === 'manifest');
+        if (!manifestPrev.length) {
+          setTimeout(() => tryAutoSelect(tagged), 0);
+          return tagged;
+        }
+        const merged: SubtitleOption[] = [...tagged];
+        const keyFor = (o: SubtitleOption) => `${o.url}::${(o.language ?? o.name ?? '').toLowerCase()}::${o.format ?? ''}::${o.forced?1:0}::${o.sdh?1:0}`;
+        const seen = new Set(tagged.map((tt) => keyFor(tt)));
+        for (const mm of manifestPrev) {
+          const key = keyFor(mm);
+          if (!seen.has(key)) {
+            merged.push(mm);
+            seen.add(key);
+          }
+        }
+        setTimeout(() => tryAutoSelect(merged), 0);
+        return merged;
+      });
+    } catch {
+      setSubOptions((prev) => {
+        const manifestOnly = prev.filter((p) => p.source === 'manifest');
+        return manifestOnly;
+      });
+    }
+  }, [provider, id, ensureSubtitleCap, tryAutoSelect]);
+
+  /** Merge manifest-discovered tracks into subOptions, deduped by (url, language). */
+  const mergeManifestTracks = useCallback((tracks: { language: string; url: string; kind: string; forced?: boolean; sdh?: boolean }[], baseDir: string | null) => {
+    if (!tracks.length) return;
+    const opts: SubtitleOption[] = tracks.map((tt) => {
+      let url = tt.url;
+      if (baseDir && !url.startsWith('http://') && !url.startsWith('https://') && !url.startsWith('/') && !url.startsWith('/api/')) {
+        url = baseDir + url;
+      }
+      const ext = url.split('?')[0].split('.').pop()?.toLowerCase() ?? '';
+      const fmt = (['srt','vtt','ass','ssa','ttml'].includes(ext) ? ext : undefined) as SubtitleOption['format'];
+      const isForced = tt.forced;
+      const isSdh = tt.sdh;
+      const name = tt.language ? `${tt.language}${isForced ? ' (forced)' : ''}${isSdh ? ' SDH' : ''}` : url;
+      return {
+        name,
+        url,
+        language: tt.language,
+        format: fmt,
+        forced: isForced,
+        sdh: isSdh,
+        source: 'manifest' as const,
+      };
+    });
+    setSubOptions((prev) => {
+      const k2 = (o: SubtitleOption) => `${o.url}::${(o.language ?? o.name ?? '').toLowerCase()}::${o.format ?? ''}::${o.forced?1:0}::${o.sdh?1:0}`;
+      const existingKeys = new Set(prev.map((p) => k2(p)));
+      const toAdd: SubtitleOption[] = [];
+      for (const o of opts) {
+        const k = k2(o);
+        if (!existingKeys.has(k)) {
+          existingKeys.add(k);
+          toAdd.push(o);
+        }
+      }
+      if (!toAdd.length) return prev;
+      const merged = [...prev, ...toAdd];
+      setTimeout(() => tryAutoSelect(merged), 0);
+      return merged;
+    });
+  }, [tryAutoSelect]);
 
   /** Fetch + parse one subtitle file through the header-injecting proxy. */
   const fetchSubtitleText = useCallback(async (opt: SubtitleOption): Promise<string | null> => {
+    if (opt.url.startsWith('/api/proxy/')) {
+      try {
+        const r = await fetch(opt.url, { cache: "no-store" });
+        if (!r.ok) return null;
+        return await r.text();
+      } catch { return null; }
+    }
+    if (opt.url.startsWith('blob:')) {
+      const local = localCuesRef.current;
+      if (local && local.url === opt.url) {
+        return null;
+      }
+      try {
+        const r = await fetch(opt.url);
+        if (!r.ok) return null;
+        return await r.text();
+      } catch { return null; }
+    }
+    let hdrs: [string, string][] = [];
+    try {
+      const rels = (loadedRef.current?.streams.releases ?? []) as Release[];
+      const curKey = activeRef.current?.releaseKey;
+      let rel: Release | undefined;
+      if (curKey) rel = rels.find((r) => `${r.provider}:${r.filename}` === curKey);
+      if (!rel) rel = rels[0];
+      if (rel?.mirrors?.[0]?.headers) hdrs = rel.mirrors[0].headers as [string, string][];
+    } catch {}
     let res: Response;
     try {
       res = await fetch(`/api/mb/proxy/ticket`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: opt.url, headers: [] }),
+        body: JSON.stringify({ url: opt.url, headers: hdrs }),
         cache: "no-store",
       });
     } catch {
@@ -425,10 +1222,10 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       return null;
     }
     if (typeof body !== "object" || body === null || !("ticket" in body)) return null;
-    const ticket = body.ticket;
-    if (typeof ticket !== "string" || !ticket) return null;
+    const ticketVal = (body as { ticket?: unknown }).ticket;
+    if (typeof ticketVal !== "string" || !ticketVal) return null;
     try {
-      const subRes = await fetch(`/api/proxy/${ticket}/`, { cache: "no-store" });
+      const subRes = await fetch(`/api/proxy/${ticketVal}/`, { cache: "no-store", priority: "low" } as unknown as RequestInit);
       if (!subRes.ok) return null;
       return await subRes.text();
     } catch {
@@ -436,43 +1233,345 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     }
   }, []);
 
+  /** Handle hidden file input side-load (ASS/TTML via worker strings). */
+  const handleSideLoadFile = useCallback(async (file: File) => {
+    try {
+      const text = await file.text();
+      const rawFmt = file.name.split('.').pop()?.toLowerCase() ?? '';
+      const cues = await parseViaWorker(text, rawFmt);
+      if (!cues.length) {
+        flashNotice("No cues found in file");
+        return;
+      }
+      const ext = rawFmt;
+      const fmt = (['srt','vtt','ass','ssa','ttml'].includes(ext) ? ext : undefined) as SubtitleOption['format'];
+      const blobUrl = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+      const opt: SubtitleOption = {
+        name: file.name,
+        url: blobUrl,
+        language: 'local',
+        format: fmt,
+        source: 'local',
+      };
+      localCuesRef.current = opt;
+      const video = videoRef.current;
+      if (!video) return;
+      flashNotice(`Loaded ${file.name}`);
+      const need = needsOverlay(fmt ?? null, (chosenSub2Ref.current?.format ?? null), dualSubsRef2.current, (subFilterRef.current ?? 'all') !== 'all' ? 'signs' : 'all');
+      if (need) {
+        subTrackRef.current?.cleanup(); subTrackRef.current=null;
+        setPrimaryCuesSync(cues);
+        primaryCuesRef.current=cues;
+      } else {
+        subTrackRef.current?.cleanup();
+        const state = attachSubtitleTrack(video, opt.name, cues, { offsetMs: subOffsetMsRef.current, source: 'native' });
+        subTrackRef.current = state;
+        setPrimaryCuesSync([]);
+        primaryCuesRef.current = cues;
+        const vars = styleToCssVars(subStyleRef.current);
+        try { Object.entries(vars).forEach(([k,v])=> { try{ video.style.setProperty(k,v);}catch{}; try{ document.documentElement.style.setProperty(k,v);}catch{}; }); } catch{}
+      }
+      setSubOptions((prev) => {
+        if (prev.some((p) => p.url === blobUrl)) return prev;
+        return [...prev, opt];
+      });
+      chosenSubRef.current = opt;
+      setChosenSub(opt);
+    } catch {
+      flashNotice("Failed to load subtitle file");
+    }
+  }, [flashNotice]);
+
   /** Cheap re-apply after source (re)starts — only when captions are on. */
   const reapplyCaptions = useCallback(() => {
     const video = videoRef.current;
-    if (!video || !chosenSubRef.current) return;
-    reattachSubtitleTrack(video, subTrackRef.current);
-    ensureActiveCues(video, subTrackRef.current);
+    const cur = chosenSubRef.current;
+    if (!video || !cur) return;
+    const cur2 = chosenSub2Ref.current;
+    const dualActive = dualSubsRef2.current && !!cur2;
+    const needPrimary = needsOverlay(cur.format ?? null, cur2?.format ?? null, dualActive, (subFilterRef.current ?? 'all') !== 'all' ? 'signs' : 'all');
+    if (cur.source === 'local' && subTrackRef.current) {
+      if (needPrimary) {
+        // local via overlay: cues already in state, just keep them
+      } else {
+        reattachSubtitleTrack(video, subTrackRef.current);
+        ensureActiveCues(video, subTrackRef.current);
+      }
+    } else if (needPrimary) {
+      // overlay already has cues — ensure clock will paint; native cleaned
+      if (subTrackRef.current) { subTrackRef.current.cleanup(); subTrackRef.current=null; }
+    } else {
+      reattachSubtitleTrack(video, subTrackRef.current);
+      ensureActiveCues(video, subTrackRef.current);
+      // reapply native vars
+            const vars = styleToCssVars(subStyleRef.current);
+            try { Object.entries(vars).forEach(([k,v])=> { try{ video.style.setProperty(k,v);}catch{}; try{ document.documentElement.style.setProperty(k,v);}catch{}; }); } catch {}
+    }
+    if (dualActive && cur2) {
+      // secondary always overlay when dual — nothing native to reattach unless we had native secondary (we don't)
+      // just ensure overlay clock tick
+      if (video) { overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime); }
+    }
   }, []);
 
   /** (Re)attach a chosen option, or clear the track when opt is null ("Off"). */
   const applyChosenCaptions = useCallback(
     async (opt: SubtitleOption | null) => {
       const video = videoRef.current;
-      subTrackRef.current?.cleanup();
-      subTrackRef.current = null;
-      if (!opt || !video) return;
+      if (!opt || !video) {
+        if (jassubActiveRef.current) {
+          jassubActiveRef.current = false;
+          jassubAssRef.current = null;
+          void destroyJassub().catch(() => undefined);
+        }
+        subTrackRef.current?.cleanup(); subTrackRef.current=null;
+        setPrimaryCuesSync([]);
+        primaryCuesRef.current=[];
+        return;
+      }
+      // Tear down any previous JASSUB before switching track
+      if (jassubActiveRef.current) {
+        jassubActiveRef.current = false;
+        jassubAssRef.current = null;
+        void destroyJassub().catch(() => undefined);
+        setPrimaryCuesSync([]);
+        primaryCuesRef.current=[];
+      }
+      if (opt.source === 'local' && localCuesRef.current?.url === opt.url) {
+        try {
+          const r = await fetch(opt.url);
+          if (!r.ok) return;
+          const txt = await r.text();
+          const cues = await parseViaWorker(txt, opt.format ?? null);
+          if (!cues.length) return;
+          if (chosenSubRef.current !== opt) return;
+          const dualActive = dualSubsRef2.current && !!chosenSub2Ref.current;
+          const need = needsOverlay(opt.format ?? null, chosenSub2Ref.current?.format ?? null, dualActive, (subFilterRef.current ?? 'all') !== 'all' ? 'signs' : 'all');
+          if (need) {
+            subTrackRef.current?.cleanup(); subTrackRef.current=null;
+            setPrimaryCuesSync(cues); primaryCuesRef.current=cues;
+            overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime);
+          } else {
+                  subTrackRef.current?.cleanup();
+            const state = attachSubtitleTrack(video, opt.name, cues, { offsetMs: subOffsetMsRef.current, source:'native'});
+            subTrackRef.current=state;
+            setPrimaryCuesSync([]); primaryCuesRef.current=cues;
+            const vars = styleToCssVars(subStyleRef.current);
+            try { Object.entries(vars).forEach(([k,v])=> { try{ video.style.setProperty(k,v);}catch{}; try{ document.documentElement.style.setProperty(k,v);}catch{}; }); } catch {}
+          }
+        } catch {}
+        return;
+      }
       const text = await fetchSubtitleText(opt);
       if (text == null) return;
-      const cues = parseSubtitleCues(text);
-      if (!cues.length) return;
-      if (chosenSubRef.current !== opt) return; // user switched during fetch
-      subTrackRef.current = attachSubtitleTrack(video, opt.name, cues);
+      if (chosenSubRef.current !== opt) return;
+      const fmtLower = (opt.format ?? "").toLowerCase();
+      const dualActive = dualSubsRef2.current && !!chosenSub2Ref.current;
+      const filterOn = (subFilterRef.current ?? 'all') !== 'all';
+      const isAss = fmtLower === 'ass' || fmtLower === 'ssa' || (text.includes('[Script Info]') && text.includes('Dialogue:'));
+      // ASS via JASSUB worker only when single track, no filter, no dual — lazy import
+      if (isAss && !filterOn && !dualActive) {
+        // lazy: dynamic import so bundle doesn't pay WASM cost until ASS chosen
+        try {
+          // keep parsed cues as fallback until worker ready; clear native
+          subTrackRef.current?.cleanup(); subTrackRef.current=null;
+          setPrimaryCuesSync([]);
+          primaryCuesRef.current=[];
+          // jassub worker — only for ASS (libass WASM handles typesetting, fonts)
+          const ok = await attachJassub(video, text);
+          if (ok) {
+            if (chosenSubRef.current !== opt) {
+              void destroyJassub().catch(() => undefined);
+              return;
+            }
+            jassubActiveRef.current = true;
+            jassubAssRef.current = text;
+            // also parse stripped cues for lookup/filter fallback if JASSUB destroyed
+            const cues = await parseViaWorker(text, opt.format ?? null);
+            if (cues.length) { setPrimaryCuesSync([]); primaryCuesRef.current = cues; }
+            return;
+          }
+        } catch {}
+        // JASSUB failed — fall through to stripped overlay
+      }
+      const cues = await parseViaWorker(text, opt.format ?? null);
+      if (!cues.length) { flashNotice("No cues in subtitle"); return; }
+      if (chosenSubRef.current !== opt) return;
+      const need = needsOverlay(opt.format ?? null, chosenSub2Ref.current?.format ?? null, dualActive, (subFilterRef.current ?? 'all') !== 'all' ? 'signs' : 'all');
+      if (need) {
+        subTrackRef.current?.cleanup(); subTrackRef.current=null;
+        setPrimaryCuesSync(cues); primaryCuesRef.current=cues;
+        if (video) { overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime); }
+      } else {
+        subTrackRef.current?.cleanup();
+        const state = attachSubtitleTrack(video, opt.name, cues, { offsetMs: subOffsetMsRef.current, source:'native'});
+        subTrackRef.current=state;
+        setPrimaryCuesSync([]); primaryCuesRef.current=cues;
+        const vars = styleToCssVars(subStyleRef.current);
+        try { const el = containerRef.current ?? video; Object.entries(vars).forEach(([k,v])=> el.style.setProperty(k,v)); } catch{}
+      }
     },
     [fetchSubtitleText],
   );
 
+  const applySecondCaptions = useCallback(async (opt: SubtitleOption | null) => {
+    const video = videoRef.current;
+    if (!opt || !video) {
+      setSecondaryCuesSync([]); secondaryCuesRef.current=[]; dualTrackRef.current?.cleanup(); dualTrackRef.current=null; return;
+    }
+    if (opt.source === 'local' && localCuesRef.current?.url === opt.url) {
+      try {
+        const r = await fetch(opt.url); if(!r.ok) return; const txt=await r.text();
+        const cues = await parseViaWorker(txt, opt.format ?? null);
+        if(chosenSub2Ref.current!==opt) return;
+        setSecondaryCuesSync(cues); secondaryCuesRef.current=cues; overlayNowRef.current=video.currentTime; setOverlayNow(video.currentTime);
+      } catch{}
+      return;
+    }
+    const text = await fetchSubtitleText(opt);
+    if(text==null) return;
+    const cues = await parseViaWorker(text, opt.format ?? null);
+    if(!cues.length){ flashNotice("No cues in subtitle"); return; }
+    if(chosenSub2Ref.current!==opt) return;
+    setSecondaryCuesSync(cues); secondaryCuesRef.current=cues;
+    if(video){ overlayNowRef.current=video.currentTime; setOverlayNow(video.currentTime); }
+  }, [fetchSubtitleText]);
+  useEffect(() => { applySecondRef.current = applySecondCaptions; }, [applySecondCaptions]);
+
   /** User picked an option (or Off) in the CC panel. */
   const chooseSubtitle = useCallback(
     (opt: SubtitleOption | null) => {
+      if (opt) lastChosenSubRef.current = opt;
+      if (!opt) {
+        if (jassubActiveRef.current) {
+          jassubActiveRef.current = false; jassubAssRef.current = null;
+          void destroyJassub().catch(() => undefined);
+        }
+        subTrackRef.current?.cleanup(); subTrackRef.current = null;
+        setPrimaryCuesSync([]); primaryCuesRef.current=[];
+        setLookup(null);
+        // if dual was active, demote? keep secondary but it will become hidden until new primary chosen — keep for now
+      } else {
+        if (jassubActiveRef.current) {
+          jassubActiveRef.current = false; jassubAssRef.current = null;
+          void destroyJassub().catch(() => undefined);
+        }
+        setLookup(null);
+      }
       chosenSubRef.current = opt;
       setChosenSub(opt);
       setSubsOpen(false);
+      // When dual is on, we must re-evaluate both tracks for overlay needs
+      if (!opt) {
+        // off primary — keep secondary paused visually? clear secondary overlay too per spec: dual only when both chosen
+        // leave secondary cues but overlay condition will hide them (needs both)
+      } else {
+        // trigger sync for second track if dual active (it was overlay; ensure it stays)
+        if (dualSubsRef2.current && chosenSub2Ref.current) {
+          // force secondary back through overlay path (it already is)
+        }
+      }
       void applyChosenCaptions(opt);
+      // If we toggled between native/overlay, re-sync secondary rendering mode
+      if (dualSubsRef2.current && chosenSub2Ref.current) {
+        // re-apply second through overlay to keep both via same renderer
+        void applySecondRef.current?.(chosenSub2Ref.current);
+      }
     },
     [applyChosenCaptions],
   );
+  const chooseSecondSubtitle = useCallback((opt: SubtitleOption | null) => {
+    if (opt && opt.url === chosenSubRef.current?.url) {
+      flashNotice("Secondary must differ from primary");
+      return;
+    }
+    chosenSub2Ref.current = opt;
+    dualSubRef.current = opt;
+    setChosenSub2(opt);
+    // dual toggle persists via pref when user explicitly picks second; keep dual enabled
+    if (opt) {
+      if (!dualSubsRef2.current) {
+        dualSubsRef2.current = true; setDualSubsState(true); try{ setPrefs({ dualSubs:true}); }catch{}
+      }
+      // migrate primary to overlay if it was native
+      const primaryOpt = chosenSubRef.current;
+      if (primaryOpt && primaryCuesRef.current.length && subTrackRef.current && subTrackRef.current.track) {
+        // primary was native -> convert to overlay
+        const cues = [...primaryCuesRef.current];
+        subTrackRef.current.cleanup(); subTrackRef.current=null;
+        setPrimaryCuesSync(cues);
+        const video = videoRef.current; if(video){ overlayNowRef.current=video.currentTime; setOverlayNow(video.currentTime); }
+      } else if (primaryOpt && primaryCuesRef.current.length===0 && subTrackRef.current) {
+        // primary was native but cues held in trackState.cues
+        const cues = [...(subTrackRef.current.cues ?? [])];
+        subTrackRef.current.cleanup(); subTrackRef.current=null;
+        setPrimaryCuesSync(cues); primaryCuesRef.current=cues;
+        const video=videoRef.current; if(video){ overlayNowRef.current=video.currentTime; setOverlayNow(video.currentTime);}
+      } else if (primaryOpt && !primaryCuesRef.current.length && primaryCues.length===0 && (subTrackRef.current==null)) {
+        // no primary cues stored yet (maybe still loading) — let applyChosenCaptions handle next time
+      }
+    }
+    void applySecondCaptions(opt);
+    // when turning second off, if we drop to single and format allows native, convert back
+    if (!opt) {
+      const primaryOpt = chosenSubRef.current;
+      if (primaryOpt && primaryCuesRef.current.length) {
+        // if primary not ASS and filter all, move back to native for a11y
+        const need = needsOverlay(primaryOpt.format ?? null, null, false, (subFilterRef.current ?? 'all') !== 'all' ? 'signs' : 'all');
+        if (!need) {
+          const video=videoRef.current; if(video){
+            const cues=[...primaryCuesRef.current];
+            setPrimaryCuesSync([]); primaryCuesRef.current=cues;
+            const state = attachSubtitleTrack(video, primaryOpt.name, cues,{offsetMs: subOffsetMsRef.current, source:'native'});
+            subTrackRef.current=state;
+            const vars=styleToCssVars(subStyleRef.current);
+            try{ Object.entries(vars).forEach(([k,v])=> { try{ video.style.setProperty(k,v);}catch{}; try{ document.documentElement.style.setProperty(k,v);}catch{}; }); }catch{}
+          }
+        }
+      }
+    }
+  }, [applySecondCaptions, flashNotice]);
+  const toggleDual = useCallback((next: boolean) => {
+    dualSubsRef2.current = next;
+    setDualSubsState(next);
+    try{ setPrefs({ dualSubs: next }); }catch{}
+    const video=videoRef.current;
+    const primaryOpt=chosenSubRef.current;
+    const secOpt=chosenSub2Ref.current;
+    if (next) {
+      // enabling dual: ensure primary now via overlay, and if no secondary yet pick nothing (user must pick)
+      if (primaryOpt) {
+        let cues: import("@/lib/captions").SubtitleCue[] = [];
+        if (primaryCuesRef.current.length) cues=[...primaryCuesRef.current];
+        else if (subTrackRef.current?.cues) cues=[...subTrackRef.current.cues];
+        else if (primaryCues.length) cues=[...primaryCues];
+        if (cues.length) {
+          subTrackRef.current?.cleanup(); subTrackRef.current=null;
+          setPrimaryCuesSync(cues); primaryCuesRef.current=cues;
+          if(video){ overlayNowRef.current=video.currentTime; setOverlayNow(video.currentTime); }
+        }
+      }
+      // if we have a secondary but it was cleared earlier, re-apply it
+      if (secOpt) void applySecondRef.current?.(secOpt);
+    } else {
+      // disabling dual: secondary hidden, primary may go back to native
+      setSecondaryCuesSync([]); // keeps secondary choice for re-enable but hides overlay
+      // keep chosenSub2 value but don't show; spec: dualOff hides second slot, choice persists
+      if (primaryOpt) {
+        const cues = primaryCuesRef.current.length ? [...primaryCuesRef.current] : (primaryCues.length ? [...primaryCues] : []);
+        const need = needsOverlay(primaryOpt.format ?? null, null, false, (subFilterRef.current ?? 'all') !== 'all' ? 'signs' : 'all');
+        if (!need && cues.length && video) {
+          setPrimaryCuesSync([]); primaryCuesRef.current=cues;
+          const state = attachSubtitleTrack(video, primaryOpt.name, cues,{offsetMs: subOffsetMsRef.current, source:'native'});
+          subTrackRef.current=state;
+          const vars=styleToCssVars(subStyleRef.current);
+          try{ Object.entries(vars).forEach(([k,v])=> { try{ video.style.setProperty(k,v);}catch{}; try{ document.documentElement.style.setProperty(k,v);}catch{}; }); }catch{}
+        }
+      }
+    }
+    pokeControls();
+  }, [primaryCues]);
 
-  // ---------------- HEVC fallback: live server-side transcode ----------------
   const ticketFromUrl = useCallback((sourceUrl: string): string | null => {
     const m = sourceUrl.match(/\/api\/proxy\/([0-9a-f]{16,40})\//i);
     return m ? m[1] : null;
@@ -557,6 +1656,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       transcodeIndexUrlRef.current = indexUrl;
       const startPlayback = () => {
         if (sourceEpochRef.current !== epoch || hlsRef.current == null) return;
+        restorePlaybackRate();
         reapplyCaptions();
         window.setTimeout(() => {
           reapplyCaptions();
@@ -572,9 +1672,44 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       // inactive, so gating here strands them on the spinner forever.
       if (sourceEpochRef.current !== epoch) return;
       if (Hls.isSupported()) {
-        const hls = new Hls({ maxBufferLength: 40, backBufferLength: Infinity });
+        let seedBps = 2_000_000;
+        let bb: BackBuffer = 30;
+        try {
+          const p = getPrefs();
+          if (Number.isFinite(p.lastBps) && p.lastBps > 0) seedBps = p.lastBps;
+          bb = p.backBuffer as BackBuffer;
+        } catch {}
+        const initTarget = bufferTargetFor(seedBps);
+        const backLen = bb === 0 ? Infinity : bb;
+        const hls = new Hls({
+          maxBufferLength: initTarget,
+          backBufferLength: backLen,
+          abrEwmaDefaultEstimate: seedBps,
+          startLevel: 0,
+          capLevelToPlayerSize: true,
+          startFragPrefetch: true,
+        });
         hlsRef.current = hls;
-        hls.on(Hls.Events.ERROR, (_event: unknown, data: { fatal: boolean; type: string }) => {
+        // seed estimator state
+        lastBwEstimateRef.current = seedBps;
+        lastAppliedTargetRef.current = initTarget;
+        lastTargetChangeAtRef.current = Date.now();
+        bwSamplesRef.current = [];
+        // HLS 1s tick (hysteresis inside applyBufferTarget)
+        try {
+          if (bwTickRef.current != null) window.clearInterval(bwTickRef.current);
+          bwTickRef.current = window.setInterval(() => {
+            if (lastBwEstimateRef.current > 0) applyBufferTarget(lastBwEstimateRef.current);
+            checkHeapAndPruneInternal();
+          }, 1000);
+        } catch {}
+        hls.on(Hls.Events.ERROR, (_event: unknown, data: { fatal: boolean; type: string; details?: string; networkDetails?: { status?: number } | null; response?: { code?: number } }) => {
+          // mirror failover on 403/504 even when not yet fatal (e.g. frag load error retrying)
+          try {
+            const code = (data as unknown as { networkDetails?: { status?: number } })?.networkDetails?.status
+              ?? (data as unknown as { response?: { code?: number } })?.response?.code;
+            if (code === 403 || code === 504) void maybeMirrorFailover("frag error", code);
+          } catch {}
           if (!data.fatal) {
             // hls.js fires non-fatal BUFFER_STALLED_ERROR while it fills the
             // buffer after a seek jump; the engine recovers on its own.
@@ -588,13 +1723,31 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           setError("This title isn't available right now. Try again or pick another source.");
           setState("error");
         });
+        hls.on(Hls.Events.FRAG_LOADED, (_event: string, data: unknown) => {
+          try {
+            const d = data as { frag?: { stats?: { loaded?: number; loading?: { start?: number; end?: number } }; type?: string } };
+            const stats = d?.frag?.stats;
+            const loaded = typeof stats?.loaded === "number" ? stats.loaded : 0;
+            const s = stats?.loading?.start;
+            const e = stats?.loading?.end;
+            if (Number.isFinite(loaded) && loaded > 0 && Number.isFinite(s) && Number.isFinite(e) && (e as number) > (s as number)) {
+              const ms = (e as number) - (s as number);
+              if (ms > 0 && ms < 120_000) {
+                pushBwSample({ bytes: loaded, ms });
+                if (ms > 1500) void maybeMirrorFailover("slow frag", undefined, ms);
+              }
+            }
+          } catch {}
+        });
+        // fetch priority not applicable via xhrSetup for segments (engine XHR); manifests high priority via our own fetches
         hls.on(Hls.Events.MANIFEST_PARSED, startPlayback);
         hls.on(Hls.Events.LEVEL_UPDATED, () => {
           ensureActiveCues(video, subTrackRef.current);
+          // re-apply buffer target on ABR level change (hysteresis inside)
+          if (lastBwEstimateRef.current > 0) applyBufferTarget(lastBwEstimateRef.current);
         });
         hls.loadSource(indexUrl);
         hls.attachMedia(video);
-      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
         const onMeta = () => {
           reapplyCaptions();
           video.removeEventListener("loadedmetadata", onMeta);
@@ -630,6 +1783,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         // torn down or switched to another source while waiting?
         if (!transcodeActiveRef.current || transcodeSessionRef.current !== started.session) return;
         transcodeIndexUrlRef.current = indexUrl;
+        void loadThumbsForSession(started.session);
         playHls(indexUrl);
       } catch (e) {
         setTranscodeActive(false);
@@ -727,7 +1881,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         // their HEVC representations stripped client-side.
         let manifestText: string | null = null;
         try {
-          const res = await fetch(source, { cache: "no-store" });
+          const res = await fetch(source, { cache: "no-store", priority: "high" } as unknown as RequestInit);
           if (res.ok) manifestText = await res.text();
         } catch {
           console.warn("[playback] manifest sniff fetch failed; playing original URL with watchdog cover");
@@ -765,12 +1919,19 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
             blobUrlRef.current = URL.createObjectURL(blob);
             dashSource = blobUrlRef.current;
           }
+          // Manifest subtitle extraction for DASH (soft subs): merge into subOptions.
+          if (manifestText !== null) {
+            const subs = sniffSubtitles(manifestText, false);
+            if (subs.length) {
+              const baseDir = source.slice(0, source.lastIndexOf("/") + 1);
+              mergeManifestTracks(subs, baseDir);
+            }
+          }
         }
 
         // Exception: static import crashes SSR; load only when needed in browser
         const dashModuleEpoch = sourceEpochRef.current;
         const dashjs = (await import("dashjs")).default;
-        // A teardown while the import was in flight → don't create an engine
         // at all (it would bind the reused video element as a zombie).
         if (sourceEpochRef.current !== dashModuleEpoch) return;
         const dash = dashjs.MediaPlayer().create();
@@ -782,17 +1943,62 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         // Next's dev overlay relays every console.error as "[browser]".
         // Suppress internal error logging; fatal manifest/init failures
         // still surface through our own ERROR/PLAYBACK_ERROR handlers.
+        let dashSeedBps = 2_000_000;
+        let dashBB: BackBuffer = 30;
         try {
-          // LOG_LEVEL_FATAL = 1: only fatal internal logs; the enum isn't
-          // exported in the typings, so the literal stands in for it.
-          dash.updateSettings({ debug: { logLevel: 1 } });
+          const p = getPrefs();
+          if (Number.isFinite(p.lastBps) && p.lastBps > 0) dashSeedBps = p.lastBps;
+          dashBB = p.backBuffer as BackBuffer;
+        } catch {}
+        const dashInitTarget = bufferTargetFor(dashSeedBps);
+        lastBwEstimateRef.current = dashSeedBps;
+        lastAppliedTargetRef.current = dashInitTarget;
+        lastTargetChangeAtRef.current = Date.now();
+        bwSamplesRef.current = [];
+        const dashKeep = dashBB === 0 ? 30 : dashBB;
+        try {
+          dash.updateSettings({
+            debug: { logLevel: 1 },
+            streaming: {
+              buffer: { stableBufferTime: dashInitTarget / 2, bufferToKeep: dashKeep },
+              abr: { initialBitrate: { video: 400 } as unknown as Record<string, number>, autoSwitchBitrate: { video: true } as unknown as Record<string, boolean> },
+            },
+          } as unknown as Parameters<typeof dash.updateSettings>[0]);
         } catch {
-          /* older dash.js without updateSettings — leave logging as-is */
+          try { dash.updateSettings({ debug: { logLevel: 1 } }); } catch {}
         }
+        try {
+          dash.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, (e: unknown) => {
+            try {
+              const ev = e as { request?: { bytesLoaded?: number; bytesTotal?: number; requestStartDate?: Date; requestEndDate?: Date | null; mediaType?: string }; response?: ArrayBuffer };
+              if (ev?.request?.mediaType && ev.request.mediaType !== "video" && ev.request.mediaType !== "audio") return;
+              const bytes = typeof ev?.request?.bytesLoaded === "number" && ev.request.bytesLoaded > 0 ? ev.request.bytesLoaded : (ev?.response ? (ev.response as ArrayBuffer).byteLength : 0);
+              const s = ev?.request?.requestStartDate ? new Date(ev.request.requestStartDate).getTime() : NaN;
+              const en = ev?.request?.requestEndDate ? new Date(ev.request.requestEndDate as unknown as Date).getTime() : NaN;
+              const ms = Number.isFinite(s) && Number.isFinite(en) ? en - s : NaN;
+              if (bytes > 0 && Number.isFinite(ms) && ms > 0 && ms < 120_000) {
+                pushBwSample({ bytes, ms });
+                if (ms > 1500) void maybeMirrorFailover("slow frag", undefined, ms);
+              }
+            } catch {}
+          });
+        } catch {}
+        // 1s hysteresis tick for DASH (LEVEL_UPDATED is HLS-only)
+        try {
+          if (bwTickRef.current != null) window.clearInterval(bwTickRef.current);
+          bwTickRef.current = window.setInterval(() => {
+            if (lastBwEstimateRef.current > 0) applyBufferTarget(lastBwEstimateRef.current);
+            checkHeapAndPruneInternal();
+          }, 1000);
+        } catch {}
         const fatal = (code: number | undefined) =>
           code != null && (code === 27 || code === 34 || code === 2 || code === 11);
         dash.on(dashjs.MediaPlayer.events.ERROR, (data: unknown) => {
           if (dashRef.current !== dash) return; // superseded engine — ignore
+          try {
+            const err = (data as { error?: { code?: number; message?: string } })?.error;
+            if (err?.code === 403 || err?.code === 504) void maybeMirrorFailover("dash error", err.code);
+          } catch {}
           const err = (data as { error?: { code?: number; message?: string } })?.error;
           if (err && (fatal(err.code) || /manifest|initialization/i.test(err.message ?? ""))) {
             setError("This title isn't available right now. Try again or pick another source.");
@@ -808,6 +2014,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           if (sourceEpochRef.current !== dashModuleEpoch) return;
           dash.initialize(video, dashSource, true);
           dash.setAutoPlay(false);
+          restorePlaybackRate();
           void video.play().catch(() => undefined);
         } catch (e) {
           console.warn("[playback] DASH initialization failed:", e instanceof Error ? e.message : e);
@@ -825,7 +2032,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           const hlsSniffEpoch = sourceEpochRef.current;
           let hlsText: string | null = null;
           try {
-            const res = await fetch(source, { cache: "no-store" });
+            const res = await fetch(source, { cache: "no-store", priority: "high" } as unknown as RequestInit);
             if (res.ok) hlsText = await res.text();
           } catch {
             /* playlist unreadable — play with watchdog cover */
@@ -835,6 +2042,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           if (hlsText !== null) {
             const sniff = sniffHls(hlsText);
             hevcOnlyRef.current = sniff.videoCodecs.length ? sniff.hevcOnly : null;
+            // Extract subtitles from HLS manifest (EXT-X-MEDIA TYPE=SUBTITLES) before potential transcode.
+            const hlsSubs = sniffSubtitles(hlsText, true);
+            if (hlsSubs.length) {
+              const baseDir = source.slice(0, source.lastIndexOf("/") + 1);
+              mergeManifestTracks(hlsSubs, baseDir);
+            }
             // Only the MSE path (hls.js) needs this gate: native HLS leaves
             // decode to the element, which errors instead of going black.
             const mseHls = typeof window !== "undefined" && window.MediaSource != null;
@@ -848,6 +2061,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         } else {
           video.src = source;
           video.load();
+          restorePlaybackRate();
           void video.play().catch(() => undefined);
         }
       }
@@ -898,6 +2112,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
               : [],
           dubs: [],
           anime: null,
+          animeIds: /^\d+$/.test(id) ? { anilistId: Number(id), malId: null } : null,
         };
       }
       setLoaded({ streams, details });
@@ -939,6 +2154,57 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [boot]);
 
+  // ---------------- skip markers (B2) ----------------
+  const skipFetchedKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!loaded) return;
+    const det = loaded.details as unknown as { animeIds?: { anilistId?: number | null; malId?: number | null } | null };
+    const anilistId = det.animeIds?.anilistId ?? null;
+    const malId = det.animeIds?.malId ?? null;
+    const key = `${provider}:${id}:${season}:${episode}:${anilistId ?? "-"}:${malId ?? "-"}`;
+    if (skipFetchedKeyRef.current === key) return;
+    skipFetchedKeyRef.current = key;
+    let cancelled = false;
+    void api
+      .skipMarkers({ provider, id, season, episode, anilistId: anilistId as number | null, malId: malId as number | null })
+      .then((res) => {
+        if (cancelled) return;
+        const markers = (res as unknown as { markers?: { start: number; end: number; kind: string; label: string }[] }).markers;
+        if (!markers || markers.length === 0) return;
+        const mapped: (import("@/lib/types").Chapter)[] = markers
+          .map((m) => {
+            const k = (m.kind || "").toLowerCase();
+            let kind: import("@/lib/types").Chapter["kind"];
+            if (k === "op" || k === "intro") kind = "intro";
+            else if (k === "ed" || k === "outro") kind = "outro";
+            else if (k === "preview") kind = "preview";
+            else if (k === "credits") kind = "credits";
+            else kind = "intro";
+            return {
+              start: Number(m.start),
+              end: Number(m.end),
+              kind,
+              label: String(m.label || (kind === "intro" ? "Opening" : kind === "outro" ? "Ending" : kind)),
+            };
+          })
+          .filter((c) => Number.isFinite(c.start) && Number.isFinite(c.end) && c.end > c.start && c.start >= 0);
+        if (!mapped.length) return;
+        setLoaded((prev) => {
+          if (!prev) return prev;
+          const existing = (prev.streams as unknown as { chapters?: import("@/lib/types").Chapter[] }).chapters ?? [];
+          const seen = new Set(existing.map((c) => `${c.start}:${c.end}:${c.kind}`));
+          const toAdd = mapped.filter((c) => !seen.has(`${c.start}:${c.end}:${c.kind}`));
+          if (!toAdd.length) return prev;
+          const merged = [...existing, ...toAdd].sort((a, b) => a.start - b.start);
+          return { ...prev, streams: { ...prev.streams, chapters: merged } as typeof prev.streams };
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [loaded, provider, id, season, episode]);
+
   const saveNowRef = useRef(saveNow);
   saveNowRef.current = saveNow;
 
@@ -978,8 +2244,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       entry &&
       entry.updated < Date.now() - 120_000 &&
       entry.position > 25 &&
-      entry.duration > 0 &&
-      entry.position / entry.duration < 0.98
+      !isComplete(entry.position, entry.duration)
     ) {
       resumePromptedRef.current = true;
       setResumeAsk({ position: entry.position });
@@ -1039,15 +2304,428 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     };
   }, [pokeControls, state]);
 
+  // Quick CC toggle (one-tap ON/OFF) — keeps last choice for restore (defined after pokeControls to avoid TDZ)
+  const toggleCcQuick = useCallback(() => {
+    if (chosenSub) {
+      lastChosenSubRef.current = chosenSub;
+      chooseSubtitle(null);
+    } else {
+      const fallback = lastChosenSubRef.current ?? (subOptions[0] ?? null);
+      if (fallback) chooseSubtitle(fallback);
+      else flashNotice("No subtitles available");
+    }
+    pokeControls();
+  }, [chosenSub, subOptions, chooseSubtitle, flashNotice, pokeControls]);
+
+  // ---------------- prefs hydration ----------------
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const prefs = getPrefs();
+    setMuted(prefs.muted);
+    setVolume(prefs.volume);
+    volumeRef.current = prefs.volume;
+    setVolumeBoost(prefs.volumeBoost);
+    volumeBoostRef.current = prefs.volumeBoost;
+    setNormalizeOn(prefs.normalize);
+    normalizeGainRef.current = prefs.normalize;
+    setAspectModeState(prefs.aspectMode);
+    setFilterMode(prefs.filter);
+    setNightDimState(prefs.nightDim);
+    setBrightnessState(prefs.brightness);
+    brightnessRef.current = prefs.brightness;
+    setStatsOpen(prefs.statsOpen);
+    // P2 sub prefs hydration
+    setDualSubsState(prefs.dualSubs);
+    dualSubRef.current = prefs.dualSubs ? dualSubRef.current : null; // keep ref consistent on hydration
+    chosenSub2Ref.current = prefs.dualSubs ? chosenSub2Ref.current : null;
+    setSubOffsetMs(prefs.subOffsetMs);
+    setSubOffsetMs2(prefs.subOffsetMs2);
+    subOffsetMsRef.current = prefs.subOffsetMs;
+    subOffsetMs2Ref.current = prefs.subOffsetMs2;
+    const coerced = coerceSubStyle(prefs.subStyle);
+    setSubStyleState(coerced);
+    subStyleRef.current = coerced;
+    setSubFilterState(prefs.subFilter);
+    const v = videoRef.current;
+    if (v) {
+      try { v.volume = prefs.volume; } catch {}
+      try { v.muted = prefs.muted; } catch {}
+    }
+  }, []);
+
+  // backBuffer live follow (device-local pref) + lastBps seed already wired via engine init
+  useEffect(() => {
+    const unsub = subscribePrefs((next) => {
+      try {
+        const bb = next.backBuffer as BackBuffer;
+        if (bb === 15 || bb === 30 || bb === 60 || bb === 0) {
+          const curHls = hlsRef.current;
+          const curDash = dashRef.current;
+          if (curHls || curDash) applyBackBufferPref(bb);
+        }
+      } catch {}
+    });
+    return () => { try { unsub(); } catch {} };
+  }, [applyBackBufferPref]);
+  // apply aspectMode -> video.style.objectFit + persist
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    try { video.style.objectFit = aspectModeState as string; } catch {}
+  }, [aspectModeState]);
+  const applyAspect = useCallback((mode: AspectMode) => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
+    setAspectModeState(mode);
+    try { setPrefs({ aspectMode: mode }); } catch {}
+    const video = videoRef.current;
+    if (video) try { video.style.objectFit = mode as string; } catch {}
+    pokeControls();
+  }, [pokeControls]);
+
+  const toggleSubFilter = useCallback((next: 'all'|'signs') => {
+    setSubFilterState(next);
+    subFilterRef.current = next;
+    try { setPrefs({ subFilter: next }); } catch {}
+    // when filter toggles, migrate primary between native/overlay as needed
+    const cur = chosenSubRef.current;
+    if (!cur) { pokeControls(); return; }
+    const dualActive = dualSubsRef2.current && !!chosenSub2Ref.current;
+    const need = needsOverlay(cur.format ?? null, chosenSub2Ref.current?.format ?? null, dualActive, next !== 'all' ? 'signs' : 'all');
+    // if ASS with jassub and we switch to signs filter, tear down jassub so overlay filter can run
+    if (jassubActiveRef.current && need) {
+      jassubActiveRef.current = false;
+      jassubAssRef.current = null;
+      void destroyJassub().catch(() => undefined);
+      // re-attach via stripped cues through applyChosen path
+      if (primaryCuesRef.current.length) {
+        setPrimaryCuesSync([...primaryCuesRef.current]);
+        const video = videoRef.current;
+        if (video) { overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime); }
+      } else if (subTrackRef.current?.cues) {
+        setPrimaryCuesSync([...subTrackRef.current.cues]);
+        primaryCuesRef.current = [...subTrackRef.current.cues];
+        subTrackRef.current.cleanup(); subTrackRef.current = null;
+        const video = videoRef.current;
+        if (video) { overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime); }
+      }
+      pokeControls();
+      return;
+    }
+    // If filter back to all and primary is ASS, re-trigger JASSUB next selection
+    if (!need && cur.format && isAssFormat(cur.format) && !jassubActiveRef.current) {
+      void applyChosenCaptionsRef.current?.(cur);
+    } else if (need && !jassubActiveRef.current) {
+      // native -> overlay migration when filter turns on
+      const video = videoRef.current;
+      if (cur && primaryCuesRef.current.length === 0 && subTrackRef.current?.cues && video) {
+        const cues = [...subTrackRef.current.cues];
+        subTrackRef.current.cleanup(); subTrackRef.current = null;
+        setPrimaryCuesSync(cues); primaryCuesRef.current = cues;
+        overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime);
+      } else if (cur && primaryCuesRef.current.length && subTrackRef.current?.track) {
+        const cues = [...primaryCuesRef.current];
+        subTrackRef.current.cleanup(); subTrackRef.current = null;
+        setPrimaryCuesSync(cues);
+        const video = videoRef.current;
+        if (video) { overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime); }
+      }
+    }
+    pokeControls();
+  }, [pokeControls, primaryCues]);
+
+  const handleWordClick = useCallback((word: string, cueText: string) => {
+    const video = videoRef.current;
+    try { video?.pause(); } catch {}
+    setLookup({ word: word.replace(/^[.,!?:;'"`(\[]+|[.,!?:;'"`)\]]+$/g, ""), cueText });
+    pokeControls();
+  }, [pokeControls]);
+
+  const toggleSmartSpeed = useCallback(async (next: boolean) => {
+    setSmartSpeedState(next);
+    smartSpeedRef.current = next;
+    try { setPrefs({ smartSpeed: next }); } catch {}
+    const video = videoRef.current;
+    if (!video) { pokeControls(); return; }
+    if (next) {
+      try {
+        let handle = smartHandleRef.current;
+        if (!handle) {
+          handle = createSmartSpeed(video, { silentRate: 1.8 });
+          if (handle) smartHandleRef.current = handle;
+        }
+        if (handle) {
+          await handle.resume();
+          handle.enable();
+        } else {
+          flashNotice("Smart speed unavailable on this device");
+          setSmartSpeedState(false);
+          smartSpeedRef.current = false;
+          try { setPrefs({ smartSpeed: false }); } catch {}
+        }
+      } catch {
+        flashNotice("Smart speed unavailable");
+        setSmartSpeedState(false);
+        smartSpeedRef.current = false;
+      }
+    } else {
+      try { smartHandleRef.current?.disable(); } catch {}
+      // restore rate: disable already restores base if boosting
+    }
+    pokeControls();
+  }, [pokeControls, flashNotice]);
+
+  const runSubtitleSearch = useCallback(async () => {
+    const title = loaded?.details.title ?? "";
+    if (!title.trim()) { flashNotice("No title for search"); return; }
+    setSearchLoading(true);
+    try {
+      const res = await api.subtitleSearch({ provider: searchProvider, title: title.trim(), episode: String(episode ?? ""), lang: getPrefs().prefSubLang?.[0] ?? "en" });
+      const incoming: SubtitleOption[] = (res.subtitles ?? []).map((o) => ({ ...o, source: 'search' as const }));
+      setSearchResults(incoming);
+      if (!incoming.length) { flashNotice("No results from " + searchProvider); return; }
+      // merge badged into subOptions, deduped by (url, language, format, forced, sdh)
+      setSubOptions((prev) => {
+        const keyFor = (o: SubtitleOption) => `${o.url}::${(o.language ?? o.name ?? '').toLowerCase()}::${o.format ?? ''}::${o.forced?1:0}::${o.sdh?1:0}::${o.provider ?? ''}`;
+        const seen = new Set(prev.map((p) => keyFor(p)));
+        const toAdd: SubtitleOption[] = [];
+        for (const opt of incoming) {
+          const k = keyFor(opt);
+          if (!seen.has(k)) { seen.add(k); toAdd.push(opt); }
+        }
+        if (!toAdd.length) return prev;
+        return [...prev, ...toAdd];
+      });
+      flashNotice(`Found ${incoming.length} from ${searchProvider}`);
+    } catch (e) {
+      flashNotice(e instanceof Error ? e.message : "Search failed");
+    } finally {
+      setSearchLoading(false);
+    }
+  }, [loaded, episode, searchProvider, flashNotice]);
+
+
+
+  // apply filter -> video.style.filter
+  const filterToCss = useCallback((mode: FilterMode): string => {
+    if (mode === "anime") return "saturate(1.25) contrast(1.05)";
+    if (mode === "contrast") return "contrast(1.35) saturate(1.1) brightness(1.04)";
+    return "none";
+  }, []);
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    try { video.style.filter = filterToCss(filterMode); } catch {}
+  }, [filterMode, filterToCss]);
+  const applyFilter = useCallback((mode: FilterMode) => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
+    setFilterMode(mode);
+    try { setPrefs({ filter: mode }); } catch {}
+    const video = videoRef.current;
+    if (video) try { video.style.filter = filterToCss(mode); } catch {}
+    pokeControls();
+  }, [filterToCss, pokeControls]);
+
+  // nightDim + brightness -> shared dimmer overlay (reused dimmerRef)
+  const computeOverlayOpacity = useCallback((b: number, n: number): number => {
+    const brightDim = b < 1 ? 1 - b : 0;
+    const nightDimOp = Math.min(0.85, Math.max(0, n * 0.7));
+    return Math.min(0.85, Math.max(brightDim, nightDimOp));
+  }, []);
+  useEffect(() => {
+    const el = dimmerRef.current;
+    if (!el) return;
+    const op = computeOverlayOpacity(brightness, nightDim);
+    el.style.opacity = String(op);
+    el.style.pointerEvents = "none";
+  }, [brightness, nightDim, computeOverlayOpacity]);
+  const setNightDim = useCallback((value: number) => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
+    const v = Math.min(1, Math.max(0, value));
+    setNightDimState(v);
+    try { setPrefs({ nightDim: v }); } catch {}
+    const el = dimmerRef.current;
+    if (el) el.style.opacity = String(computeOverlayOpacity(brightnessRef.current, v));
+    pokeControls();
+  }, [pokeControls, computeOverlayOpacity]);
+  const setBrightness = useCallback((value: number) => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
+    const v = Math.min(1, Math.max(0.3, value));
+    setBrightnessState(v);
+    brightnessRef.current = v;
+    try { setPrefs({ brightness: v }); } catch {}
+    const el = dimmerRef.current;
+    if (el) el.style.opacity = String(computeOverlayOpacity(v, nightDim));
+    pokeControls();
+  }, [pokeControls, nightDim, computeOverlayOpacity]);
+  // --- Screen lock / child lock ---
+  const clearLockTimers = useCallback(() => {
+    if (lockTapTimerRef.current != null) window.clearTimeout(lockTapTimerRef.current);
+    if (lockHoldTimerRef.current != null) window.clearTimeout(lockHoldTimerRef.current);
+    lockTapTimerRef.current = null;
+    lockHoldTimerRef.current = null;
+    lockTapCountRef.current = 0;
+  }, []);
+  const lock = useCallback(() => {
+    setLocked(true);
+    lockedRef.current = true;
+    setLockHint(false);
+    clearLockTimers();
+    pokeControls();
+  }, [clearLockTimers, pokeControls]);
+  const unlock = useCallback(() => {
+    setLocked(false);
+    lockedRef.current = false;
+    setLockHint(false);
+    clearLockTimers();
+    pokeControls();
+  }, [clearLockTimers, pokeControls]);
+  const handleLockTap = useCallback(() => {
+    lockTapCountRef.current += 1;
+    if (lockTapTimerRef.current != null) window.clearTimeout(lockTapTimerRef.current);
+    lockTapTimerRef.current = window.setTimeout(() => {
+      lockTapCountRef.current = 0;
+      lockTapTimerRef.current = null;
+    }, 600);
+    if (lockTapCountRef.current >= 3) unlock();
+    else {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 3000);
+    }
+  }, []);
+  const handleLockHoldStart = useCallback(() => {
+    if (lockHoldTimerRef.current != null) window.clearTimeout(lockHoldTimerRef.current);
+    lockHoldTimerRef.current = window.setTimeout(() => {
+      unlock();
+      lockHoldTimerRef.current = null;
+    }, 1000);
+  }, []);
+  const handleLockHoldEnd = useCallback(() => {
+    if (lockHoldTimerRef.current != null) window.clearTimeout(lockHoldTimerRef.current);
+    lockHoldTimerRef.current = null;
+  }, []);
+  useEffect(() => {
+    lockedRef.current = locked;
+  }, [locked]);
+
+  // --- PiP (Picture-in-Picture) ---
+  const togglePip = useCallback(async () => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
+    const video = videoRef.current;
+    if (!video) return;
+    if (document.pictureInPictureElement === video) {
+      try { await document.exitPictureInPicture(); } catch {}
+      setPipActive(false);
+    } else {
+      try {
+        await video.requestPictureInPicture();
+        setPipActive(true);
+      } catch (e) {
+        flashNotice("PiP unavailable");
+        console.warn("[pip] request failed", e);
+      }
+    }
+    pokeControls();
+  }, [pokeControls, flashNotice]);
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onLeave = () => {
+      setPipActive(false);
+      pokeControls();
+    };
+    video.addEventListener("leavepictureinpicture", onLeave);
+    return () => video.removeEventListener("leavepictureinpicture", onLeave);
+  }, [pokeControls]);
+
+  // --- AirPlay (Safari only) ---
+  const canAirPlay = typeof window !== "undefined" && "webkitShowPlaybackTargetPicker" in HTMLVideoElement.prototype;
+  const showAirPlay = useCallback(() => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
+    const video = videoRef.current;
+    if (!video || !canAirPlay) return;
+    try { (video as unknown as { webkitShowPlaybackTargetPicker: () => void }).webkitShowPlaybackTargetPicker(); } catch {}
+    pokeControls();
+  }, [pokeControls]);
+
+  // --- Stats polling (1s) ---
+  useEffect(() => {
+    if (!statsOpen) {
+      if (statsTimerRef.current != null) {
+        window.clearInterval(statsTimerRef.current);
+        statsTimerRef.current = null;
+      }
+      return;
+    }
+    const video = videoRef.current;
+    if (!video) return;
+    statsTimerRef.current = window.setInterval(() => {
+      const v = videoRef.current;
+      if (!v) return;
+      const snap = sampleStats(v, hlsRef.current ?? null, dashRef.current ?? null);
+      statsSnapshotRef.current = snap;
+      setStatsTick((t) => t + 1);
+    }, 1000);
+    return () => {
+      if (statsTimerRef.current != null) window.clearInterval(statsTimerRef.current);
+    };
+  }, [statsOpen]);
+
   const togglePlay = useCallback(() => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) void video.play().catch(() => undefined);
     else video.pause();
+    // smartSpeed resume on gesture (autoplay policy)
+    if (smartSpeedRef.current && videoRef.current) {
+      void smartHandleRef.current?.resume();
+    }
     pokeControls();
   }, [pokeControls]);
 
   const seekBy = useCallback((delta: number) => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
     if (transcodeActiveRef.current) {
@@ -1088,8 +2766,13 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     }
     pokeControls();
   }, [pokeControls, absolutePosition, pinSeekTarget, flashNotice]);
-
   const toggleMute = useCallback(() => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
     video.muted = !video.muted;
@@ -1098,13 +2781,32 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       video.volume = volumeRef.current || 1;
       setVolume(video.volume);
     }
+    try {
+      setPrefs({ muted: video.muted, volume: video.volume });
+    } catch {}
   }, []);
 
   const toggleFullscreen = useCallback(() => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
     const el = containerRef.current;
     if (!el) return;
     if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
-    else void el.requestFullscreen().catch(() => undefined);
+    else {
+      const pr = el.requestFullscreen();
+      const after = () => {
+        try {
+          const o = (screen.orientation as unknown as { lock?: (v: string) => Promise<void> });
+          if (o?.lock) void o.lock("landscape").catch(() => undefined);
+        } catch {}
+      };
+      if (pr && typeof (pr as Promise<void>).then === "function") void (pr as Promise<void>).then(after).catch(() => undefined);
+      else after();
+    }
   }, []);
 
   /** Add/remove the title being watched from the account My List. */
@@ -1122,6 +2824,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   }, [loaded, myList, provider, id]);
 
   const onVolume = (v: number) => {
+    if (lockedRef.current) {
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
     video.volume = v;
@@ -1129,9 +2837,274 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     setVolume(v);
     setMuted(v === 0);
     volumeRef.current = v;
+    try {
+      setPrefs({ volume: v, muted: v === 0 });
+    } catch {}
   };
 
-  // ---------------- absolute seeking (transcode path) ----------------
+  // ---------------- speed: rate + pitch lock helpers ----------------
+  const setRate = useCallback((r: number) => {
+    if (boostActiveRef.current) {
+      const clamped = clampRate(r);
+      prevRateRef.current = clamped;
+      setPlaybackRateState(clamped);
+      playbackRateRef.current = clamped;
+      if (ratePersistTimerRef.current != null) window.clearTimeout(ratePersistTimerRef.current);
+      ratePersistTimerRef.current = window.setTimeout(() => {
+        try { setPrefs({ playbackRate: clampRate(playbackRateRef.current) }); } catch {}
+      }, 500);
+      pokeControls();
+      return;
+    }
+    const clamped = clampRate(r);
+    setPlaybackRateState(clamped);
+    playbackRateRef.current = clamped;
+    const video = videoRef.current;
+    if (video) {
+      try { video.playbackRate = clamped; } catch {}
+      applyPreservesPitch(video, pitchLockRef.current);
+    }
+    // Slider drags can fire dozens of times/sec — batch the storage write.
+    if (ratePersistTimerRef.current != null) window.clearTimeout(ratePersistTimerRef.current);
+    ratePersistTimerRef.current = window.setTimeout(() => {
+      try { setPrefs({ playbackRate: clampRate(playbackRateRef.current) }); } catch {}
+    }, 500);
+    pokeControls();
+  }, [applyPreservesPitch, pokeControls]);
+  useEffect(() => {
+    setRateRef.current = setRate;
+  }, [setRate]);
+  const togglePitchLock = useCallback(() => {
+    const next = !pitchLockRef.current;
+    setPitchLockState(next);
+    pitchLockRef.current = next;
+    const video = videoRef.current;
+    if (video) applyPreservesPitch(video, next);
+    try { setPrefs({ pitchLock: next }); } catch {}
+    pokeControls();
+  }, [applyPreservesPitch, pokeControls]);
+  const stepFrame = useCallback((dir: 1 | -1) => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (transcodeActiveRef.current) {
+      if (!frameStepWarnedRef.current) {
+        frameStepWarnedRef.current = true;
+        flashNotice("Frame step restarts transcode");
+      }
+      const pos = absolutePosition();
+      const target = pos + dir * 0.1;
+      void seekAbsoluteRef.current(target);
+      pokeControls();
+      return;
+    }
+    // direct path: 30fps assumption — 1 frame = 1/30s
+    const current = video.currentTime;
+    const next = frameStep(current, dir, 30); // 30fps assumption
+    const dur = video.duration;
+    if (!isSeekableDuration(dur)) return;
+    const target = clampSeekTarget(next, dur);
+    if (target == null) return;
+    pinSeekTarget(target);
+    try { video.currentTime = target; } catch { pendingSeekRef.current = null; }
+    pokeControls();
+  }, [absolutePosition, flashNotice, pokeControls, pinSeekTarget]);
+
+  // ---------------- volume boost / normalize (lazy WebAudio graph) ----------------
+  // Graph is created once, on first boost/normalize enable. Never created when
+  // both remain disabled (zero cost). Mute stays element-level so boost-of-muted
+  // stays silent. All AudioContext work is guarded for SSR and never at top-level.
+  const applyGainValue = useCallback(() => {
+    const g = gainRef.current;
+    const ctx = audioCtxRef.current;
+    if (!g) return;
+    const target = volumeBoostRef.current ? 2.0 : 1.0;
+    try {
+      if (ctx && ctx.state === "suspended") void ctx.resume().catch(() => undefined);
+      if (ctx) {
+        try {
+          g.gain.cancelScheduledValues(ctx.currentTime);
+          g.gain.setTargetAtTime(target, ctx.currentTime, 0.015);
+        } catch {}
+      }
+      g.gain.value = target;
+    } catch {
+      try { g.gain.value = target; } catch {}
+    }
+  }, []);
+
+  const applyNormalizeWiring = useCallback(() => {
+    const ctx = audioCtxRef.current;
+    const src = audioSrcRef.current;
+    const gain = gainRef.current;
+    const comp = compRef.current;
+    if (!ctx || !src || !gain || !comp) return;
+    try {
+      try { src.disconnect(); } catch {}
+      try { gain.disconnect(); } catch {}
+      try { comp.disconnect(); } catch {}
+      if (normalizeGainRef.current) {
+        src.connect(gain);
+        gain.connect(comp);
+        comp.connect(ctx.destination);
+      } else {
+        src.connect(gain);
+        gain.connect(ctx.destination);
+      }
+      if (ctx.state === "suspended") void ctx.resume().catch(() => undefined);
+    } catch (e) {
+      console.warn("[audio] normalize wiring failed", e);
+    }
+  }, []);
+
+  const ensureAudioGraph = useCallback(async (): Promise<boolean> => {
+    if (typeof window === "undefined") return false;
+    if (graphReadyRef.current) return true;
+    const video = videoRef.current;
+    if (!video) return false;
+    // Prefixed AudioContext for old Safari; assign to named const before member access
+    const audioWindow = window as unknown as { AudioContext?: typeof AudioContext; webkitAudioContext?: typeof AudioContext }; // well-known DOM AudioContext
+    const Ctx = audioWindow.AudioContext ?? audioWindow.webkitAudioContext;
+    if (!Ctx) return false;
+    try {
+      const ctx = new Ctx();
+      if (ctx.state === "suspended") {
+        try { await ctx.resume(); } catch {}
+      }
+      const src = ctx.createMediaElementSource(video);
+      const gain = ctx.createGain();
+      gain.gain.value = volumeBoostRef.current ? 2.0 : 1.0;
+      const comp = ctx.createDynamicsCompressor();
+      try {
+        comp.threshold.value = -24;
+        comp.knee.value = 30;
+        comp.ratio.value = 12;
+        comp.attack.value = 0.003;
+        comp.release.value = 0.25;
+      } catch {}
+      // Wire according to current normalize pref
+      if (normalizeGainRef.current) {
+        src.connect(gain);
+        gain.connect(comp);
+        comp.connect(ctx.destination);
+      } else {
+        src.connect(gain);
+        gain.connect(ctx.destination);
+      }
+      audioCtxRef.current = ctx;
+      audioSrcRef.current = src;
+      gainRef.current = gain;
+      compRef.current = comp;
+      graphReadyRef.current = true;
+      return true;
+    } catch (e) {
+      console.warn("[audio] graph init failed", e);
+      return false;
+    }
+  }, []);
+
+  const setVolumeBoostEnabled = useCallback(async (next: boolean) => {
+    volumeBoostRef.current = next;
+    setVolumeBoost(next);
+    try { setPrefs({ volumeBoost: next }); } catch {}
+    if (next) {
+      const ok = await ensureAudioGraph();
+      if (ok) applyGainValue();
+      else {
+        // Fallback: no AudioContext support — keep pref but no boost
+        flashNotice("Boost unavailable on this device");
+      }
+    } else if (graphReadyRef.current) {
+      applyGainValue();
+    }
+    pokeControls();
+  }, [ensureAudioGraph, applyGainValue, pokeControls, flashNotice]);
+
+  const setNormalizeEnabled = useCallback(async (next: boolean) => {
+    normalizeGainRef.current = next;
+    setNormalizeOn(next);
+    try { setPrefs({ normalize: next }); } catch {}
+    if (next && !graphReadyRef.current) {
+      const ok = await ensureAudioGraph();
+      if (!ok) {
+        flashNotice("Normalize unavailable on this device");
+        return;
+      }
+      // ensureAudioGraph already wired for normalize=true
+      pokeControls();
+      return;
+    }
+    if (graphReadyRef.current) applyNormalizeWiring();
+    pokeControls();
+  }, [ensureAudioGraph, applyNormalizeWiring, pokeControls, flashNotice]);
+  // Hydration restore: if boost/normalize persisted as on, lazily build graph
+  // once the element exists (still zero cost when both remain off).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (graphReadyRef.current) return;
+    if (!volumeBoost && !normalizeOn) return;
+    if (!videoRef.current) return;
+    void ensureAudioGraph().catch(() => undefined);
+  }, [volumeBoost, normalizeOn, ensureAudioGraph]);
+  // P4: smartSpeed hydration — SSR-guarded, single source per stable element
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!smartSpeed) return;
+    const video = videoRef.current;
+    if (!video) return;
+    let handle = smartHandleRef.current;
+    if (!handle) {
+      handle = createSmartSpeed(video, { silentRate: 1.8 });
+      if (handle) smartHandleRef.current = handle;
+    }
+    if (!handle) return;
+    void handle.resume().catch(() => undefined);
+    handle.enable();
+    const onVis = () => {
+      if (document.visibilityState === "visible") void handle?.resume().catch(() => undefined);
+    };
+    document.addEventListener("visibilitychange", onVis);
+    // also ensure not stuck: when disabled re-enable restores base rate; when paused, tick no-ops
+    const onEnded = () => {
+      try { handle?.disable(); } catch {}
+    };
+    video.addEventListener("ended", onEnded);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      video.removeEventListener("ended", onEnded);
+      try { handle?.disable(); } catch {}
+    };
+  }, [smartSpeed]);
+  // Pause/resume smartSpeed when element pauses/plays so silence ramp doesn't stick
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onPause = () => {
+      if (smartSpeedRef.current) {
+        try { smartHandleRef.current?.disable(); } catch {}
+        // keep handle alive; re-enable on play via the hydration effect's handle
+        // simpler: if still enabled pref, re-enable on next play
+        if (smartSpeedRef.current && videoRef.current) {
+          // delay to avoid immediate re-ramp on pause tick
+        }
+      }
+    };
+    const onPlay = () => {
+      if (smartSpeedRef.current) {
+        const h = smartHandleRef.current ?? createSmartSpeed(video, { silentRate: 1.8 });
+        if (h) {
+          smartHandleRef.current = h;
+          void h.resume().catch(() => undefined);
+          h.enable();
+        }
+      }
+    };
+    video.addEventListener("pause", onPause);
+    video.addEventListener("play", onPlay);
+    return () => {
+      video.removeEventListener("pause", onPause);
+      video.removeEventListener("play", onPlay);
+    };
+  }, []);
 
   /**
    * Restart the transcode pipeline at an absolute source offset and resume on
@@ -1141,6 +3114,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
    */
   const remoteSeek = useCallback(
     async (absSeconds: number) => {
+      if (lockedRef.current) {
+        setLockHint(true);
+        if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+        lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+        return;
+      }
       const session = transcodeSessionRef.current;
       if (!session) return;
       if (remoteSeekBusyRef.current) {
@@ -1230,6 +3209,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
    */
   const seekAbsolute = useCallback(
     async (absSeconds: number) => {
+      if (lockedRef.current) {
+        setLockHint(true);
+        if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+        lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+        return;
+      }
       const video = videoRef.current;
       if (!video) return;
       if (!Number.isFinite(absSeconds)) return;
@@ -1345,7 +3330,11 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
 
   useEffect(() => {
     if (!nextUp) return;
-    nextCountdown.current = 10;
+    if (!autoplay) {
+      // autoplay off: static card, no countdown
+      return;
+    }
+    nextCountdown.current = autoplayDelay;
     countdownTimer.current = window.setInterval(() => {
       nextCountdown.current -= 1;
       setTick((t) => t + 1);
@@ -1359,23 +3348,281 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     return () => {
       if (countdownTimer.current) clearInterval(countdownTimer.current);
     };
-  }, [nextUp, router, provider, id, showNextUp]);
+  }, [nextUp, router, provider, id, showNextUp, autoplay, autoplayDelay]);
 
-  // ---------------- keyboard ----------------
+  useDismissable(subsOpen, subsMenuRef, () => setSubsOpen(false));
+  useDismissable(speedOpen, speedMenuRef, () => setSpeedOpen(false));
+  useDismissable(episodeDrawerOpen, episodeDrawerRef, () => setEpisodeDrawerOpen(false));
+  useDismissable(volPopoverOpen, volMenuRef, () => setVolPopoverOpen(false));
+  useDismissable(aspectOpen, aspectMenuRef, () => setAspectOpen(false));
+  useDismissable(filterOpen, filterMenuRef, () => setFilterOpen(false));
+
+  // overlay clock: keep overlayNow in sync while overlay is active (dual/ASS/filter)
+  // Lightweight tick — only while needed, via rAF that updates state ~5-10fps throttled
   useEffect(() => {
-    if (!subsOpen) return;
-    const onDown = (ev: MouseEvent) => {
-      const el = subsMenuRef.current;
-      if (el && !el.contains(ev.target as Node)) setSubsOpen(false);
+    const needs = (
+      (dualSubs && !!chosenSub && !!chosenSub2) ||
+      (chosenSub && (chosenSub.format === 'ass' || chosenSub.format === 'ssa')) ||
+      (chosenSub2 && (chosenSub2.format === 'ass' || chosenSub2.format === 'ssa')) ||
+      (subFilter !== 'all')
+    );
+    // also if primary is currently via overlay (primaryCues length >0) needs tick
+    const overlayActive = needs || primaryCues.length > 0 || secondaryCues.length > 0;
+    if (!overlayActive) return;
+    let raf = 0;
+    let last = 0;
+    const loop = () => {
+      const now = performance.now();
+      if (now - last > 100) { // 10fps sufficient for cues (1s granularity), saves re-renders
+        const cur = absolutePosition();
+        // only trigger state if should change active set? but cheap to set even if same — overlay component will filter
+        overlayNowRef.current = cur;
+        setOverlayNow(cur);
+        last = now;
+      }
+      raf = requestAnimationFrame(loop);
     };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [subsOpen]);
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [dualSubs, chosenSub, chosenSub2, subFilter, primaryCues.length, secondaryCues.length, absolutePosition]);
+
+  // keep native ::cue vars in sync with subStyle
+  useEffect(() => {
+    const vars = styleToCssVars(subStyle);
+    const vEl = videoRef.current;
+    const root = typeof document !== 'undefined' ? document.documentElement : null;
+    if (!vEl && !root) return;
+    try { Object.entries(vars).forEach(([k,v]) => { if(vEl) try{ vEl.style.setProperty(k,v);}catch{}; if(root) try{ root.style.setProperty(k,v);}catch{}; }); } catch {}
+  }, [subStyle]);
+
+  // Keep sub prefs in sync if changed elsewhere (account sync / another tab)
+  useEffect(() => {
+    const unsub = subscribePrefs((next) => {
+      // subStyle is in sync subset, device-local for offsets/dual
+      try { const ns = coerceSubStyle(next.subStyle, DEFAULT_SUB_STYLE); if (JSON.stringify(ns)!==JSON.stringify(subStyleRef.current)) { setSubStyleState(ns); subStyleRef.current=ns; } } catch {}
+      // subFilter / dual / offsets are device-local but listen for manual setPrefs in same tab
+      if (typeof next.subFilter === 'string' && (next.subFilter==='all'||next.subFilter==='signs')) {
+        if (next.subFilter !== subFilterRef.current) { setSubFilterState(next.subFilter as 'all'|'signs'); subFilterRef.current = next.subFilter as 'all'|'signs'; }
+      }
+      if (typeof next.dualSubs === 'boolean' && next.dualSubs !== dualSubsRef2.current) {
+        setDualSubsState(next.dualSubs); dualSubsRef2.current=next.dualSubs;
+      }
+      if (typeof next.subOffsetMs === 'number' && next.subOffsetMs !== subOffsetMsRef.current) {
+        setSubOffsetMs(next.subOffsetMs); subOffsetMsRef.current = next.subOffsetMs;
+      }
+      if (typeof next.subOffsetMs2 === 'number' && next.subOffsetMs2 !== subOffsetMs2Ref.current) {
+        setSubOffsetMs2(next.subOffsetMs2); subOffsetMs2Ref.current = next.subOffsetMs2;
+      }
+    });
+    return () => { try{ unsub(); }catch{} };
+  }, []);
+
+  // Auto-migrate primary between native and overlay when filter toggles
+  useEffect(() => {
+    const cur = chosenSubRef.current;
+    if (!cur) return;
+    const need = needsOverlay(cur.format ?? null, chosenSub2Ref.current?.format ?? null, dualSubsRef2.current && !!chosenSub2Ref.current, subFilter !== 'all' ? 'signs':'all');
+    const hasOverlay = primaryCues.length > 0;
+    const hasNative = !!subTrackRef.current?.track;
+    if (need && hasNative) {
+      const cues = subTrackRef.current?.cues ? [...subTrackRef.current.cues] : [...primaryCuesRef.current];
+      if (!cues.length) return;
+      const video = videoRef.current;
+      if (!video) return;
+      subTrackRef.current?.cleanup(); subTrackRef.current=null;
+      setPrimaryCuesSync(cues); primaryCuesRef.current=cues;
+      if(video){ overlayNowRef.current=video.currentTime; setOverlayNow(video.currentTime); }
+    } else if (!need && hasOverlay) {
+      const cues = [...primaryCuesRef.current];
+      if (!cues.length) return;
+      const video = videoRef.current;
+      if (!video) return;
+      setPrimaryCuesSync([]); primaryCuesRef.current=cues;
+      const state = attachSubtitleTrack(video, cur.name, cues,{offsetMs: subOffsetMsRef.current, source:'native'});
+      state.cues=[...cues]; (state as any).offsetMs=subOffsetMsRef.current;
+      subTrackRef.current=state;
+      const vars=styleToCssVars(subStyleRef.current);
+      try{ const el=containerRef.current??video; Object.entries(vars).forEach(([k,v])=> el.style.setProperty(k,v)); }catch{}
+    }
+  }, [subFilter, primaryCues]);
+
+
+  // Keep season tab in sync with current episode's season
+  useEffect(() => {
+    if (loaded?.details.seasons?.length) {
+      const nums = loaded.details.seasons.map((s) => s.number);
+      if (activeSeasonTab == null || !nums.includes(activeSeasonTab)) {
+        setActiveSeasonTab(season || nums[0] || null);
+      }
+    }
+  }, [loaded, season, activeSeasonTab]);
+
+  // Keep autoplay prefs in sync if changed elsewhere (e.g., account sync)
+  useEffect(() => {
+    try {
+      const p = getPrefs();
+      setAutoplay(p.autoplay);
+      setAutoplayDelay(p.autoplayDelay);
+    } catch {}
+    const unsub = subscribePrefs((next) => {
+      setAutoplay(next.autoplay);
+      setAutoplayDelay(next.autoplayDelay);
+    });
+    return () => { try { unsub(); } catch {} };
+  }, []);
+
+  // P1Seek — keep seekStep/timeMode in sync with external pref changes
+  useEffect(() => {
+    try {
+      const p = getPrefs();
+      setSeekStepState(resolveSeekStep(p.seekStep));
+      const tm = p.timeMode;
+      setTimeModeState(tm === 'elapsed' || tm === 'remaining' ? tm : 'elapsed');
+    } catch {}
+    const unsub = subscribePrefs((next) => {
+      setSeekStepState(resolveSeekStep(next.seekStep));
+      const tm = next.timeMode;
+      setTimeModeState(tm === 'elapsed' || tm === 'remaining' ? tm : 'elapsed');
+    });
+    return () => { try { unsub(); } catch {} };
+  }, []);
+
+  // ------ Prefetch worker (07.4): warm next-episode manifests + 2-3 heads at >0.8 progress ------
+  const prefetchWorkerRef = useRef<Worker | null>(null);
+  const prefetchFiredRef = useRef(false);
+  const getPrefetchWorker = () => {
+    if (typeof window === 'undefined') return null;
+    if (prefetchWorkerRef.current) return prefetchWorkerRef.current;
+    try {
+      const w = new Worker(new URL("../workers/prefetch.ts", import.meta.url));
+      prefetchWorkerRef.current = w;
+      return w;
+    } catch { return null; }
+  };
+  // Fire once per episode when crossing 0.8 progress or entering end credits
+  useEffect(() => {
+    if (!loaded) return;
+    const next = nextEpisode(loaded.details.seasons ?? [], season, episode);
+    if (!next) return;
+    // Poll every 5s for the 0.8 crossing — effect deps (functions) don't tick with playback
+    const check = () => {
+      if (prefetchFiredRef.current) return;
+      const dur = absoluteDuration();
+      const pos = absolutePosition();
+      let shouldWarm = false;
+      if (dur > 0 && pos / dur > 0.8) shouldWarm = true;
+      if (!shouldWarm) return;
+      prefetchFiredRef.current = true;
+      const worker = getPrefetchWorker();
+      (async () => {
+        try {
+          let playUrl: string | undefined;
+          let manifestUrls: string[] = [];
+          try {
+            const playRes = await api.play({ provider, id, season: next.season, episode: next.episode } as unknown as Record<string, unknown> as never);
+            playUrl = playRes.play_url;
+            manifestUrls = [playRes.play_url];
+          } catch {}
+          // Warm via worker into caches.open('prefetch-v1') — NEVER auto-POST /transcode/start
+          if (worker) {
+            try { worker.postMessage({ type: 'prefetch', provider, id, season: next.season, episode: next.episode, playUrl, manifestUrls }); } catch {}
+          } else {
+            try {
+              const cache = await caches.open('prefetch-v1');
+              for (const u of manifestUrls.slice(0, 3)) {
+                try {
+                  const r = await fetch(u, { cache: 'no-store', priority: 'low' } as unknown as RequestInit);
+                  if (r.ok) await cache.put(u, r.clone());
+                } catch {}
+              }
+            } catch {}
+          }
+        } catch {}
+      })();
+    };
+    // immediate check (for already-past threshold on load) + interval
+    check();
+    const iv = window.setInterval(check, 5000);
+    return () => window.clearInterval(iv);
+  }, [loaded, season, episode, provider, id, absoluteDuration, absolutePosition]);
+  // Reset prefetch gate when season/episode changes
+  useEffect(() => { prefetchFiredRef.current = false; }, [season, episode, id]);
+  // Cleanup worker on unmount
+  useEffect(() => { return () => { const w = prefetchWorkerRef.current; if (w) { try { w.terminate(); } catch {} prefetchWorkerRef.current = null; } }; }, []);
+
+
+  const adjustOffset = useCallback((which: 'primary'|'secondary', deltaMs: number) => {
+    const video = videoRef.current;
+    const clamp = (v: number) => Math.max(-2000, Math.min(2000, Math.round(v)));
+    if (which === 'primary') {
+      const next = clamp((subOffsetMsRef.current ?? 0) + deltaMs);
+      subOffsetMsRef.current = next; setSubOffsetMs(next);
+      persistOffset('subOffsetMs', next);
+      const sign = next > 0 ? '+' : '';
+      flashNotice(`Subs ${sign}${next}ms`);
+      // native path: re-attach with shifted cues if not overlay
+      const need = needsOverlay(chosenSubRef.current?.format ?? null, chosenSub2Ref.current?.format ?? null, dualSubsRef2.current && !!chosenSub2Ref.current, (subFilterRef.current ?? 'all') !== 'all' ? 'signs':'all');
+      if (!need && subTrackRef.current && video && chosenSubRef.current) {
+        const cues = subTrackRef.current.cues ? [...subTrackRef.current.cues] : [...primaryCuesRef.current];
+        if (cues.length) {
+          subTrackRef.current.cleanup();
+          const state = attachSubtitleTrack(video, chosenSubRef.current.name, cues,{offsetMs: next, source:'native'});
+          subTrackRef.current=state;
+        }
+      } else {
+        // overlay: just re-tick so filter picks shifted window
+        if (video) { overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime); }
+      }
+    } else {
+      const next = clamp((subOffsetMs2Ref.current ?? 0) + deltaMs);
+      subOffsetMs2Ref.current = next; setSubOffsetMs2(next);
+      persistOffset('subOffsetMs2', next);
+      const sign = next > 0 ? '+' : '';
+      flashNotice(`Subs2 ${sign}${next}ms`);
+      if (video) { overlayNowRef.current = video.currentTime; setOverlayNow(video.currentTime); }
+    }
+    pokeControls();
+  }, [flashNotice, pokeControls]);
+
+  const updateSubStyle = (patch: Partial<SubStyle>) => {
+    const next = coerceSubStyle({ ...subStyleRef.current, ...patch }, DEFAULT_SUB_STYLE);
+    setSubStyleState(next);
+    subStyleRef.current = next;
+    try { setPrefs({ subStyle: next }); } catch {}
+    // native vars update via effect, but also immediate for overlay preview
+    const vars = styleToCssVars(next);
+    const vEl = videoRef.current;
+    if (vEl) try { Object.entries(vars).forEach(([k,v])=> { try{ vEl.style.setProperty(k,v);}catch{}; try{ document.documentElement.style.setProperty(k,v);}catch{}; }); } catch{}
+    pokeControls();
+  };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target?.tagName === "INPUT" || target?.tagName === "SELECT") return;
+      if (target?.tagName === "INPUT" || target?.tagName === "SELECT" || (target as HTMLElement)?.isContentEditable) return;
+      if (lockedRef.current) {
+        setLockHint(true);
+        if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+        lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+        return;
+      }
+      const shifted = e.shiftKey;
+      if (e.key === 'g' || e.key === 'G') {
+        if (chosenSubRef.current || primaryCuesRef.current.length || primaryCues.length) {
+          e.preventDefault();
+          const delta = shifted ? -500 : -100;
+          adjustOffset('primary', delta);
+        }
+        return;
+      }
+      if (e.key === 'h' || e.key === 'H') {
+        if (chosenSubRef.current || primaryCuesRef.current.length || primaryCues.length) {
+          e.preventDefault();
+          const delta = shifted ? 500 : 100;
+          adjustOffset('primary', delta);
+        }
+        return;
+      }
       switch (e.key) {
         case " ":
         case "k":
@@ -1384,11 +3631,11 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           break;
         case "ArrowLeft":
           e.preventDefault();
-          seekBy(-10);
+          seekBy(-seekStepRef.current);
           break;
         case "ArrowRight":
           e.preventDefault();
-          seekBy(10);
+          seekBy(seekStepRef.current);
           break;
         case "ArrowUp":
           e.preventDefault();
@@ -1404,8 +3651,24 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         case "f":
           toggleFullscreen();
           break;
+        case ",":
+          e.preventDefault();
+          stepFrame(-1);
+          break;
+        case ".":
+          e.preventDefault();
+          stepFrame(1);
+          break;
         case "Escape":
           if (subsOpen) setSubsOpen(false);
+          else if (speedOpen) setSpeedOpen(false);
+          else if (volPopoverOpen) setVolPopoverOpen(false);
+          else if (episodeDrawerOpen) setEpisodeDrawerOpen(false);
+          else if (statsOpen) {
+            setStatsOpen(false);
+            try { setPrefs({ statsOpen: false }); } catch {}
+          } else if (aspectOpen) setAspectOpen(false);
+          else if (filterOpen) setFilterOpen(false);
           else if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
           else if (nextUp) showNextUp(null);
           else if (resumeAsk) setResumeAsk(null);
@@ -1416,7 +3679,24 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [togglePlay, seekBy, toggleMute, toggleFullscreen, nextUp, resumeAsk, router, subsOpen]);
+  }, [togglePlay, seekBy, toggleMute, toggleFullscreen, nextUp, resumeAsk, router, subsOpen, speedOpen, episodeDrawerOpen, volPopoverOpen, stepFrame, statsOpen, aspectOpen, filterOpen, adjustOffset]);
+
+  // ---------------- skip intro/outro detection ----------------
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const chaps = (loaded?.streams as (StreamsResponse & { chapters?: Chapter[] }))?.chapters;
+      if (!chaps || chaps.length === 0) {
+        if (skipChapter) setSkipChapter(null);
+        return;
+      }
+      const pos = absolutePosition();
+      const found = chaps.find((c) => (c.kind === 'intro' || c.kind === 'outro') && pos >= c.start && pos < c.end) ?? null;
+      if ((found?.start ?? null) !== (skipChapter?.start ?? null) || (found?.end ?? null) !== (skipChapter?.end ?? null)) {
+        setSkipChapter(found);
+      }
+    }, 600);
+    return () => window.clearInterval(id);
+  }, [loaded, absolutePosition, skipChapter]);
 
   // ---------------- progress tick ----------------
   useEffect(() => {
@@ -1472,7 +3752,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           const pending = pendingSeekRef.current;
           const displayTime = resolveDisplayTime(pending, absTime, transcode);
           const pct = seekProgressPct(displayTime, duration);
-          if (timeRef.current) timeRef.current.textContent = formatClock(displayTime);
+          if (timeRef.current) timeRef.current.textContent = timeModeRef.current === 'remaining' ? formatRemaining(displayTime, duration) : formatClock(displayTime);
           if (playedFillRef.current) playedFillRef.current.style.width = `${pct}%`;
           if (seekRef.current) {
             seekRef.current.max = String(Math.floor(duration));
@@ -1711,11 +3991,151 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
 
   /** Release of the seek bar: dispatch the chosen absolute position. */
   const commitSeekFromRange = (target: HTMLInputElement) => {
+    if (lockedRef.current) {
+      draggingRef.current = false;
+      setLockHint(true);
+      if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+      lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+      return;
+    }
     draggingRef.current = false;
     const value = Number(target.value);
     if (!Number.isFinite(value)) return;
     void seekAbsoluteRef.current(value);
   };
+
+
+  // ---------- P3 gestures: double-tap, swipe, hold-boost, pinch ----------
+  const holdBoostRateRef = useRef<import("@/lib/player-prefs").HoldBoostRate>(2 as HoldBoostRate);
+  // keep holdBoostRate in sync with prefs
+  useEffect(() => {
+    try { holdBoostRateRef.current = getPrefs().holdBoostRate; } catch {}
+    const unsub = subscribePrefs((next) => { holdBoostRateRef.current = next.holdBoostRate; });
+    return () => { try { unsub(); } catch {} };
+  }, []);
+  // throttling refs for swipe flash
+  const lastBrightnessFlashRef = useRef(0);
+  const lastVolumeFlashRef = useRef(0);
+  const gestureHandlers = useGestures({
+    lockedRef,
+    seekStepRef,
+    pokeControls,
+    flashNotice,
+    onSingleTap: () => {
+      togglePlay();
+    },
+    onDoubleTapSeek: (side, jump) => {
+      // side determines direction; hook passes jump already scaled by jumpForTaps
+      const delta = side === "left" ? -jump : jump;
+      // flash + side effect
+      const label = `${delta > 0 ? "+" : ""}${delta}s`;
+      // transient side flash animation
+      setSideFlash(side);
+      if (sideFlashTimerRef.current != null) window.clearTimeout(sideFlashTimerRef.current);
+      sideFlashTimerRef.current = window.setTimeout(() => {
+        sideFlashTimerRef.current = null;
+        setSideFlash((cur) => (cur === side ? null : cur));
+      }, 300);
+      flashNotice(label);
+      seekBy(delta);
+    },
+    onSwipe: (side, dy) => {
+      if (side === "right") {
+        if (gestureVolumeStartRef.current == null) gestureVolumeStartRef.current = volumeRef.current;
+        const start = gestureVolumeStartRef.current ?? 1;
+        const next = Math.min(1, Math.max(0, start - dy * 0.004));
+        onVolume(next);
+        const now = Date.now();
+        if (now - lastVolumeFlashRef.current > 180) {
+          lastVolumeFlashRef.current = now;
+          flashNotice(`Volume ${Math.round(next * 100)}%`);
+        }
+      } else if (side === "left") {
+        if (gestureBrightnessStartRef.current == null) gestureBrightnessStartRef.current = brightnessRef.current;
+        const start = gestureBrightnessStartRef.current ?? 1;
+        const next = Math.min(1, Math.max(0.3, start - dy * 0.004));
+        setBrightness(next);
+        const now = Date.now();
+        if (now - lastBrightnessFlashRef.current > 180) {
+          lastBrightnessFlashRef.current = now;
+          flashNotice(`Brightness ${Math.round(next * 100)}%`);
+        }
+      }
+    },
+    onHoldStart: () => {
+      const video = videoRef.current;
+      if (!video) return;
+      if (boostActiveRef.current) return;
+      prevRateRef.current = video.playbackRate;
+      boostActiveRef.current = true;
+      const rate = holdBoostRateRef.current ?? 2;
+      try { video.playbackRate = rate; } catch {}
+      flashNotice(`${rate}× speed`);
+      pokeControls();
+    },
+    onHoldEnd: () => {
+      const video = videoRef.current;
+      if (!boostActiveRef.current) {
+        // still clear prev to avoid stale restore on next hold
+        prevRateRef.current = null;
+        return;
+      }
+      boostActiveRef.current = false;
+      const prev = prevRateRef.current;
+      prevRateRef.current = null;
+      if (video && prev != null && Number.isFinite(prev)) {
+        try { video.playbackRate = prev; } catch {}
+        // keep state ref in sync (do not persist boosted rate)
+        playbackRateRef.current = prev;
+        setPlaybackRateState(prev);
+      }
+      // reset swipe starts after hold
+      gestureVolumeStartRef.current = null;
+      gestureBrightnessStartRef.current = null;
+      pokeControls();
+    },
+    onPinch: (scale) => {
+      if (scale > 1.15 && pinchAppliedRef.current !== "cover") {
+        pinchAppliedRef.current = "cover";
+        applyAspect("cover");
+        flashNotice("Zoom: fill");
+      } else if (scale < 0.9 && pinchAppliedRef.current !== "contain") {
+        pinchAppliedRef.current = "contain";
+        applyAspect("contain");
+        flashNotice("Zoom: fit");
+      }
+    },
+  });
+  // Reset pinch/swipe starts when gesture ends (pointer up without hold)
+  const handleGesturePointerUp = useCallback((e: React.PointerEvent) => {
+    gestureHandlers.onPointerUp(e);
+    // if no pointers remain, reset gesture start refs and pinch throttle
+    // active pointers count is internal to hook; we approximate by resetting on any up when not holding
+    if (!boostActiveRef.current) {
+      // delay reset to allow trailing swipe commits (hook's debounce is 400ms, but starts are per-sequence)
+      // We reset starts only after a pause; simplest reset now if not boosting
+      // For swipes, hook resets suppression after up; we reset volumes
+      // Use timeout to ensure we don't reset mid-multi-tap sequence — keep until commit
+      // For volume/brightness, reset if dy reset is desired for next swipe sequence
+      // Heuristic: if both pointers lifted, reset
+      // Since we don't know active count, just reset brightness/volume starts after a short delay
+      // Actually we want starts to persist within one continuous swipe; the hook's isSwiping flag handles.
+      // So we reset only when swipe ends: isSwiping was true and now ends.
+      // We can't introspect; just reset after each up if not in a tap debounce.
+      // Safer to reset on next down via onPointerDown side-effect; so keep starts until next gesture down resets explicitly?
+      // We'll reset here opportunistically but keep pinchApplied hysteresis across gesture.
+    }
+    // pinch hysteresis reset after gesture lifts — allow re-trigger on next fresh pinch
+    // Keep pinchAppliedRef across lifts only for a short window; reset after 400ms to allow toggling again
+    window.setTimeout(() => { pinchAppliedRef.current = null; }, 400);
+  }, [gestureHandlers]);
+  const handleGesturePointerDown = useCallback((e: React.PointerEvent) => {
+    // reset per-sequence swipe starts for fresh gesture
+    // Do not reset during multi-tap debounce? Keep start null until swipe triggers; resetting here is safe
+    gestureVolumeStartRef.current = null;
+    gestureBrightnessStartRef.current = null;
+    gestureHandlers.onPointerDown(e);
+  }, [gestureHandlers]);
 
   const showSpinner = state === "loading";
   const inMyList = myList.ready && myList.has(provider, id);
@@ -1731,7 +4151,56 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         ref={videoRef}
         className="h-full w-full"
         playsInline
-        onClick={togglePlay}
+        style={{ objectFit: aspectModeState, filter: filterToCss(filterMode) } as React.CSSProperties}
+      />
+      {/* gesture layer — transparent, touch-action:none, below controls (z-10) */}
+      <div
+        className="gesture-layer"
+        onPointerDown={handleGesturePointerDown}
+        onPointerMove={gestureHandlers.onPointerMove}
+        onPointerUp={handleGesturePointerUp}
+        onPointerCancel={gestureHandlers.onPointerCancel}
+        aria-hidden
+      />
+      {/* side flash indicators for double-tap */}
+      {sideFlash === "left" && <div className="side-flash side-flash--left" aria-hidden />}
+      {sideFlash === "right" && <div className="side-flash side-flash--right" aria-hidden />}
+      {/* Subtitle overlay(s) — active only when overlay path engages (dual/ASS/filter) */}
+      {/* single primary via overlay — never native TextTrack when this renders */}
+      {primaryCues.length > 0 && !jassubActiveRef.current && (
+        <SubtitleOverlay cues={primaryCues} style={subStyle} slot="bottom" currentTime={overlayNow} offsetMs={subOffsetMs} filter={subFilter} interactive onWordClick={handleWordClick} />
+      )}
+      {/* dual secondary top slot — only when both tracks chosen */}
+      {dualSubs && chosenSub && chosenSub2 && secondaryCues.length > 0 && (
+        <SubtitleOverlay cues={secondaryCues} style={subStyle} slot="top" currentTime={overlayNow} offsetMs={subOffsetMs2} filter={subFilter} interactive onWordClick={handleWordClick} />
+      )}
+      {/* word lookup selection — pause + token only (dictionary fetch follow-up) */}
+      {lookup && (
+        <div className="absolute bottom-[18%] left-1/2 z-[22] -translate-x-1/2 rounded-lg border border-white/15 bg-black/85 px-3 py-2 shadow-xl backdrop-blur">
+          <div className="flex items-center gap-2">
+            <span className="mono-meta text-[10px] font-bold tracking-[0.2em] text-brand">LOOKUP</span>
+            <button
+              onClick={() => setLookup(null)}
+              aria-label="Close lookup"
+              className="ml-auto grid h-6 w-6 place-items-center rounded-full text-white/60 hover:bg-white/10 hover:text-white"
+            >
+              <svg viewBox="0 0 24 24" width={14} height={14} fill="none" stroke="currentColor" strokeWidth={2}><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+          <p className="mt-1 text-sm font-bold text-white">{lookup.word}</p>
+          <p className="mt-0.5 max-w-[min(80vw,380px)] truncate text-xs text-zinc-400">{lookup.cueText}</p>
+          <p className="mono-meta mt-1 text-[10px] tracking-widest text-zinc-500">Dictionary lookup — coming soon</p>
+          <div className="mt-2 flex gap-2">
+            <button onClick={() => { setLookup(null); void videoRef.current?.play().catch(() => undefined); }} className="rounded-md bg-white px-3 py-1.5 text-xs font-bold text-black hover:bg-zinc-200">Resume</button>
+            <button onClick={() => setLookup(null)} className="rounded-md bg-white/10 px-3 py-1.5 text-xs font-semibold text-white hover:bg-white/20">Dismiss</button>
+          </div>
+        </div>
+      )}
+      <div
+        ref={dimmerRef}
+        className="pointer-events-none absolute inset-0 bg-black transition-opacity duration-200"
+        style={{ opacity: Math.min(0.85, Math.max(brightness < 1 ? 1 - brightness : 0, nightDim > 0 ? Math.min(0.85, Math.max(0, nightDim * 0.7)) : 0)) }}
+        aria-hidden
       />
 
       {/* top scrim + back */}
@@ -1741,7 +4210,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         }`}
       />
       <div
-        className={`absolute left-0 top-0 z-20 flex w-full items-center gap-4 p-5 transition-opacity duration-300 md:p-7 ${
+        className={`absolute left-0 top-0 z-30 flex w-full items-center gap-4 p-5 transition-opacity duration-300 md:p-7 ${
           controls ? "opacity-100" : "pointer-events-none opacity-0"
         }`}
       >
@@ -1798,7 +4267,139 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
             )}
           </p>
         </div>
+        {/* Screen lock button (top bar) */}
+        <button
+          onClick={() => {
+            if (locked) handleLockTap();
+            else lock();
+          }}
+          onPointerDown={locked ? handleLockHoldStart : undefined}
+          onPointerUp={locked ? handleLockHoldEnd : undefined}
+          onPointerLeave={locked ? handleLockHoldEnd : undefined}
+          aria-label={locked ? "Unlock screen" : "Lock screen"}
+          className="ml-auto grid h-11 w-11 place-items-center rounded-full bg-black/50 text-white ring-1 ring-white/20 backdrop-blur transition hover:bg-black/80"
+          title={locked ? "Triple-tap or hold 1s to unlock" : "Lock screen"}
+        >
+          {locked ? <UnlockIcon width={20} height={20} /> : <LockIcon width={20} height={20} />}
+        </button>
+        {/* Episode drawer button (top bar) */}
+        {loaded?.details.seasons && loaded.details.seasons.length > 0 && (
+          <button
+            onClick={() => {
+              setEpisodeDrawerOpen((o) => !o);
+              pokeControls();
+            }}
+            aria-label="Episodes"
+            aria-expanded={episodeDrawerOpen}
+            className="grid h-11 w-11 place-items-center rounded-full bg-black/50 text-white ring-1 ring-white/20 backdrop-blur transition hover:bg-black/80"
+          >
+            <svg viewBox="0 0 24 24" width={20} height={20} fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <path d="M7 8h10M7 12h10M7 16h10" />
+            </svg>
+          </button>
+        )}
       </div>
+
+
+      {/* episode drawer — right-side, fullscreen-safe (inside containerRef) */}
+      {episodeDrawerOpen && loaded?.details.seasons && (
+        <div className="absolute inset-0 z-30 flex justify-end bg-black/40 backdrop-blur-[1px]" onClick={() => setEpisodeDrawerOpen(false)}>
+          <div
+            ref={episodeDrawerRef}
+            onClick={(e) => e.stopPropagation()}
+            className="glass-panel flex h-full w-[min(88vw,380px)] flex-col overflow-hidden border-l border-white/10"
+          >
+            <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+              <p className="eyebrow text-brand">EPISODES</p>
+              <button
+                onClick={() => setEpisodeDrawerOpen(false)}
+                aria-label="Close episodes"
+                className="grid h-8 w-8 place-items-center rounded-full text-white/70 hover:bg-white/10 hover:text-white"
+              >
+                <svg viewBox="0 0 24 24" width={18} height={18} fill="none" stroke="currentColor" strokeWidth={2}><path d="M6 6l12 12M18 6 6 18" /></svg>
+              </button>
+            </div>
+            {loaded.details.seasons.length > 1 && (
+              <div className="flex gap-1.5 overflow-x-auto border-b border-white/10 px-3 py-2 scrollbar-none">
+                {loaded.details.seasons
+                  .slice()
+                  .sort((a, b) => a.number - b.number)
+                  .map((s) => (
+                    <button
+                      key={s.number}
+                      onClick={() => setActiveSeasonTab(s.number)}
+                      className={`mono-meta shrink-0 rounded-full px-3 py-1.5 text-xs font-bold tracking-widest transition ${activeSeasonTab === s.number ? "bg-brand text-white" : "bg-white/10 text-zinc-300 hover:bg-white/20"}`}
+                    >
+                      S{s.number}
+                    </button>
+                  ))}
+              </div>
+            )}
+            <div className="flex-1 overflow-y-auto p-3">
+              <div className="grid grid-cols-4 gap-2 sm:grid-cols-5">
+                {(() => {
+                  const seasonsSorted = loaded.details.seasons.slice().sort((a, b) => a.number - b.number);
+                  const activeSeason = seasonsSorted.find((s) => s.number === activeSeasonTab) ?? seasonsSorted[0];
+                  if (!activeSeason) return null;
+                  const eps = activeSeason.episodes.slice().sort((a, b) => a.number - b.number);
+                  return eps.map((ep) => {
+                    const isCurrent = activeSeason.number === season && ep.number === episode;
+                    return (
+                      <button
+                        key={`${activeSeason.number}-${ep.number}`}
+                        onClick={() => {
+                          setEpisodeDrawerOpen(false);
+                          router.push(`/watch/${provider}/${id}?s=${activeSeason.number}&e=${ep.number}`);
+                        }}
+                        className={`flex flex-col items-center justify-center rounded-lg border px-2 py-3 text-center transition ${isCurrent ? "border-brand bg-brand/20 text-brand" : "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/10"}`}
+                      >
+                        <span className="text-sm font-bold">{ep.number}</span>
+                        <span className="mt-0.5 line-clamp-1 max-w-full text-[10px] leading-tight opacity-70">{ep.title ?? `Episode ${ep.number}`}</span>
+                      </button>
+                    );
+                  });
+                })()}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Screen lock overlay (when locked) */}
+      {locked && (
+        <div
+          className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/55 backdrop-blur-[1px]"
+          onClick={handleLockTap}
+          onPointerDown={handleLockHoldStart}
+          onPointerUp={handleLockHoldEnd}
+          onPointerLeave={handleLockHoldEnd}
+          role="button"
+          tabIndex={0}
+          aria-label="Unlock"
+        >
+          <div className="flex flex-col items-center gap-3 rounded-2xl bg-black/70 px-6 py-5 ring-1 ring-white/15 backdrop-blur">
+            <LockIcon width={28} height={28} className="text-white" />
+            <p className="mono-meta text-xs font-bold tracking-[0.2em] text-white">SCREEN LOCKED</p>
+            <p className="text-center text-xs text-zinc-300">
+              {lockHint ? "Triple-tap or hold 1s to unlock" : "Tap to show unlock hint"}
+            </p>
+            {lockHint && <p className="mono-meta text-[11px] tracking-widest text-brand">Triple-tap or hold lock icon 1s</p>}
+            <button
+              onClick={(e) => { e.stopPropagation(); handleLockTap(); }}
+              onPointerDown={(e) => { e.stopPropagation(); handleLockHoldStart(); }}
+              onPointerUp={(e) => { e.stopPropagation(); handleLockHoldEnd(); }}
+              aria-label="Unlock screen"
+              className="mt-1 grid h-12 w-12 place-items-center rounded-full bg-white/10 ring-1 ring-white/20 transition hover:bg-white/20"
+            >
+              <UnlockIcon width={22} height={22} className="text-white" />
+            </button>
+          </div>
+        </div>
+      )}
+      {/* Stats overlay (mono) */}
+      {statsOpen && (
+        <StatsOverlay stats={statsSnapshotRef.current} />
+      )}
 
       {/* live-transcode status pill (always visible while transcoding) */}
       {transcodeActive && (
@@ -1833,12 +4434,29 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       )}
       {state === "paused" && !nextUp && !resumeAsk && (
         <button
-          onClick={togglePlay}
-          aria-label="Play"
+          onClick={() => {
+            if (endedRef.current) {
+              endedRef.current = false;
+              seekAbsoluteRef.current(0);
+              void videoRef.current?.play();
+              recordWatch(
+                { provider, id, season, episode, title: loaded?.details.title ?? label.replace(/ · S\d+ E\d+$/, ""), poster: loaded?.details.poster_url ?? null, mediaType: loaded?.details.media_type ?? (season > 0 ? "series" : "movie"), year: loaded?.details.year ?? null, position: 0, duration: absoluteDuration() },
+                authedRef.current,
+                false,
+              );
+            } else {
+              togglePlay();
+            }
+          }}
+          aria-label={endedRef.current ? "Replay" : "Play"}
           className="absolute inset-0 z-20 grid place-items-center"
         >
           <span className="grid h-24 w-24 place-items-center rounded-full bg-white/10 ring-1 ring-white/30 backdrop-blur-md transition hover:scale-105 hover:bg-white/20">
-            <PlayIcon width={38} height={38} className="translate-x-1 text-white" />
+            {endedRef.current ? (
+              <ReplayIcon width={38} height={38} className="translate-x-1 text-white" />
+            ) : (
+              <PlayIcon width={38} height={38} className="translate-x-1 text-white" />
+            )}
           </span>
         </button>
       )}
@@ -1901,7 +4519,11 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                   S{nextUp.season} E{nextUp.episode} · {nextUp.title}
                 </p>
               </div>
-              <span className="text-sm font-semibold text-zinc-300">{Math.max(0, nextCountdown.current)}s</span>
+              {autoplay ? (
+                <span className="text-sm font-semibold text-zinc-300">{Math.max(0, nextCountdown.current)}s</span>
+              ) : (
+                <span className="mono-meta text-xs font-semibold tracking-widest text-zinc-400">PAUSED</span>
+              )}
             </div>
             <div className="flex gap-3 p-5">
               <button
@@ -1917,6 +4539,21 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                 Cancel
               </button>
             </div>
+            <label className="flex cursor-pointer items-center gap-2 border-t border-white/10 px-5 py-3 text-sm text-zinc-300 hover:bg-white/[0.04]">
+              <input
+                type="checkbox"
+                checked={!autoplay}
+                onChange={(e) => {
+                  const dont = e.target.checked;
+                  const nextVal = !dont;
+                  setAutoplay(nextVal);
+                  try { setPrefs({ autoplay: nextVal }); } catch {}
+                  pokeControls();
+                }}
+                className="h-4 w-4 rounded border-white/20 bg-transparent accent-brand"
+              />
+              <span>Don&apos;t autoplay</span>
+            </label>
           </div>
         </div>
       )}
@@ -1928,9 +4565,35 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         }`}
       >
         <div className="px-5 pb-2 md:px-7">
-          <div className="relative mb-3 h-1.5 w-full rounded-full bg-white/20">
+          {skipChapter && (
+            <div className="pointer-events-auto absolute bottom-[88px] left-1/2 z-20 flex -translate-x-1/2 gap-2">
+              <button
+                onClick={() => {
+                  seekAbsoluteRef.current(skipChapter.end);
+                  flashNotice(skipChapter.kind === 'intro' ? "Intro skipped" : "Outro skipped");
+                  setSkipChapter(null);
+                  pokeControls();
+                }}
+                className="mono-meta rounded-full bg-white px-4 py-2 text-xs font-bold tracking-widest text-black shadow-lg transition hover:bg-zinc-200"
+              >
+                {skipChapter.kind === 'intro' ? "Skip Intro" : "Skip Outro"}
+              </button>
+            </div>
+          )}
+          <div
+            ref={seekWrapRef}
+            onPointerMove={handleSeekHoverMove}
+            onPointerLeave={handleSeekHoverLeave}
+            className="relative mb-3 h-1.5 w-full rounded-full bg-white/20"
+          >
             <div ref={bufferedFillRef} className="absolute inset-y-0 left-0 rounded-full bg-white/35" style={{ width: "0%" }} />
             <div ref={playedFillRef} className="absolute inset-y-0 left-0 rounded-full bg-brand" style={{ width: "0%" }} />
+            <div
+              ref={scrubTooltipRef}
+              className="pointer-events-none absolute -top-7 hidden rounded bg-black/85 px-1.5 py-0.5 text-[11px] font-semibold tabular-nums text-white backdrop-blur"
+              style={{ display: "none" }}
+              aria-hidden
+            />
             <input
               ref={seekRef}
               type="range"
@@ -1941,57 +4604,100 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
               aria-label="Seek"
               className="player-range absolute inset-0 h-full w-full cursor-pointer opacity-0"
               onPointerDown={(e) => {
-                // Only the primary pointer owns the drag; a second finger/mouse
-                // button must not hijack the preview or the pending pin.
+                if (lockedRef.current) {
+                  setLockHint(true);
+                  if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+                  lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+                  return;
+                }
                 if (!e.isPrimary) return;
                 if (e.pointerType === "mouse" && e.button !== 0) return;
                 draggingRef.current = true;
-                // A stale seek pin would yank the thumb back to the previous
-                // target on release; the drag preview owns the thumb now.
                 pendingSeekRef.current = null;
+                // fine-scrub baseline
+                const wrap = seekWrapRef.current;
+                if (wrap) {
+                  const rect = wrap.getBoundingClientRect();
+                  const dur = absoluteDuration();
+                  if (isSeekableDuration(dur)) {
+                    const x = e.clientX - rect.left;
+                    const clampedX = Math.max(0, Math.min(rect.width, x));
+                    const tpos = (clampedX / Math.max(rect.width, 1)) * dur;
+                    scrubStartXRef.current = e.clientX;
+                    scrubStartYRef.current = e.clientY;
+                    scrubGrabTimeRef.current = tpos;
+                    scrubModeRef.current = 'normal';
+                    // init slider to grab time so commitSeekFromRange lands at preview on quick tap
+                    e.currentTarget.value = String(Math.floor(tpos));
+                  } else {
+                    scrubStartXRef.current = e.clientX;
+                    scrubStartYRef.current = e.clientY;
+                    scrubGrabTimeRef.current = Number(seekRef.current?.value ?? 0);
+                    scrubModeRef.current = 'normal';
+                  }
+                } else {
+                  scrubStartXRef.current = e.clientX;
+                  scrubStartYRef.current = e.clientY;
+                  scrubGrabTimeRef.current = Number(seekRef.current?.value ?? 0);
+                  scrubModeRef.current = 'normal';
+                }
                 try {
                   e.currentTarget.setPointerCapture?.(e.pointerId);
-                } catch {
-                  // Capture unavailable: pointerup/leave fallbacks below settle it.
-                }
+                } catch {}
                 pokeControls();
               }}
               onPointerUp={(e) => {
                 if (!e.isPrimary) return;
+                scrubStartXRef.current = null;
+                scrubStartYRef.current = null;
+                scrubGrabTimeRef.current = null;
+                scrubModeRef.current = 'normal';
                 if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
                   try {
                     e.currentTarget.releasePointerCapture(e.pointerId);
-                  } catch {
-                    // Already released — commit below still runs.
-                  }
+                  } catch {}
                 }
                 commitSeekFromRange(e.currentTarget);
               }}
               onLostPointerCapture={(e) => {
-                // Capture loss without up/cancel: settle instead of stranding
-                // draggingRef=true. No-op after normal release (flag cleared).
-                if (draggingRef.current) commitSeekFromRange(e.currentTarget);
+                if (draggingRef.current) {
+                  scrubStartXRef.current = null;
+                  scrubStartYRef.current = null;
+                  scrubGrabTimeRef.current = null;
+                  commitSeekFromRange(e.currentTarget);
+                }
               }}
               onPointerLeave={(e) => {
-                // No-capture fallback: release outside never fires pointerup
-                // here, so buttons===0 means a missed release — commit last
-                // preview. Buttons held = drag live outside; await up/cancel.
-                if (draggingRef.current && e.buttons === 0 && e.isPrimary)
+                const tip = scrubTooltipRef.current;
+                if (tip) tip.style.display = "none";
+                if (draggingRef.current && e.buttons === 0 && e.isPrimary) {
+                  scrubStartXRef.current = null;
+                  scrubStartYRef.current = null;
+                  scrubGrabTimeRef.current = null;
                   commitSeekFromRange(e.currentTarget);
+                }
               }}
               onPointerCancel={(e) => {
                 if (!e.isPrimary) return;
                 draggingRef.current = false;
+                scrubStartXRef.current = null;
+                scrubStartYRef.current = null;
+                scrubGrabTimeRef.current = null;
+                scrubModeRef.current = 'normal';
                 pendingSeekRef.current = null;
-                // No commit: rAF repaints the true position next frame.
+                const tip = scrubTooltipRef.current;
+                if (tip) tip.style.display = "none";
               }}
               onKeyDown={(e) => {
-                // Never trap focus: Tab moves on natively; Escape blurs and
-                // bubbles to the window handler (subs/fullscreen/back).
-                // No stopPropagation/preventDefault by design.
                 if (e.key === "Escape") e.currentTarget.blur();
               }}
               onChange={(e) => {
+                if (lockedRef.current) {
+                  setLockHint(true);
+                  if (lockHintTimerRef.current != null) window.clearTimeout(lockHintTimerRef.current);
+                  lockHintTimerRef.current = window.setTimeout(() => setLockHint(false), 2500);
+                  return;
+                }
                 const target = e.currentTarget;
                 const max = Number(target.max || 0);
                 const v = Number(target.value);
@@ -1999,21 +4705,122 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                 const pct = seekProgressPct(v, max);
                 target.style.setProperty("--progress", `${pct}%`);
                 if (playedFillRef.current) playedFillRef.current.style.width = `${pct}%`;
-                if (timeRef.current) timeRef.current.textContent = formatClock(v);
-                // keyboard-driven changes never see a pointer grab: commit them
-                // (a keyboard change landing mid pointer-drag only previews;
-                // the release commits the merged final value — no seek storm)
+                if (timeRef.current) timeRef.current.textContent = timeModeRef.current === 'remaining' ? formatRemaining(v, max) : formatClock(v);
+                // during drag, keep grab time in sync with slider value so window move delta stays correct if user twitches via keyboard
+                if (draggingRef.current && scrubGrabTimeRef.current != null) {
+                  // no-op: window move owns preview when dy present; if drag without window trigger, keep slider value as ground truth
+                }
                 if (!draggingRef.current) commitSeekFromRange(target);
               }}
             />
+            {/* chapter notches — 01§1.7, absolute by start/duration pct, empty=zero notches */}
+            {(() => {
+              const chaps = (loaded?.streams as { chapters?: Chapter[] })?.chapters;
+              const dur = absoluteDuration();
+              if (!chaps?.length || !isSeekableDuration(dur)) return null;
+              return chaps.map((ch, idx) => {
+                const left = chapterLeftPct(ch.start, dur);
+                const w = chapterWidthPct(ch.start, ch.end, dur);
+                if (w <= 0) return null;
+                const isIntroOutro = ch.kind === 'intro' || ch.kind === 'outro';
+                return (
+                  <button
+                    key={`${ch.start}-${idx}-${ch.kind}`}
+                    aria-label={ch.label}
+                    title={ch.label}
+                    onClick={() => {
+                      void seekAbsoluteRef.current(ch.start + 0.1);
+                      pokeControls();
+                    }}
+                    className={`absolute top-0 h-full rounded-sm ${isIntroOutro ? "bg-brand" : "bg-white/40"} opacity-80 hover:opacity-100`}
+                    style={{ left: `${left}%`, width: `${Math.max(w, 0.6)}%` }}
+                  />
+                );
+              });
+            })()}
           </div>
           <div className="flex items-center gap-2 md:gap-3">
-            <button onClick={togglePlay} aria-label={state === "playing" ? "Pause" : "Play"} className="grid h-11 w-11 place-items-center rounded-full text-white transition hover:bg-white/15">
-              {state === "playing" ? (
+            <button
+              onClick={() => {
+                const s = loaded?.details.seasons ?? [];
+                const prev = prevEpisode(s, season, episode);
+                if (!prev) { flashNotice("No previous episode"); return; }
+                router.push(`/watch/${provider}/${id}?s=${prev.season}&e=${prev.episode}`);
+                pokeControls();
+              }}
+              aria-label="Previous episode"
+              className="grid h-11 w-11 place-items-center rounded-full text-white transition hover:bg-white/15 disabled:opacity-30"
+            >
+              <PrevEpIcon width={22} height={22} />
+            </button>
+            <button
+              onClick={() => seekBy(-seekStepRef.current)}
+              aria-label={`Back ${seekStep}s`}
+              className="grid h-11 w-11 place-items-center rounded-full text-white transition hover:bg-white/15"
+              title={`Back ${seekStep}s`}
+            >
+              <RewindIcon width={22} height={22} />
+            </button>
+            <button
+              onClick={() => {
+                if (endedRef.current && !nextUp) {
+                  endedRef.current = false;
+                  void seekAbsoluteRef.current(0);
+                  void videoRef.current?.play().catch(() => undefined);
+                  try {
+                    recordWatch(
+                      {
+                        provider,
+                        id,
+                        title: loaded?.details.title ?? label.replace(/ · S\d+ E\d+$/, ""),
+                        poster: loaded?.details.poster_url ?? null,
+                        mediaType: loaded?.details.media_type ?? (season > 0 ? "series" : "movie"),
+                        year: loaded?.details.year ?? null,
+                        season,
+                        episode,
+                        position: 0,
+                        duration: absoluteDuration(),
+                      },
+                      authedRef.current,
+                      false,
+                    );
+                  } catch {}
+                  pokeControls();
+                } else {
+                  togglePlay();
+                }
+              }}
+              aria-label={endedRef.current && !nextUp ? "Replay" : state === "playing" ? "Pause" : "Play"}
+              className="grid h-11 w-11 place-items-center rounded-full text-white transition hover:bg-white/15"
+            >
+              {endedRef.current && !nextUp ? (
+                <ReplayIcon width={26} height={26} />
+              ) : state === "playing" ? (
                 <svg viewBox="0 0 24 24" width={26} height={26} fill="currentColor"><path d="M7 4h3.5v16H7zM13.5 4H17v16h-3.5z" /></svg>
               ) : (
                 <PlayIcon width={26} height={26} className="translate-x-0.5" />
               )}
+            </button>
+            <button
+              onClick={() => seekBy(seekStepRef.current)}
+              aria-label={`Forward ${seekStep}s`}
+              className="grid h-11 w-11 place-items-center rounded-full text-white transition hover:bg-white/15"
+              title={`Forward ${seekStep}s`}
+            >
+              <ForwardIcon width={22} height={22} />
+            </button>
+            <button
+              onClick={() => {
+                const s = loaded?.details.seasons ?? [];
+                const next = nextEpisode(s, season, episode);
+                if (!next) { flashNotice("No next episode"); return; }
+                router.push(`/watch/${provider}/${id}?s=${next.season}&e=${next.episode}`);
+                pokeControls();
+              }}
+              aria-label="Next episode"
+              className="grid h-11 w-11 place-items-center rounded-full text-white transition hover:bg-white/15 disabled:opacity-30"
+            >
+              <NextEpIcon width={22} height={22} />
             </button>
             <button onClick={toggleMute} aria-label={muted ? "Unmute" : "Mute"} className="grid h-11 w-11 place-items-center rounded-full text-white transition hover:bg-white/15">
               {muted || volume === 0 ? <VolumeMuteIcon width={24} height={24} /> : <VolumeIcon width={24} height={24} />}
@@ -2028,7 +4835,71 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
               onChange={(e) => onVolume(Number(e.target.value))}
               className="w-20 accent-brand"
             />
-            {subOptions.length > 0 && (
+            <div ref={volMenuRef} className="relative">
+              <button
+                onClick={() => {
+                  setVolPopoverOpen((o) => !o);
+                  pokeControls();
+                }}
+                aria-label="Volume options"
+                aria-expanded={volPopoverOpen}
+                className={`grid h-9 w-9 place-items-center rounded-full border transition ${volPopoverOpen || volumeBoost || normalizeOn ? "border-brand bg-brand/15 text-brand" : "border-white/20 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                title="Volume boost & normalize"
+              >
+                <BoostIcon width={16} height={16} />
+              </button>
+              {volPopoverOpen && (
+                <div className="glass-panel absolute bottom-full right-0 z-30 mb-2 w-64">
+                  <p className="eyebrow px-3 pb-1.5 pt-2.5 text-brand">VOLUME</p>
+                  <ul className="max-h-72 overflow-y-auto pb-1">
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => void setVolumeBoostEnabled(!volumeBoost)}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${volumeBoost ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">Boost to 200%</span>
+                        {volumeBoost && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => void setNormalizeEnabled(!normalizeOn)}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${normalizeOn ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">Normalize loudness</span>
+                        {normalizeOn && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                  </ul>
+                </div>
+              )}
+            </div>
+            {/* hidden file input for side-load */}
+            <input
+              ref={(el) => { fileInputRef.current = el; }}
+              type="file"
+              accept=".srt,.vtt,.ass,.ssa,.ttml"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void handleSideLoadFile(f);
+                // reset so same file can be re-selected
+                try { e.currentTarget.value = ''; } catch {}
+              }}
+            />
+            {/* one-tap CC ON/OFF: only when tracks exist */}
+            {supportsSubs !== false && subOptions.length > 0 && (
+              <button
+                onClick={toggleCcQuick}
+                aria-label={chosenSub ? "Captions off" : "Captions on"}
+                className={`grid h-9 w-9 place-items-center rounded-full border text-xs font-bold tracking-widest transition ${chosenSub ? "border-brand bg-brand/15 text-brand" : "border-white/20 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                title={chosenSub ? "Captions ON — click to turn off" : "Captions OFF — click to turn on"}
+              >
+                <CcIcon width={16} height={16} />
+              </button>
+            )}
+            {/* CC menu: capability-gated — hide when provider declares no support */}
+            {supportsSubs !== false && (
               <div ref={subsMenuRef} className="relative">
                 <button
                   onClick={() => {
@@ -2043,12 +4914,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                       : "border-white/25 bg-white/5 text-zinc-200 hover:bg-white/10"
                   }`}
                 >
-                  CC
+                  <CcIcon width={18} height={18} />
                 </button>
                 {subsOpen && (
-                  <div className="glass-panel absolute bottom-full right-0 z-30 mb-2 w-64">
+                  <div className="glass-panel absolute bottom-full right-0 z-30 mb-2 w-72">
                     <p className="eyebrow px-3 pb-1.5 pt-2.5 text-brand">SUBTITLES</p>
-                    <ul className="max-h-72 overflow-y-auto pb-1">
+                    <ul className="max-h-[min(60vh,28rem)] overflow-y-auto pb-1">
                       <li className="hairline-t">
                         <button
                           onClick={() => chooseSubtitle(null)}
@@ -2060,32 +4931,415 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                           {!chosenSub && <CheckIcon width={14} height={14} />}
                         </button>
                       </li>
-                      {subOptions.map((opt) => {
-                        const isActive = chosenSub?.url === opt.url;
-                        return (
-                          <li key={opt.url} className="hairline-t">
+                      {subOptions.length === 0 ? (
+                        <li className="hairline-t px-3 py-2.5 text-xs text-zinc-500">No subtitles available</li>
+                      ) : (
+                        subOptions.map((opt) => {
+                          const isActive = chosenSub?.url === opt.url;
+                          const badges: string[] = [];
+                          if (opt.format) badges.push(opt.format.toUpperCase());
+                          if (opt.forced) badges.push("FORCED");
+                          if (opt.sdh) badges.push("SDH");
+                          if (opt.provider) badges.push(opt.provider.toUpperCase());
+                          if (opt.source === 'manifest') badges.push("Manifest");
+                          if (opt.source === 'local') badges.push("Local");
+                          if (opt.source === 'search') badges.push("Search");
+                          return (
+                            <li key={opt.url + ':' + (opt.language ?? opt.name)} className="hairline-t">
+                              <button
+                                onClick={() => chooseSubtitle(opt)}
+                                className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${
+                                  isActive ? "text-brand" : "text-zinc-200"
+                                }`}
+                              >
+                                <span className="flex min-w-0 flex-col">
+                                  <span className="truncate text-xs">{opt.name}</span>
+                                  {badges.length > 0 && (
+                                    <span className="mono-meta mt-0.5 flex flex-wrap gap-1 text-[9px] tracking-widest text-zinc-500">
+                                      {badges.map((b) => (
+                                        <span key={b} className="rounded-[2px] border border-white/15 px-1 py-px">{b}</span>
+                                      ))}
+                                    </span>
+                                  )}
+                                </span>
+                                {isActive && <CheckIcon width={14} height={14} />}
+                              </button>
+                            </li>
+                          );
+                        })
+                      )}
+                      <li className="hairline-t">
+                        <button
+                          onClick={() => {
+                            fileInputRef.current?.click();
+                            setSubsOpen(false);
+                          }}
+                          className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-xs text-zinc-300 transition hover:bg-white/10 hover:text-white"
+                        >
+                          <span>Load subtitle file…</span>
+                        </button>
+                      </li>
+                      <li className="hairline-t">
+                        <button
+                          onClick={() => {
+                            setSearchOpen((o) => !o);
+                            pokeControls();
+                          }}
+                          className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left text-xs text-zinc-300 transition hover:bg-white/10 hover:text-white"
+                          aria-expanded={searchOpen}
+                        >
+                          <span>Search subtitles…</span>
+                          {searchResults.length > 0 && (
+                            <span className="mono-meta rounded-full bg-brand/20 px-1.5 py-0.5 text-[10px] font-bold tracking-widest text-brand">{searchResults.length}</span>
+                          )}
+                        </button>
+                      </li>
+                      {searchOpen && (
+                        <li className="hairline-t px-3 py-2.5">
+                          <div className="flex flex-wrap gap-1.5">
+                            {(['opensubtitles','subscene','aniskip','jimaku'] as const).map((p) => (
+                              <button
+                                key={p}
+                                onClick={() => setSearchProvider(p)}
+                                className={`rounded-full border px-2.5 py-1 text-[11px] font-bold capitalize tracking-widest transition ${searchProvider===p ? "border-brand bg-brand/15 text-brand" : "border-white/15 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                              >
+                                {p}
+                              </button>
+                            ))}
+                          </div>
+                          <button
+                            onClick={() => void runSubtitleSearch()}
+                            disabled={searchLoading}
+                            className="mt-2 w-full rounded-md bg-brand px-3 py-2 text-xs font-bold text-white transition hover:bg-brand/90 disabled:opacity-50"
+                          >
+                            {searchLoading ? "Searching…" : `Search ${searchProvider}`}
+                          </button>
+                          {searchResults.length > 0 && (
+                            <ul className="mt-2 max-h-40 overflow-y-auto rounded-md border border-white/10">
+                              {searchResults.map((opt) => {
+                                const isActive = chosenSub?.url === opt.url;
+                                return (
+                                  <li key={"search-"+opt.url} className="hairline-t first:*:border-t-0">
+                                    <button
+                                      onClick={() => chooseSubtitle(opt)}
+                                      className={`flex w-full items-center justify-between gap-2 px-2.5 py-2 text-left transition hover:bg-white/10 ${isActive ? "text-brand" : "text-zinc-200"}`}
+                                    >
+                                      <span className="truncate text-xs">{opt.name}</span>
+                                      <span className="mono-meta shrink-0 rounded-[2px] border border-white/15 px-1 py-px text-[9px] tracking-widest text-zinc-500">{(opt.format ?? opt.provider ?? "Search").toUpperCase()}</span>
+                                    </button>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          )}
+                        </li>
+                      )}
+                      {/* Dual toggle + Second subtitle section */}
+                      <li className="hairline-t px-3 py-2.5">
+                        <label className="flex cursor-pointer items-center justify-between gap-3">
+                          <span className="text-xs text-zinc-200">Dual subtitles</span>
+                          <input
+                            type="checkbox"
+                            checked={dualSubs}
+                            onChange={(e) => toggleDual(e.target.checked)}
+                            className="h-4 w-4 rounded border-white/20 bg-transparent accent-brand"
+                          />
+                        </label>
+                      </li>
+                      {dualSubs && (
+                        <>
+                          <li className="hairline-t">
+                            <div className="px-3 pb-1 pt-2.5">
+                              <p className="mono-meta text-[10px] font-bold tracking-[0.18em] text-zinc-400">SECOND SUBTITLE</p>
+                            </div>
+                          </li>
+                          <li className="hairline-t">
                             <button
-                              onClick={() => chooseSubtitle(opt)}
-                              className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${
-                                isActive ? "text-brand" : "text-zinc-200"
-                              }`}
+                              onClick={() => chooseSecondSubtitle(null)}
+                              className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${!chosenSub2 ? "text-brand" : "text-zinc-300"}`}
                             >
-                              <span className="truncate text-xs">{opt.name}</span>
-                              {isActive && <CheckIcon width={14} height={14} />}
+                              <span className="mono-meta text-xs tracking-widest">OFF</span>
+                              {!chosenSub2 && <CheckIcon width={14} height={14} />}
                             </button>
                           </li>
-                        );
-                      })}
+                          {subOptions.map((opt) => {
+                            const isActive2 = chosenSub2?.url === opt.url;
+                            const isPrimary = chosenSub?.url === opt.url;
+                            if (isPrimary) return null;
+                            const badges2: string[] = [];
+                            if (opt.format) badges2.push(opt.format.toUpperCase());
+                            if (opt.forced) badges2.push("FORCED");
+                            if (opt.sdh) badges2.push("SDH");
+                            return (
+                              <li key={"dual-"+opt.url + ':' + (opt.language ?? opt.name)} className="hairline-t">
+                                <button
+                                  onClick={() => chooseSecondSubtitle(opt)}
+                                  className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${isActive2 ? "text-brand" : "text-zinc-200"}`}
+                                >
+                                  <span className="flex min-w-0 flex-col">
+                                    <span className="truncate text-xs">{opt.name}</span>
+                                    {badges2.length>0 && (
+                                      <span className="mono-meta mt-0.5 flex flex-wrap gap-1 text-[9px] tracking-widest text-zinc-500">
+                                        {badges2.map((b)=>(<span key={b} className="rounded-[2px] border border-white/15 px-1 py-px">{b}</span>))}
+                                      </span>
+                                    )}
+                                  </span>
+                                  {isActive2 && <CheckIcon width={14} height={14} />}
+                                </button>
+                              </li>
+                            );
+                          })}
+                        </>
+                      )}
+                      {/* Sync offset slider(s) */}
+                      <li className="hairline-t px-3 py-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-zinc-300">Sync primary</span>
+                          <span className="mono-meta text-xs font-bold text-brand">{subOffsetMs>0?'+':''}{subOffsetMs}ms</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={-2000}
+                          max={2000}
+                          step={50}
+                          value={subOffsetMs}
+                          onChange={(e) => {
+                            const v = clampOffset(Number(e.target.value));
+                            subOffsetMsRef.current=v; setSubOffsetMs(v);
+                            // live preview for overlay
+                            if (primaryCues.length>0 || secondaryCues.length>0) {
+                              overlayNowRef.current = videoRef.current?.currentTime ?? overlayNow;
+                              setOverlayNow(overlayNowRef.current);
+                            }
+                          }}
+                          onPointerUp={(e) => {
+                            const v = clampOffset(Number((e.target as HTMLInputElement).value));
+                            persistOffset('subOffsetMs', v);
+                            const need = needsOverlay(chosenSubRef.current?.format ?? null, chosenSub2Ref.current?.format ?? null, dualSubsRef2.current && !!chosenSub2Ref.current, (subFilterRef.current ?? 'all') !== 'all' ? 'signs':'all');
+                            const videoEl = videoRef.current;
+                            if (!need && subTrackRef.current && videoEl && chosenSubRef.current) {
+                              const cues = subTrackRef.current.cues ? [...subTrackRef.current.cues] : [...primaryCuesRef.current];
+                              if (cues.length) {
+                                    subTrackRef.current.cleanup();
+                                const state = attachSubtitleTrack(videoEl, chosenSubRef.current.name, cues,{offsetMs: v, source:'native'});
+                                subTrackRef.current=state;
+                              }
+                            }
+                            const sign = v>0?'+':''; flashNotice(`Subs ${sign}${v}ms`);
+                          }}
+                          className="mt-2 w-full accent-brand"
+                          aria-label="Subtitle sync offset"
+                        />
+                        <div className="mt-1 flex justify-between text-[10px] text-zinc-500"><span>-2000ms</span><span>+2000ms</span></div>
+                      </li>
+                      {dualSubs && chosenSub2 && (
+                        <li className="hairline-t px-3 py-2.5">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs text-zinc-300">Sync secondary</span>
+                            <span className="mono-meta text-xs font-bold text-brand">{subOffsetMs2>0?'+':''}{subOffsetMs2}ms</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={-2000}
+                            max={2000}
+                            step={50}
+                            value={subOffsetMs2}
+                            onChange={(e) => {
+                              const v=clampOffset(Number(e.target.value));
+                              subOffsetMs2Ref.current=v; setSubOffsetMs2(v);
+                              overlayNowRef.current = videoRef.current?.currentTime ?? overlayNow;
+                              setOverlayNow(overlayNowRef.current);
+                            }}
+                            onPointerUp={(e)=>{ const v=clampOffset(Number((e.target as HTMLInputElement).value)); persistOffset('subOffsetMs2',v); const sign=v>0?'+':''; flashNotice(`Subs2 ${sign}${v}ms`); }}
+                            className="mt-2 w-full accent-brand"
+                            aria-label="Secondary subtitle sync offset"
+                          />
+                        </li>
+                      )}
+                      {/* Style section */}
+                      <li className="hairline-t px-3 pb-1 pt-2.5">
+                        <p className="eyebrow !text-brand text-[10px]">STYLE</p>
+                      </li>
+                      <li className="hairline-t px-3 py-2.5">
+                        <span className="text-xs text-zinc-300">Font</span>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {(['sans','serif','mono','anime'] as const).map((f) => (
+                            <button
+                              key={f}
+                              onClick={()=> updateSubStyle({ font: f })}
+                              className={`rounded-full border px-2.5 py-1 text-[11px] font-bold capitalize tracking-widest transition ${subStyle.font===f ? "border-brand bg-brand/15 text-brand" : "border-white/15 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                            >
+                              {f}
+                            </button>
+                          ))}
+                        </div>
+                      </li>
+                      <li className="hairline-t px-3 py-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-zinc-300">Scale</span>
+                          <span className="mono-meta text-xs font-bold text-brand">{Math.round(subStyle.scale*100)}%</span>
+                        </div>
+                        <input type="range" min={0.5} max={2} step={0.05} value={subStyle.scale} onChange={(e)=> updateSubStyle({ scale: Number(e.target.value)})} className="mt-2 w-full accent-brand" aria-label="Subtitle scale" />
+                        <div className="mt-1 flex justify-between text-[10px] text-zinc-500"><span>50%</span><span>200%</span></div>
+                      </li>
+                      <li className="hairline-t px-3 py-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-zinc-300">Text color</span>
+                          <span className="text-[11px] text-zinc-500">{subStyle.color}</span>
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {['#ffffff','#ffff00','#00ffff','#ffcc00','#ff5a5a','#a0ff6b','#111111'].map((c)=> (
+                            <button key={c} aria-label={`Pick color ${c}`} onClick={()=> updateSubStyle({ color: c })} className={`h-7 w-7 rounded-full border-2 transition ${subStyle.color.toLowerCase()===c.toLowerCase() ? "border-brand scale-110" : "border-white/15 hover:border-white/30"}`} style={{ background:c }} />
+                          ))}
+                        </div>
+                      </li>
+                      <li className="hairline-t px-3 py-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-zinc-300">Background opacity</span>
+                          <span className="mono-meta text-xs font-bold text-brand">{Math.round(subStyle.bgOpacity*100)}%</span>
+                        </div>
+                        <input type="range" min={0} max={1} step={0.05} value={subStyle.bgOpacity} onChange={(e)=> updateSubStyle({ bgOpacity: Number(e.target.value)})} className="mt-2 w-full accent-brand" aria-label="Background opacity" />
+                      </li>
+                      <li className="hairline-t px-3 py-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs text-zinc-300">Y-offset</span>
+                          <span className="mono-meta text-xs font-bold text-brand">{subStyle.yOffset>0?'+':''}{subStyle.yOffset}%</span>
+                        </div>
+                        <input type="range" min={-20} max={20} step={1} value={subStyle.yOffset} onChange={(e)=> updateSubStyle({ yOffset: Number(e.target.value)})} className="mt-2 w-full accent-brand" aria-label="Subtitle Y offset" />
+                        <div className="mt-1 flex justify-between text-[10px] text-zinc-500"><span>-20%</span><span>+20%</span></div>
+                      </li>
+                      <li className="hairline-t px-3 py-2.5">
+                        <span className="text-xs text-zinc-300">Stroke color</span>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {['#000000','#ffffff','#ff00ff','#00ffff','#ffff00','#333333'].map((c)=> (
+                            <button key={'stroke-'+c} aria-label={`Pick stroke ${c}`} onClick={()=> updateSubStyle({ stroke: c })} className={`h-7 w-7 rounded-full border-2 transition ${subStyle.stroke.toLowerCase()===c.toLowerCase() ? "border-brand scale-110" : "border-white/15 hover:border-white/30"}`} style={{ background:c }} />
+                          ))}
+                        </div>
+                      </li>
+                      <li className="hairline-t px-3 py-2.5">
+                        <span className="text-xs text-zinc-300">Weight</span>
+                        <div className="mt-2 flex gap-1.5">
+                          {(['normal','bold'] as const).map((w)=> (
+                            <button key={w} onClick={()=> updateSubStyle({ weight: w })} className={`flex-1 rounded-full border px-2.5 py-1.5 text-xs font-bold capitalize tracking-widest transition ${subStyle.weight===w ? "border-brand bg-brand/15 text-brand" : "border-white/15 bg-white/5 text-zinc-300 hover:bg-white/10"}`}>{w}</button>
+                          ))}
+                        </div>
+                      </li>
+                      {/* Signs-only filter (P4): classifyCue kinds dialogue vs sign/song */}
+                      <li className="hairline-t px-3 py-2.5">
+                        <label className="flex cursor-pointer items-center justify-between gap-3">
+                          <span className="text-xs text-zinc-200">Signs / lyrics only</span>
+                          <input
+                            type="checkbox"
+                            checked={subFilter === 'signs'}
+                            onChange={(e) => toggleSubFilter(e.target.checked ? 'signs' : 'all')}
+                            className="h-4 w-4 rounded border-white/20 bg-transparent accent-brand"
+                          />
+                        </label>
+                        <p className="mono-meta mt-1 text-[10px] tracking-widest text-zinc-500">Hides dialogue, shows signs & songs</p>
+                      </li>
                     </ul>
                   </div>
                 )}
               </div>
             )}
-            <span className="ml-1 text-sm tabular-nums text-zinc-300">
+            <div ref={speedMenuRef} className="relative">
+              <button
+                onClick={() => {
+                  setSpeedOpen((o) => !o);
+                  pokeControls();
+                }}
+                aria-label="Playback speed"
+                aria-expanded={speedOpen}
+                className={`mono-meta h-8 border px-2.5 text-xs font-bold tracking-[0.15em] transition ${speedOpen || playbackRate !== 1 ? "border-brand bg-brand/15 text-brand" : "border-white/25 bg-white/5 text-zinc-200 hover:bg-white/10"}`}
+              >
+                {playbackRate.toFixed(2).replace(/\.?0+$/, "")}×
+              </button>
+              {speedOpen && (
+                <div className="glass-panel absolute bottom-full right-0 z-30 mb-2 w-64">
+                  <p className="eyebrow px-3 pb-1.5 pt-2.5 text-brand">SPEED</p>
+                  <ul className="max-h-72 overflow-y-auto pb-1">
+                    {SPEED_PRESETS.map((preset) => {
+                      const isActive = nearestPreset(playbackRate) === preset;
+                      return (
+                        <li key={preset} className="hairline-t">
+                          <button
+                            onClick={() => setRate(preset)}
+                            className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${isActive ? "text-brand" : "text-zinc-200"}`}
+                          >
+                            <span className="text-xs">{preset}×</span>
+                            {isActive && <CheckIcon width={14} height={14} />}
+                          </button>
+                        </li>
+                      );
+                    })}
+                    {playbackRate !== nearestPreset(playbackRate) && (
+                      <li className="hairline-t">
+                        <button
+                          onClick={() => setRate(playbackRate)}
+                          className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left text-brand transition hover:bg-white/10"
+                        >
+                          <span className="text-xs">Custom {playbackRate.toFixed(2).replace(/\.?0+$/, "")}×</span>
+                          <CheckIcon width={14} height={14} />
+                        </button>
+                      </li>
+                    )}
+                    <li className="hairline-t px-3 py-2.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-zinc-300">Custom</span>
+                        <span className="mono-meta text-xs font-bold text-brand">{playbackRate.toFixed(2)}×</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0.25}
+                        max={3.0}
+                        step={0.05}
+                        value={playbackRate}
+                        onChange={(e) => setRate(Number(e.target.value))}
+                        className="mt-2 w-full accent-brand"
+                        aria-label="Playback speed"
+                      />
+                    </li>
+                    <li className="hairline-t">
+                      <button
+                        onClick={togglePitchLock}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${pitchLock ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">Pitch lock</span>
+                        {pitchLock && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => void toggleSmartSpeed(!smartSpeed)}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${smartSpeed ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="flex flex-col">
+                          <span className="text-xs">Smart speed</span>
+                          <span className="mono-meta text-[10px] tracking-widest text-zinc-500">Silence → 1.8× (resumes on speech)</span>
+                        </span>
+                        {smartSpeed && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                  </ul>
+                </div>
+              )}
+            </div>
+            <button
+              onClick={() => {
+                const nextMode: TimeMode = timeModeRef.current === 'elapsed' ? 'remaining' : 'elapsed';
+                setTimeModeState(nextMode);
+                timeModeRef.current = nextMode;
+                try { setPrefs({ timeMode: nextMode }); } catch {}
+                pokeControls();
+              }}
+              aria-label="Toggle remaining time"
+              className="ml-1 rounded px-1 text-sm tabular-nums text-zinc-300 transition hover:bg-white/10 hover:text-white"
+              title="Toggle remaining time"
+            >
               <span ref={timeRef}>0:00</span>
               <span className="mx-1 text-zinc-600">/</span>
               <span ref={durationRef} data-d="-1">–:––</span>
-            </span>
+            </button>
 
             {qualityChoices.length > 1 && (
               <div className="ml-auto hidden items-center gap-1.5 sm:flex">
@@ -2117,6 +5371,169 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
               </div>
             )}
 
+            <div ref={aspectMenuRef} className="relative">
+              <button
+                onClick={() => {
+                  setAspectOpen((o) => !o);
+                  pokeControls();
+                }}
+                aria-label="Aspect ratio"
+                aria-expanded={aspectOpen}
+                className={`grid h-9 w-9 place-items-center rounded-full border transition ${aspectOpen ? "border-brand bg-brand/15 text-brand" : "border-white/20 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                title="Aspect: Fit / Fill / Stretch"
+              >
+                <AspectIcon width={16} height={16} />
+              </button>
+              {aspectOpen && (
+                <div className="glass-panel absolute bottom-full right-0 z-30 mb-2 w-64">
+                  <p className="eyebrow px-3 pb-1.5 pt-2.5 text-brand">ASPECT</p>
+                  <ul className="pb-1">
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => {
+                          applyAspect("contain");
+                          setAspectOpen(false);
+                        }}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${aspectModeState === "contain" ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">Fit</span>
+                        {aspectModeState === "contain" && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => {
+                          applyAspect("cover");
+                          setAspectOpen(false);
+                        }}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${aspectModeState === "cover" ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">Fill</span>
+                        {aspectModeState === "cover" && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => {
+                          applyAspect("fill");
+                          setAspectOpen(false);
+                        }}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${aspectModeState === "fill" ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">Stretch</span>
+                        {aspectModeState === "fill" && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                  </ul>
+                </div>
+              )}
+            </div>
+            <div ref={filterMenuRef} className="relative">
+              <button
+                onClick={() => {
+                  setFilterOpen((o) => !o);
+                  pokeControls();
+                }}
+                aria-label="Video filters"
+                aria-expanded={filterOpen}
+                className={`grid h-9 w-9 place-items-center rounded-full border transition ${filterOpen || filterMode !== "none" || nightDim > 0 ? "border-brand bg-brand/15 text-brand" : "border-white/20 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                title="Filters & dimmer"
+              >
+                <GearIcon width={16} height={16} />
+              </button>
+              {filterOpen && (
+                <div className="glass-panel absolute bottom-full right-0 z-30 mb-2 w-64">
+                  <p className="eyebrow px-3 pb-1.5 pt-2.5 text-brand">FILTERS</p>
+                  <ul className="pb-1">
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => applyFilter("none")}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${filterMode === "none" ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">None</span>
+                        {filterMode === "none" && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => applyFilter("anime")}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${filterMode === "anime" ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">Anime pop</span>
+                        {filterMode === "anime" && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                    <li className="hairline-t">
+                      <button
+                        onClick={() => applyFilter("contrast")}
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-white/10 ${filterMode === "contrast" ? "text-brand" : "text-zinc-200"}`}
+                      >
+                        <span className="text-xs">High contrast</span>
+                        {filterMode === "contrast" && <CheckIcon width={14} height={14} />}
+                      </button>
+                    </li>
+                    <li className="hairline-t px-3 py-2.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-zinc-300">Dimmer</span>
+                        <span className="mono-meta text-xs font-bold text-brand">{Math.round(nightDim * 100)}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={nightDim}
+                        onChange={(e) => setNightDim(Number(e.target.value))}
+                        className="mt-2 w-full accent-brand"
+                        aria-label="Night dimmer"
+                      />
+                    </li>
+                  </ul>
+                </div>
+              )}
+            </div>
+            <button
+              onClick={() => void togglePip()}
+              aria-label={pipActive ? "Exit Picture-in-Picture" : "Picture-in-Picture"}
+              className={`grid h-9 w-9 place-items-center rounded-full border transition ${pipActive ? "border-brand bg-brand/15 text-brand" : "border-white/20 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+              title="Picture-in-Picture"
+            >
+              <PipIcon width={16} height={16} />
+            </button>
+            {canAirPlay ? (
+              <button
+                onClick={showAirPlay}
+                aria-label="AirPlay"
+                className="grid h-9 w-9 place-items-center rounded-full border border-white/20 bg-white/5 text-zinc-300 transition hover:bg-white/10"
+                title="AirPlay"
+              >
+                <CastIcon width={16} height={16} />
+              </button>
+            ) : null}
+            <button
+              onClick={() => {
+                const next = !statsOpen;
+                setStatsOpen(next);
+                try {
+                  setPrefs({ statsOpen: next });
+                } catch {}
+                if (next) {
+                  const v = videoRef.current;
+                  if (v) {
+                    const snap = sampleStats(v, hlsRef.current ?? null, dashRef.current ?? null);
+                    statsSnapshotRef.current = snap;
+                    setStatsTick((x) => x + 1);
+                  }
+                }
+                pokeControls();
+              }}
+              aria-label="Stats for nerds"
+              aria-pressed={statsOpen}
+              className={`grid h-9 w-9 place-items-center rounded-full border transition ${statsOpen ? "border-brand bg-brand/15 text-brand" : "border-white/20 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+              title="Stats for nerds"
+            >
+              <StatsIcon width={16} height={16} />
+            </button>
             <div className="ml-auto flex items-center gap-2 sm:ml-0">
               <button onClick={toggleFullscreen} aria-label="Fullscreen" className="grid h-11 w-11 place-items-center rounded-full text-white transition hover:bg-white/15">
                 {fullscreen ? <FullscreenExitIcon width={24} height={24} /> : <FullscreenIcon width={24} height={24} />}

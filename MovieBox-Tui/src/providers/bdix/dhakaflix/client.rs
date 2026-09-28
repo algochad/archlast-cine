@@ -319,6 +319,7 @@ impl DhakaFlixClient {
             genres: vec![],
             seasons: vec![],
             dubs: vec![],
+            anime_ids: None,
         })
     }
 

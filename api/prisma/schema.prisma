@@ -14,6 +14,7 @@ model User {
   passwordHash   String
   region         String           @default("ph")
   provider       String           @default("moviebox")
+  settings       Json             @default("{}")
   createdAt      DateTime         @default(now())
   history        WatchHistory[]
   myList         MyList[]

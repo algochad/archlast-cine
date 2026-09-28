@@ -182,6 +182,7 @@ impl CircleFtpClient {
             genres,
             seasons,
             dubs: vec![],
+            anime_ids: None,
         })
     }
 

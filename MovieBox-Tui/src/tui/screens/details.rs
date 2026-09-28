@@ -2003,6 +2003,7 @@ mod tests {
                 genres: vec!["Sci-Fi".to_string()],
                 seasons: vec![],
                 dubs: vec![],
+                anime_ids: None,
             }),
             selected_resources: vec![
                 Release {
@@ -2113,6 +2114,7 @@ mod tests {
                 genres: vec!["Sci-Fi".to_string()],
                 seasons: vec![],
                 dubs: vec![],
+                anime_ids: None,
             }),
             selected_resources: vec![
                 Release {
@@ -2232,6 +2234,7 @@ mod tests {
                 genres: vec![],
                 seasons: vec![],
                 dubs: vec![],
+                anime_ids: None,
             }),
             ..Default::default()
         };
@@ -2344,6 +2347,7 @@ mod tests {
                     ],
                 }],
                 dubs: vec![],
+                anime_ids: None,
             }),
             available_seasons: vec![Season {
                 number: 1,
@@ -2419,6 +2423,7 @@ mod tests {
                     episodes: vec![],
                 }],
                 dubs: vec![],
+                anime_ids: None,
             }),
             available_seasons: vec![Season {
                 number: 1,
@@ -2500,6 +2505,7 @@ mod tests {
                         label: "Hindi".to_string(),
                     },
                 ],
+                anime_ids: None,
             }),
             basic_terminal: false,
             ..Default::default()
@@ -2549,6 +2555,7 @@ mod tests {
                     AudioTrackOption { subject_id: "3".to_string(), language: "Spanish (LA)".to_string(), label: "Spanish (LA)".to_string() },
                     AudioTrackOption { subject_id: "4".to_string(), language: "Portuguese (Brazil)".to_string(), label: "Portuguese (Brazil)".to_string() },
                 ],
+                anime_ids: None,
             }),
             available_seasons: vec![Season {
                 number: 1,
@@ -2609,6 +2616,7 @@ mod tests {
                     label: "Hindi dub".to_string(),
                 },
             ],
+            anime_ids: None,
         };
 
         let area = Rect::new(0, 0, 120, 30);
@@ -2655,6 +2663,7 @@ mod tests {
                         label: "Hindi dub".to_string(),
                     },
                 ],
+                anime_ids: None,
             }),
             ..Default::default()
         };
@@ -2717,6 +2726,7 @@ mod tests {
                         label: "Hindi".to_string(),
                     },
                 ],
+                anime_ids: None,
             }),
             language_chosen: true,
             has_streams_settled: false,
@@ -2788,6 +2798,7 @@ mod tests {
                 genres: vec![],
                 seasons: vec![],
                 dubs: vec![],
+                anime_ids: None,
             }),
             ..Default::default()
         };
@@ -2855,6 +2866,7 @@ mod tests {
                         label: "Portuguese (BR)".to_string(),
                     },
                 ],
+                anime_ids: None,
             }),
             ..Default::default()
         };
@@ -2952,6 +2964,7 @@ mod tests {
                         label: "Hindi".to_string(),
                     },
                 ],
+                anime_ids: None,
             }),
             selected_resources: vec![Release {
                 provider: ProviderKind::MovieBox,

@@ -123,6 +123,15 @@ pub struct AudioTrackOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimeIds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anilist_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mal_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaDetails {
     pub id: ProviderMediaId,
     pub title: String,
@@ -140,6 +149,8 @@ pub struct MediaDetails {
     pub genres: Vec<String>,
     pub seasons: Vec<Season>,
     pub dubs: Vec<AudioTrackOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "animeIds")]
+    pub anime_ids: Option<AnimeIds>,
 }
 
 impl MediaDetails {
@@ -201,6 +212,7 @@ impl MediaDetails {
                 genres: vec![],
                 seasons: vec![],
                 dubs: vec![],
+                anime_ids: None,
             }
         }
     }
@@ -218,6 +230,18 @@ pub struct SourceMirror {
 pub struct SubtitleOption {
     pub name: String,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdh: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

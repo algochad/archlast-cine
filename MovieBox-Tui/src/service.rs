@@ -202,12 +202,12 @@ impl MovieBoxService {
         sibling_ids: &[String],
     ) -> Result<Vec<crate::providers::models::SubtitleOption>, String> {
         let mut all_captions = Vec::new();
-        let mut seen_urls = std::collections::HashSet::new();
+        let mut seen_keys = std::collections::HashSet::new();
 
         if let Ok(payload) = self.client.get_ext_captions(subject_id, resource_id).await {
             Self::append_unique_captions(
                 &mut all_captions,
-                &mut seen_urls,
+                &mut seen_keys,
                 crate::providers::moviebox::adapt::captions_json_to_options(&payload),
             );
         }
@@ -249,15 +249,27 @@ impl MovieBoxService {
             if !sibling_futs.is_empty() {
                 let sibling_results = futures::future::join_all(sibling_futs).await;
                 for res in sibling_results {
-                    Self::append_unique_captions(&mut all_captions, &mut seen_urls, res);
+                    Self::append_unique_captions(&mut all_captions, &mut seen_keys, res);
                 }
             }
         }
+        // Language-dedupe widened to (url, language, format, forced, sdh) so
+        // forced/SDH variants of the same language are not collapsed.
         let mut deduplicated: Vec<crate::providers::models::SubtitleOption> = Vec::new();
-        let mut seen_languages = std::collections::HashSet::new();
+        let mut seen_composite = std::collections::HashSet::new();
         for sub in all_captions {
-            let sanitized_lang = crate::tui::text::sanitize_language_label(&sub.name);
-            if seen_languages.insert(sanitized_lang) {
+            let lang_key = sub
+                .language
+                .clone()
+                .unwrap_or_else(|| crate::tui::text::sanitize_language_label(&sub.name));
+            let key = (
+                sub.url.clone(),
+                lang_key,
+                sub.format.clone().unwrap_or_default(),
+                sub.forced.unwrap_or(false),
+                sub.sdh.unwrap_or(false),
+            );
+            if seen_composite.insert(key) {
                 deduplicated.push(sub);
             }
         }
@@ -279,11 +291,22 @@ impl MovieBoxService {
 
     fn append_unique_captions(
         target: &mut Vec<crate::providers::models::SubtitleOption>,
-        seen_urls: &mut std::collections::HashSet<String>,
+        seen: &mut std::collections::HashSet<(String, String, String, bool, bool)>,
         opts: Vec<crate::providers::models::SubtitleOption>,
     ) {
         for opt in opts {
-            if seen_urls.insert(opt.url.clone()) {
+            let lang_key = opt
+                .language
+                .clone()
+                .unwrap_or_else(|| crate::tui::text::sanitize_language_label(&opt.name));
+            let key = (
+                opt.url.clone(),
+                lang_key,
+                opt.format.clone().unwrap_or_default(),
+                opt.forced.unwrap_or(false),
+                opt.sdh.unwrap_or(false),
+            );
+            if seen.insert(key) {
                 target.push(opt);
             }
         }

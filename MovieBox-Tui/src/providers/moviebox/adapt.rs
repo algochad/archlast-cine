@@ -11,7 +11,7 @@ pub fn captions_json_to_options(payload: &serde_json::Value) -> Vec<SubtitleOpti
     else {
         return Vec::new();
     };
-    let mut seen_urls = std::collections::HashSet::new();
+    let mut seen_keys = std::collections::HashSet::new();
     captions
         .iter()
         .filter_map(|cap| {
@@ -43,12 +43,61 @@ pub fn captions_json_to_options(payload: &serde_json::Value) -> Vec<SubtitleOpti
             if raw_name.eq_ignore_ascii_case("in") && (size == 0 || size <= 100) {
                 return None;
             }
-            if !seen_urls.insert(url.to_string()) {
+            let language = cap
+                .get("language")
+                .or_else(|| cap.get("lan"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let format = cap
+                .get("format")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let ext = url
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or("")
+                        .split('?')
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    match ext.as_str() {
+                        "srt" | "vtt" | "ass" | "ssa" | "ttml" => Some(ext),
+                        _ => None,
+                    }
+                })
+                .filter(|f| matches!(f.as_str(), "srt" | "vtt" | "ass" | "ssa" | "ttml" | "embedded"));
+            let forced = cap
+                .get("forced")
+                .and_then(|v| v.as_bool())
+                .or_else(|| cap.get("isForced").and_then(|v| v.as_bool()));
+            let sdh = cap
+                .get("sdh")
+                .and_then(|v| v.as_bool())
+                .or_else(|| cap.get("isSdh").and_then(|v| v.as_bool()))
+                .or_else(|| cap.get("isHI").and_then(|v| v.as_bool()));
+            let embedded = cap.get("embedded").and_then(|v| v.as_bool());
+            let dedupe_key = (
+                url.to_string(),
+                language.clone().unwrap_or_default(),
+                format.clone().unwrap_or_default(),
+                forced.unwrap_or(false),
+                sdh.unwrap_or(false),
+            );
+            if !seen_keys.insert(dedupe_key) {
                 return None;
             }
             Some(SubtitleOption {
                 name: raw_name.to_string(),
                 url: url.to_string(),
+                language,
+                format,
+                forced,
+                sdh,
+                embedded,
+                provider: None,
             })
         })
         .collect()
@@ -438,6 +487,7 @@ pub fn moviebox_details_json_to_media_details(
         genres,
         seasons,
         dubs,
+        anime_ids: None,
     })
 }
 

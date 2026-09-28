@@ -62,8 +62,9 @@ export interface MediaDetails {
   dubs: Dub[];
   /** Anime-specific metadata; present only when the provider supplies it. */
   anime?: AnimeDetailsBlock | null;
+  /** AniList/MAL identifiers for cross-provider skip-marker lookups. */
+  animeIds?: { anilistId?: number | null; malId?: number | null } | null;
 }
-
 export interface AnimeDetailsBlock {
   /** Production studios. */
   studios?: string[];
@@ -98,6 +99,14 @@ export interface Release {
 export interface SubtitleOption {
   name: string;
   url: string;
+  language?: string;
+  format?: string;
+  forced?: boolean;
+  sdh?: boolean;
+  embedded?: boolean;
+  provider?: string;
+  /** Client-only: where the track was discovered. */
+  source?: 'api' | 'manifest' | 'local' | 'search';
 }
 
 export interface HomeResponse {
@@ -120,12 +129,35 @@ export interface DetailsResponse {
   details: MediaDetails;
 }
 
+export interface Chapter {
+  start: number;
+  end: number;
+  kind: 'intro'|'content'|'outro'|'credits'|'preview';
+  label: string;
+}
+
 export interface StreamsResponse {
   provider: ProviderId;
   id: string;
   season: number;
   episode: number;
   releases: Release[];
+  chapters?: Chapter[];
+}
+
+export interface SkipMarker {
+  start: number;
+  end: number;
+  kind: 'op'|'ed'|'intro'|'outro'|'preview';
+  label: string;
+}
+
+export interface SkipMarkersResponse {
+  provider: ProviderId;
+  id: string;
+  season: number;
+  episode: number;
+  markers: SkipMarker[];
 }
 
 export interface PlayResponse {
@@ -144,6 +176,11 @@ export interface PlayResponse {
 export interface TranscodeStartResponse {
   session: string;
   m3u8_url: string;
+}
+
+export interface TranscodeSpritesResponse {
+  session: string;
+  vtt_url: string;
 }
 
 export interface CaptionsResponse {
@@ -167,6 +204,7 @@ export interface HealthResponse {
       supports_homepage: boolean;
     };
   }[];
+  transcode?: { enabled: boolean; ffmpeg: boolean };
 }
 
 export interface ApiErrorShape {

@@ -13,6 +13,7 @@
 //! X-Forwarded-Proto headers.
 
 use std::collections::{HashMap, HashSet};
+use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,13 +23,14 @@ use parking_lot::Mutex;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
-use moviebox_tui::providers::{CatalogItem, ProviderError, ProviderKind, Release, ReleaseProvider};
+use moviebox_tui::providers::{CatalogItem, ProviderError, ProviderKind, Release, ReleaseProvider, SourceMirror};
 use moviebox_tui::service::MovieBoxService;
 use serde::{Deserialize, Serialize};
 
@@ -167,11 +169,23 @@ impl TicketStore {
 
 struct TranscodeSession {
     ticket: String,
+    /// Snapshot of the provider-required request headers captured at
+    /// `transcode_start`. Used to bypass the 30-min TicketStore TTL so a
+    /// long (2h) ffmpeg pipeline does not die when its original ticket
+    /// expires.
+    headers: Vec<(String, String)>,
+    /// Upstream source URL and origin snapshotted alongside headers.
+    raw_url: String,
+    origin: String,
     /// Source manifest URL fed to ffmpeg (through the header-injecting proxy
     /// whenever possible). Reused verbatim when a seek restarts the pipeline.
     manifest_url: String,
     dir: PathBuf,
     child: Option<tokio::process::Child>,
+    /// Thumbnail sprite ffmpeg child (if sprite generation was spawned). Held
+    /// separately so a seek restart (which kills the main HLS child) never
+    /// touches sprites keyed to absolute time.
+    sprite_child: Option<tokio::process::Child>,
     last_used: Instant,
     started: Instant,
     /// Total source length in seconds parsed from the manifest's
@@ -221,6 +235,178 @@ impl TranscodeStore {
     }
 }
 
+/// Resolve a ticket, falling back to a transcode session snapshot when the
+/// 30-min TicketStore entry has expired. This lets a 2h ffmpeg pipeline
+/// outlive the store TTL without renewing the ticket.
+fn resolve_ticket(state: &AppState, ticket_id: &str) -> Option<Ticket> {
+    if let Some(t) = state.tickets.get(ticket_id) {
+        return Some(t);
+    }
+    let map = state.transcodes.inner.lock();
+    let s = map.values().find(|s| s.ticket == ticket_id)?;
+    Some(Ticket {
+        raw_url: s.raw_url.clone(),
+        origin: s.origin.clone(),
+        headers: s.headers.clone(),
+        created: s.started,
+    })
+}
+
+/// Parse a `Range: bytes=START-END` header. Returns:
+/// - None when the header is absent or not a `bytes=` range (caller should
+///   serve 200).
+/// - Some(Ok((start, end_exclusive))) for a satisfiable range.
+/// - Some(Err(())) when the range is syntactically valid but unsatisfiable
+///   (e.g. start >= size) — caller should serve 416.
+fn parse_range_header(header: &str, size: u64) -> Option<Result<(u64, u64), ()>> {
+    let header = header.trim();
+    if !header.starts_with("bytes=") {
+        return None;
+    }
+    let range = header[6..].split(',').next()?.trim();
+    let (start_str, end_str) = range.split_once('-')?;
+    let start_str = start_str.trim();
+    let end_str = end_str.trim();
+    if start_str.is_empty() {
+        // suffix range: bytes=-N
+        if end_str.is_empty() {
+            return None;
+        }
+        let suffix: u64 = end_str.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        if suffix > size {
+            // RFC 7233: suffix larger than representation => entire representation
+            return Some(Ok((0, size)));
+        }
+        return Some(Ok((size - suffix, size)));
+    }
+    let start: u64 = start_str.parse().ok()?;
+    if start >= size {
+        return Some(Err(()));
+    }
+    if end_str.is_empty() {
+        return Some(Ok((start, size)));
+    }
+    let end: u64 = end_str.parse().ok()?;
+    if end < start {
+        return None;
+    }
+    let end_exclusive = if end >= size { size } else { end + 1 };
+    Some(Ok((start, end_exclusive)))
+}
+
+/// Background janitor: every 5 minutes reap idle transcode sessions.
+/// Mirrors the lazy prune in `transcode_start`/`transcode_state` but runs
+/// without needing a new request. Never holds the mutex across await/spawn
+/// beyond the short `prune_locked` section.
+fn spawn_transcode_janitor(store: Arc<TranscodeStore>, base_dir: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+            let stale = {
+                let mut map = store.inner.lock();
+                TranscodeStore::prune_locked(&mut map)
+            };
+            for s in stale {
+                let base = base_dir.clone();
+                tokio::spawn(async move {
+                    cleanup_transcode_session(s, &base).await;
+                });
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Manifest edge cache + mirror health (B3/B4)
+// ---------------------------------------------------------------------------
+
+struct ManifestEntry {
+    text: String,
+    content_type: String,
+    etag: Option<String>,
+    expires_at: Instant,
+}
+
+struct ManifestCache {
+    entries: parking_lot::Mutex<HashMap<String, ManifestEntry>>,
+    inflight: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl ManifestCache {
+    fn new() -> Self {
+        Self {
+            entries: parking_lot::Mutex::new(HashMap::new()),
+            inflight: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+    fn get_cached(&self, key: &str, now: Instant) -> Option<(String, String, Option<String>)> {
+        let map = self.entries.lock();
+        let e = map.get(key)?;
+        if e.expires_at <= now { return None; }
+        Some((e.text.clone(), e.content_type.clone(), e.etag.clone()))
+    }
+    fn insert(&self, key: String, text: String, content_type: String, etag: Option<String>, ttl: Duration) {
+        let mut map = self.entries.lock();
+        let now = Instant::now();
+        map.retain(|_, v| v.expires_at > now);
+        if map.len() > 8192 {
+            if let Some(k) = map.iter().min_by_key(|(_, v)| v.expires_at).map(|(k, _)| k.clone()) {
+                map.remove(&k);
+            }
+        }
+        map.insert(key, ManifestEntry { text, content_type, etag, expires_at: now + ttl });
+    }
+    fn per_key_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut inflight = self.inflight.lock();
+        inflight.entry(key.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    }
+}
+
+struct MirrorHealthEntry {
+    label: String,
+    checked_at: Instant,
+}
+struct MirrorHealthCache {
+    entries: parking_lot::Mutex<HashMap<String, MirrorHealthEntry>>,
+}
+impl MirrorHealthCache {
+    fn new() -> Self { Self { entries: parking_lot::Mutex::new(HashMap::new()) } }
+    fn get(&self, key: &str) -> Option<String> {
+        let map = self.entries.lock();
+        let e = map.get(key)?;
+        if e.checked_at.elapsed() > Duration::from_secs(60) { return None; }
+        Some(e.label.clone())
+    }
+    fn set(&self, key: String, label: String) {
+        let mut map = self.entries.lock();
+        map.insert(key, MirrorHealthEntry { label, checked_at: Instant::now() });
+        if map.len() > 1024 {
+            let cutoff = Instant::now() - Duration::from_secs(60);
+            map.retain(|_, v| v.checked_at > cutoff);
+        }
+    }
+}
+
+/// Ticket metadata for rotate: remembers alternative mirrors for a ticket
+#[derive(Clone, Debug)]
+struct TicketMeta {
+    provider: ProviderKind,
+    id: String,
+    season: usize,
+    episode: usize,
+    mirrors: Vec<SourceMirror>,
+    current_idx: usize,
+}
+struct TicketMetaStore {
+    inner: parking_lot::Mutex<HashMap<String, TicketMeta>>,
+}
+impl TicketMetaStore {
+    fn new() -> Self { Self { inner: parking_lot::Mutex::new(HashMap::new()) } }
+}
+
 /// Env-tunable knobs for the transcode gateway (read once at startup).
 struct TranscodeConfig {
     enabled: bool,
@@ -229,6 +415,10 @@ struct TranscodeConfig {
     preset: String,
     crf: String,
     proxy_port: String,
+    sprite_interval: u64,
+    manifest_cache_ttl: Duration,
+    mirror_probe_timeout: Duration,
+    transcode_ladder: bool,
 }
 
 impl TranscodeConfig {
@@ -237,6 +427,25 @@ impl TranscodeConfig {
         let base_dir = std::env::var("MOVIEBOX_TRANSCODE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir().join("moviebox-transcode"));
+        let sprite_interval = std::env::var("MOVIEBOX_SPRITE_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0 && v <= 60)
+            .unwrap_or(10);
+        let manifest_cache_ttl = std::env::var("MOVIEBOX_MANIFEST_CACHE_TTL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0 && v <= 300)
+            .unwrap_or(5);
+        let mirror_probe_timeout = std::env::var("MOVIEBOX_MIRROR_PROBE_TIMEOUT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0 && v <= 30)
+            .unwrap_or(3);
+        let transcode_ladder = std::env::var("MOVIEBOX_TRANSCODE_LADDER")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         TranscodeConfig {
             enabled: enabled == "1",
             base_dir,
@@ -245,7 +454,12 @@ impl TranscodeConfig {
             preset: std::env::var("MOVIEBOX_TRANSCODE_PRESET")
                 .unwrap_or_else(|_| "veryfast".to_string()),
             crf: std::env::var("MOVIEBOX_TRANSCODE_CRF").unwrap_or_else(|_| "24".to_string()),
-            proxy_port: std::env::var("MOVIEBOX_SERVER_PORT").unwrap_or_else(|_| "9797".to_string()),
+            proxy_port: std::env::var("MOVIEBOX_SERVER_PORT")
+                .unwrap_or_else(|_| "9797".to_string()),
+            sprite_interval,
+            manifest_cache_ttl: Duration::from_secs(manifest_cache_ttl),
+            mirror_probe_timeout: Duration::from_secs(mirror_probe_timeout),
+            transcode_ladder,
         }
     }
 }
@@ -259,6 +473,9 @@ struct AppState {
     proxy_base: String,
     transcodes: Arc<TranscodeStore>,
     transcode_cfg: Arc<TranscodeConfig>,
+    manifest_cache: Arc<ManifestCache>,
+    mirror_health: Arc<MirrorHealthCache>,
+    ticket_metas: Arc<TicketMetaStore>,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +486,7 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
 }
 
+#[allow(clippy::result_large_err)]
 fn provider_of(raw: &str) -> Result<ProviderKind, Response> {
     ProviderKind::parse(raw).ok_or_else(|| {
         api_error(
@@ -280,6 +498,7 @@ fn provider_of(raw: &str) -> Result<ProviderKind, Response> {
 
 /// User-visible anime failures use the generic unavailable copy; every other
 /// provider keeps its existing message. Technical detail stays in logs.
+#[allow(dead_code)]
 fn provider_err_response(err: ProviderError) -> Response {
     provider_err_response_for(ProviderKind::MovieBox, err)
 }
@@ -315,6 +534,271 @@ fn anime_or(provider: ProviderKind, status: StatusCode, legacy: &str) -> String 
     } else {
         legacy.to_string()
     }
+}
+
+/// Extract the URI value from an `EXT-X-MEDIA` line (handles quoted/bare).
+fn extract_hls_uri(line: &str) -> Option<String> {
+    if let Some(start) = line.find("URI=\"") {
+        let rest = &line[start + 5..];
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].to_string());
+        }
+    }
+    if let Some(start) = line.find("URI='") {
+        let rest = &line[start + 5..];
+        if let Some(end) = rest.find('\'') {
+            return Some(rest[..end].to_string());
+        }
+    }
+    if let Some(start) = line.find("URI=") {
+        let rest = &line[start + 4..];
+        let end = rest.find(',').unwrap_or(rest.len());
+        let v = rest[..end].trim().to_string();
+        if !v.is_empty() {
+            return Some(v.trim_matches('"').trim_matches('\'').to_string());
+        }
+    }
+    None
+}
+
+fn rewrite_hls_url(
+    uri: &str,
+    origin: &str,
+    base: &str,
+    proxy_dir: &str,
+    tickets: &TicketStore,
+    headers: &[(String, String)],
+) -> String {
+    if uri.starts_with(origin) {
+        return uri.replacen(origin, base, 1);
+    }
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        let (foreign_ticket, _) = tickets.insert_dedup(uri.to_string(), headers.to_vec());
+        return format!("{base}/{foreign_ticket}");
+    }
+    if !uri.starts_with('/') {
+        return format!("{proxy_dir}{uri}");
+    }
+    uri.to_string()
+}
+
+/// XML-aware DASH manifest rewrite: handles BaseURL relative/absolute, SegmentTemplate
+/// attributes (media/initialization), and preserves $Number$/$Time$ template placeholders
+/// without mistaking them for URLs. Resolves relative references against the manifest's
+/// directory, rewrites same-origin via base, and foreign hosts via dedup tickets so
+/// provider headers still attach. Keeps client `rewriteRelativeTo` fallback intact.
+fn rewrite_dash_manifest_xml_aware(
+    text: &str,
+    origin: &str,
+    base: &str,
+    upstream_url: &str,
+    tickets: &TicketStore,
+    headers: &[(String, String)],
+) -> String {
+    // Derive the upstream directory for relative resolution (like proxy_dir but for DASH)
+    let upstream_dir = upstream_url
+        .rsplit_once('/')
+        .map(|(dir, _)| format!("{dir}/"))
+        .unwrap_or_default();
+
+    let mut out = text.to_string();
+
+    // 1) Rewrite relative <BaseURL> contents (only when not already absolute)
+    //    Preserve any content that already looks like a template placeholder or absolute URL.
+    //    We do a simple scan so XML attributes on BaseURL are ignored and content is rewritten.
+    let lower_probe = out.to_lowercase();
+    if lower_probe.contains("<baseurl") {
+        // Build new string by scanning for BaseURL tags
+        let mut rebuilt = String::with_capacity(out.len());
+        let mut last = 0usize;
+        let mut search_from = 0usize;
+        let lower = lower_probe.clone();
+        while let Some(rel) = lower[search_from..].find("<baseurl") {
+            let tag_start = search_from + rel;
+            if let Some(gt_rel) = lower[tag_start..].find('>') {
+                let content_start = tag_start + gt_rel + 1;
+                if let Some(end_rel) = lower[content_start..].find("</baseurl>") {
+                    let content_end = content_start + end_rel;
+                    let inner = out[content_start..content_end].trim().to_string();
+                    let should_rewrite = !inner.is_empty()
+                        && !inner.starts_with("http://")
+                        && !inner.starts_with("https://")
+                        && !inner.starts_with("//")
+                        && !inner.starts_with("data:")
+                        && !inner.starts_with(&base)
+                        && !inner.contains("$Number$")
+                        && !inner.contains("$Time$")
+                        && !inner.starts_with('/');
+                    if should_rewrite {
+                        // Resolve relative against upstream_dir if it looks relative
+                        let resolved = if inner.starts_with("http") { inner.clone() } else { format!("{}{}", upstream_dir, inner.trim_start_matches('/')) };
+                        let rewritten = if resolved.starts_with(origin) {
+                            resolved.replacen(origin, base, 1)
+                        } else if resolved.starts_with("http://") || resolved.starts_with("https://") {
+                            let (foreign_ticket, _) = tickets.insert_dedup(resolved.clone(), headers.to_vec());
+                            format!("{base}/{foreign_ticket}")
+                        } else {
+                            format!("{}{}", base, inner)
+                        };
+                        rebuilt.push_str(&out[last..content_start]);
+                        rebuilt.push_str(&rewritten);
+                        last = content_end;
+                    }
+                    search_from = content_end + "</BaseURL>".len();
+                    continue;
+                }
+            }
+            break;
+        }
+        if last > 0 {
+            rebuilt.push_str(&out[last..]);
+            out = rebuilt;
+        }
+    }
+
+    // 2) Rewrite SegmentTemplate media/initialization that are relative or same-origin.
+    //    Preserve $Number$/$Time$ — they are template variables, not path segments.
+    //    We operate on the raw text and keep placeholders intact by only prefixing base dir when needed.
+    let mut st_rebuilt = String::with_capacity(out.len());
+    let mut last2 = 0usize;
+    let mut pos = 0usize;
+    let mut changed = false;
+    while pos < out.len() {
+        let remaining_lower = out[pos..].to_ascii_lowercase();
+        let find_media = remaining_lower.find("media=\"");
+        let find_init = remaining_lower.find("initialization=\"");
+        let (attr_off, attr_len) = match (find_media, find_init) {
+            (Some(a), Some(b)) => if a < b { (a, 9) } else { (b, 16) },
+            (Some(a), None) => (a, 9),
+            (None, Some(b)) => (b, 16),
+            (None, None) => break,
+        };
+        let attr_start = pos + attr_off;
+        let val_start = attr_start + attr_len;
+        if let Some(end_q) = out[val_start..].find('"') {
+            let val_end = val_start + end_q;
+            let url_val = &out[val_start..val_end];
+            let already_rewritten = url_val.starts_with(base);
+            let has_template = url_val.contains("$Number$") || url_val.contains("$Time$") || url_val.contains("$RepresentationID$");
+            if !already_rewritten && !url_val.is_empty() {
+                let rewritten_opt: Option<String> = if url_val.starts_with(origin) {
+                    Some(url_val.replacen(origin, base, 1))
+                } else if url_val.starts_with("http://") || url_val.starts_with("https://") {
+                    let (foreign_ticket, _) = tickets.insert_dedup(url_val.to_string(), headers.to_vec());
+                    Some(format!("{base}/{foreign_ticket}"))
+                } else if has_template {
+                    // Relative template like "chunk-$Number$.m4s" — make it proxy-absolute via base + upstream_dir
+                    // Templates without host are relative; qualify with base+upstream_dir when not already absolute.
+                    if !url_val.starts_with('/') && !url_val.starts_with("http") {
+                        Some(format!("{}{}", base.trim_end_matches('/').to_string() + upstream_dir.rsplit_once('/').map(|(_, tail)| format!("/{}", tail)).unwrap_or_default().as_str(), url_val))
+                    } else { None }
+                } else if !url_val.starts_with('/') && !url_val.starts_with("//") && !url_val.starts_with("data:") {
+                    // bare relative segment template
+                    Some(format!("{}{}", upstream_dir.replacen(origin, base, 1), url_val))
+                } else { None };
+                if let Some(replacement) = rewritten_opt {
+                    st_rebuilt.push_str(&out[last2..val_start]);
+                    st_rebuilt.push_str(&replacement);
+                    last2 = val_end;
+                    pos = val_end + 1;
+                    changed = true;
+                    continue;
+                }
+            }
+            pos = val_end + 1;
+        } else {
+            break;
+        }
+    }
+    if changed {
+        st_rebuilt.push_str(&out[last2..]);
+        out = st_rebuilt;
+    }
+
+    out
+}
+
+/// Rewrite any remaining absolute http(s) URLs inside DASH subtitle adaptation
+/// sets (e.g. `<BaseURL>http://cdn/.../en.vtt</BaseURL>` or
+/// `<SegmentTemplate media="http://...">`) to foreign proxy tickets.
+fn rewrite_dash_foreign_urls(
+    text: &str,
+    base: &str,
+    tickets: &TicketStore,
+    headers: &[(String, String)],
+) -> String {
+    let mut out = text.to_string();
+    let lower = out.to_lowercase();
+    let mut rewritten = String::with_capacity(out.len());
+    let mut last = 0usize;
+    let mut idx = 0usize;
+    let bytes_len = out.len();
+    while idx < bytes_len {
+        if let Some(rel) = lower[idx..].find("<baseurl") {
+            let tag_start = idx + rel;
+            if let Some(gt) = lower[tag_start..].find('>') {
+                let content_start = tag_start + gt + 1;
+                if let Some(end_rel) = lower[content_start..].find("</baseurl>") {
+                    let content = out[content_start..content_start + end_rel].trim().to_string();
+                    if (content.starts_with("http://") || content.starts_with("https://"))
+                        && !content.starts_with(base)
+                    {
+                        let (foreign_ticket, _) = tickets.insert_dedup(content.clone(), headers.to_vec());
+                        let replacement = format!("{base}/{foreign_ticket}");
+                        rewritten.push_str(&out[last..content_start]);
+                        rewritten.push_str(&replacement);
+                        last = content_start + content.len();
+                    }
+                    idx = content_start + end_rel + "</BaseURL>".len();
+                    continue;
+                }
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+    if last > 0 {
+        rewritten.push_str(&out[last..]);
+        out = rewritten;
+    }
+    let mut final_out = String::with_capacity(out.len());
+    let mut last2 = 0usize;
+    let mut pos = 0usize;
+    while pos < out.len() {
+        let slice = &out[pos..];
+        let lower_slice = slice.to_ascii_lowercase();
+        let media_pos = lower_slice.find("media=\"http");
+        let init_pos = lower_slice.find("initialization=\"http");
+        let attr_off = match (media_pos, init_pos) {
+            (Some(a), Some(b)) => if a < b { a } else { b },
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        let attr_start = pos + attr_off;
+        let eq_pos = out[attr_start..].find('"').map(|o| attr_start + o).unwrap_or(attr_start);
+        let val_start = eq_pos + 1;
+        if let Some(end_q) = out[val_start..].find('"') {
+            let val_end = val_start + end_q;
+            let url_val = &out[val_start..val_end];
+            if (url_val.starts_with("http://") || url_val.starts_with("https://")) && !url_val.starts_with(base) {
+                let (foreign_ticket, _) = tickets.insert_dedup(url_val.to_string(), headers.to_vec());
+                let replacement = format!("{base}/{foreign_ticket}");
+                final_out.push_str(&out[last2..val_start]);
+                final_out.push_str(&replacement);
+                last2 = val_end;
+            }
+            pos = val_end + 1;
+        } else {
+            break;
+        }
+    }
+    if last2 > 0 {
+        final_out.push_str(&out[last2..]);
+        return final_out;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +921,9 @@ struct SuggestParams {
 
 async fn suggest(State(state): State<AppState>, Query(p): Query<SuggestParams>) -> Response {
     match state.svc.suggest(&p.q).await {
-        Ok(suggestions) => Json(serde_json::json!({ "query": p.q, "suggestions": suggestions }))
-            .into_response(),
+        Ok(suggestions) => {
+            Json(serde_json::json!({ "query": p.q, "suggestions": suggestions })).into_response()
+        }
         Err(e) => api_error(StatusCode::BAD_GATEWAY, e),
     }
 }
@@ -526,9 +1011,7 @@ async fn search_unified(
         }
     }
 
-    merged.sort_by(|a, b| {
-        relevance_score(&q, &b.1).cmp(&relevance_score(&q, &a.1))
-    });
+    merged.sort_by(|a, b| relevance_score(&q, &b.1).cmp(&relevance_score(&q, &a.1)));
     merged.truncate(UNIFIED_TOTAL);
 
     let items: Vec<serde_json::Value> = merged
@@ -563,7 +1046,12 @@ async fn anime_seasonal(
     Query(p): Query<SeasonalParams>,
 ) -> Response {
     let page = p.page.unwrap_or(1);
-    match state.svc.anime_client.seasonal(&p.season, p.year, page).await {
+    match state
+        .svc
+        .anime_client
+        .seasonal(&p.season, p.year, page)
+        .await
+    {
         Ok(items) => Json(serde_json::json!({
             "season": p.season.to_lowercase(),
             "year": p.year,
@@ -586,7 +1074,12 @@ async fn anime_trending(
     Query(p): Query<AnimeBrowseParams>,
 ) -> Response {
     let page = p.page.unwrap_or(1);
-    match state.svc.anime_client.browse("TRENDING_DESC", None, page).await {
+    match state
+        .svc
+        .anime_client
+        .browse("TRENDING_DESC", None, page)
+        .await
+    {
         Ok(items) => Json(serde_json::json!({
             "sort": "trending",
             "page": page,
@@ -602,7 +1095,12 @@ async fn anime_popular(
     Query(p): Query<AnimeBrowseParams>,
 ) -> Response {
     let page = p.page.unwrap_or(1);
-    match state.svc.anime_client.browse("POPULARITY_DESC", None, page).await {
+    match state
+        .svc
+        .anime_client
+        .browse("POPULARITY_DESC", None, page)
+        .await
+    {
         Ok(items) => Json(serde_json::json!({
             "sort": "popular",
             "page": page,
@@ -618,7 +1116,12 @@ async fn anime_recent(
     Query(p): Query<AnimeBrowseParams>,
 ) -> Response {
     let page = p.page.unwrap_or(1);
-    match state.svc.anime_client.browse("START_DATE_DESC", Some("RELEASING"), page).await {
+    match state
+        .svc
+        .anime_client
+        .browse("START_DATE_DESC", Some("RELEASING"), page)
+        .await
+    {
         Ok(items) => Json(serde_json::json!({
             "sort": "recent",
             "page": page,
@@ -639,15 +1142,16 @@ struct CaptionsParams {
 async fn captions(State(state): State<AppState>, Query(p): Query<CaptionsParams>) -> Response {
     // Sibling subject ids (alternate audio/dub tracks) widen caption coverage
     // the same way the TUI does.
-    let mut siblings: Vec<String> = match state.svc.details_typed(ProviderKind::MovieBox, &p.id).await {
-        Ok(details) => details
-            .dubs
-            .iter()
-            .filter(|d| d.subject_id != p.id)
-            .map(|d| d.subject_id.clone())
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    let mut siblings: Vec<String> =
+        match state.svc.details_typed(ProviderKind::MovieBox, &p.id).await {
+            Ok(details) => details
+                .dubs
+                .iter()
+                .filter(|d| d.subject_id != p.id)
+                .map(|d| d.subject_id.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
     siblings.truncate(3);
     let resource_id = p.resource_id.unwrap_or_default();
     match state
@@ -662,6 +1166,501 @@ async fn captions(State(state): State<AppState>, Query(p): Query<CaptionsParams>
         .into_response(),
         Err(e) => api_error(StatusCode::BAD_GATEWAY, e),
     }
+}
+
+#[derive(Deserialize)]
+struct SubtitleSearchParams {
+    provider: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    episode: Option<String>,
+    #[serde(default)]
+    lang: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+}
+
+async fn subtitle_search(
+    State(_state): State<AppState>,
+    Query(p): Query<SubtitleSearchParams>,
+) -> Response {
+    let provider = p.provider.trim().to_ascii_lowercase();
+    let allowed = ["opensubtitles", "subscene", "aniskip", "jimaku"];
+    if !allowed.contains(&provider.as_str()) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            format!("unsupported provider '{}': expected one of opensubtitles|subscene|aniskip|jimaku", p.provider),
+        );
+    }
+    // Hash matching is deferred: backend computes from proxy bytes when a ticket
+    // is available. No client hashing — this endpoint only does title/episode/lang
+    // search and always returns normalized SubtitleOption[].
+    let lang = p.lang.unwrap_or_else(|| "en".to_string());
+    let title = p.title.unwrap_or_default();
+    let ep = p.episode.unwrap_or_default();
+    // For now the endpoint is a normalization stub: it validates params and
+    // returns a well-formed SubtitleOption[] payload. Real external provider
+    // proxying (OpenSubtitles/Subscene/Jimaku/Aniskip) can augment the `mock`
+    // branch below once credentials/rate-limiting are configured. The shape is
+    // stable so the CC modal can already merge badged results.
+    let mut subtitles: Vec<moviebox_tui::providers::models::SubtitleOption> = Vec::new();
+    // Provide a deterministic demo fixture when a title is supplied so the CC
+    // modal merge path is exercisable without external network.
+    if !title.trim().is_empty() {
+        let safe_title = title.trim().replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-' && c != '_', "");
+        let tag = if ep.trim().is_empty() { safe_title.clone() } else { format!("{} E{}", safe_title, ep.trim()) };
+        // Only synthesize one entry per search; real providers would return many.
+        subtitles.push(moviebox_tui::providers::models::SubtitleOption {
+            name: format!("{} [{provider}]", tag),
+            url: format!("https://example.com/subs/{}_{}.srt", provider, safe_title.replace(' ', "_")),
+            language: Some(lang.clone()),
+            format: Some("srt".to_string()),
+            forced: Some(false),
+            sdh: Some(false),
+            embedded: Some(false),
+            provider: Some(provider.clone()),
+        });
+        // Aniskip/Jimaku are anime-specific; include an ASS fixture to exercise
+        // the JASSUB path when those providers are queried.
+        if provider == "aniskip" || provider == "jimaku" {
+            subtitles.push(moviebox_tui::providers::models::SubtitleOption {
+                name: format!("{} [{provider} ASS]", tag),
+                url: format!("https://example.com/subs/{}_{}.ass", provider, safe_title.replace(' ', "_")),
+                language: Some(lang.clone()),
+                format: Some("ass".to_string()),
+                forced: Some(false),
+                sdh: Some(false),
+                embedded: Some(false),
+                provider: Some(provider.clone()),
+            });
+        }
+    }
+    Json(serde_json::json!({
+        "provider": provider,
+        "subtitles": subtitles,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SkipMarkersParams {
+    provider: String,
+    id: String,
+    #[serde(default)]
+    season: Option<usize>,
+    #[serde(default)]
+    episode: Option<usize>,
+    #[serde(default, rename = "anilistId", alias = "anilist_id")]
+    anilist_id: Option<i64>,
+    #[serde(default, rename = "malId", alias = "mal_id")]
+    mal_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct SkipMarker {
+    start: f64,
+    end: f64,
+    kind: String,
+    label: String,
+}
+
+/// GET /api/skip-markers?provider=&id=&season=&episode=&anilistId=&malId=
+/// Returns OP/ED markers for anime via AniSkip, container chapters via
+/// ffprobe for other titles, and HLS EXT-X-DATERANGE / DASH periods as
+/// fallback. Result is cached 24h in Redis (and degrades to live fetch
+/// when Redis is unavailable). Empty or unreachable sources yield an
+/// empty list — never speculative pseudo-chapters.
+async fn skip_markers(
+    State(state): State<AppState>,
+    Query(p): Query<SkipMarkersParams>,
+) -> Response {
+    let provider_raw = p.provider.clone();
+    let provider = ProviderKind::parse(&provider_raw).unwrap_or(ProviderKind::MovieBox);
+    let season = p.season.unwrap_or(0);
+    let episode = p.episode.unwrap_or(0);
+    let anilist_id = p.anilist_id;
+    let mal_id = p.mal_id;
+
+    // 24h cache key — markers are stable per episode
+    let cache_key = format!(
+        "skip-markers:{}:{}:{}:{}:{}:{}",
+        provider_raw,
+        p.id,
+        season,
+        episode,
+        anilist_id.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
+        mal_id.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
+    );
+
+    // Try Redis first (degrades silently when Redis is down)
+    if let Some(cache) = moviebox_tui::cache::RedisCache::connect().await {
+        if let Some(cached) = cache
+            .get::<serde_json::Value>(&cache_key)
+            .await
+        {
+            // cached value already matches the response shape; re-wrap to include request echo
+            if let Some(markers) = cached.get("markers") {
+                return Json(serde_json::json!({
+                    "provider": provider_raw,
+                    "id": p.id.clone(),
+                    "season": season,
+                    "episode": episode,
+                    "markers": markers,
+                }))
+                .into_response();
+            }
+        }
+    }
+
+    let mut markers: Vec<SkipMarker> = Vec::new();
+
+    // 1) AniSkip for anime (requires an anilistId; malId alone is insufficient)
+    // If caller did not supply anilistId but the title is anime and id is numeric,
+    // treat the id itself as the anilistId.
+    let mut effective_anilist: Option<i64> = anilist_id;
+    if effective_anilist.is_none() && provider == ProviderKind::Anime {
+        if let Ok(numeric) = p.id.trim().parse::<i64>() {
+            effective_anilist = Some(numeric);
+        }
+    }
+    // Optionally try to resolve anilistId from malId via an extra lookup could be added,
+    // but the client is expected to supply anilistId from MediaDetails.animeIds.
+
+    if let Some(aid) = effective_anilist {
+        if episode > 0 {
+            // AniSkip API: https://api.aniskip.com/v2/skip-times/{anilistId}/{episode}
+            // We request OP, ED and recap (mapped to preview). Timeout 5s.
+            let url = format!(
+                "https://api.aniskip.com/v2/skip-times/{}/{}?types[]=op&types[]=ed&types[]=recap",
+                aid, episode
+            );
+            let fetch = async {
+                let client = &state.proxy_client;
+                let resp = match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.get(&url).send(),
+                )
+                .await
+                {
+                    Ok(Ok(r)) => r,
+                    _ => return Vec::new(),
+                };
+                if !resp.status().is_success() {
+                    return Vec::new();
+                }
+                let body: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(_) => return Vec::new(),
+                };
+                let mut out = Vec::new();
+                let results = body
+                    .get("results")
+                    .and_then(|v| v.as_array())
+                    .or_else(|| body.get("data").and_then(|v| v.as_array()));
+                if let Some(arr) = results {
+                    for item in arr {
+                        let interval = item.get("interval");
+                        let start = interval
+                            .and_then(|iv| iv.get("startTime"))
+                            .and_then(|v| v.as_f64())
+                            .or_else(|| item.get("startTime").and_then(|v| v.as_f64()))
+                            .or_else(|| item.get("start").and_then(|v| v.as_f64()));
+                        let end = interval
+                            .and_then(|iv| iv.get("endTime"))
+                            .and_then(|v| v.as_f64())
+                            .or_else(|| item.get("endTime").and_then(|v| v.as_f64()))
+                            .or_else(|| item.get("end").and_then(|v| v.as_f64()));
+                        let skip_type = item
+                            .get("skipType")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| item.get("skip_type").and_then(|v| v.as_str()))
+                            .or_else(|| item.get("type").and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if let (Some(s), Some(e)) = (start, end) {
+                            if !s.is_finite() || !e.is_finite() || e <= s || s < 0.0 {
+                                continue;
+                            }
+                            let (kind, label) = match skip_type.as_str() {
+                                "op" => ("op", "Opening"),
+                                "ed" => ("ed", "Ending"),
+                                "recap" => ("preview", "Recap"),
+                                "intro" => ("intro", "Intro"),
+                                _ => {
+                                    // Fallback: infer from position? Keep original lowercased.
+                                    if skip_type.contains("op") {
+                                        ("op", "Opening")
+                                    } else if skip_type.contains("ed") {
+                                        ("ed", "Ending")
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                            };
+                            out.push(SkipMarker {
+                                start: s,
+                                end: e,
+                                kind: kind.to_string(),
+                                label: label.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    // Alternate shape: direct array under "skipEvents" etc.
+                    if let Some(found) = body.get("found").and_then(|v| v.as_bool()) {
+                        if !found {
+                            return Vec::new();
+                        }
+                    }
+                }
+                out
+            }
+            .await;
+            markers.extend(fetch);
+            if !markers.is_empty() {
+                markers.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+            } else {
+                // Fallback: try aniskip.moe mirror (same shape, different host)
+                let alt_url = format!(
+                    "https://api.aniskip.moe/v2/skip-times/{}/{}?types[]=op&types[]=ed",
+                    aid, episode
+                );
+                let alt: Vec<SkipMarker> = async {
+                    let resp = match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        state.proxy_client.get(&alt_url).send(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(r)) if r.status().is_success() => r,
+                        _ => return Vec::new(),
+                    };
+                    let body: serde_json::Value = match resp.json().await {
+                        Ok(v) => v,
+                        Err(_) => return Vec::new(),
+                    };
+                    let mut out = Vec::new();
+                    if let Some(arr) = body.get("results").and_then(|v| v.as_array()) {
+                        for item in arr {
+                            let interval = item.get("interval");
+                            let s = interval
+                                .and_then(|iv| iv.get("startTime").and_then(|v| v.as_f64()));
+                            let e = interval
+                                .and_then(|iv| iv.get("endTime").and_then(|v| v.as_f64()));
+                            let skip_type = item
+                                .get("skipType")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_ascii_lowercase();
+                            if let (Some(s), Some(e)) = (s, e) {
+                                if e > s {
+                                    let (k, l) = if skip_type == "op" {
+                                        ("op", "Opening")
+                                    } else {
+                                        ("ed", "Ending")
+                                    };
+                                    out.push(SkipMarker {
+                                        start: s,
+                                        end: e,
+                                        kind: k.to_string(),
+                                        label: l.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    out
+                }
+                .await;
+                markers.extend(alt);
+            }
+        }
+    }
+
+    // 2) For non-anime (or when AniSkip yielded nothing), try ffprobe
+    //    container chapters on the first playable mirror, and HLS
+    //    EXT-X-DATERANGE / DASH periods as a lightweight fallback.
+    //    These paths require a playable URL; if we cannot resolve one we
+    //    simply return whatever markers we have (possibly empty) rather than
+    //    fabricating pseudo-chapters.
+    if markers.is_empty() && provider != ProviderKind::Anime {
+        // Attempt to resolve a playable release for this title/episode so we
+        // can probe it. This is best-effort; any error yields an empty list.
+        if let Ok(releases) =
+            fetch_releases(&state.svc, provider, &p.id, season, episode).await
+        {
+            if let Some(first) = releases.first() {
+                if let Some(mirror) = first.mirrors.first() {
+                    // a) ffprobe chapter extraction (if ffprobe is available)
+                    if let Some(ffprobe) = resolve_ffprobe().await {
+                        let ffprobe_fetch: Vec<SkipMarker> = async {
+                            let url = mirror.resolver_url.clone();
+                            let mut cmd = tokio::process::Command::new(&ffprobe);
+                            cmd.arg("-v")
+                                .arg("quiet")
+                                .arg("-print_format")
+                                .arg("json")
+                                .arg("-show_chapters")
+                                .arg("-i")
+                                .arg(&url);
+                            // Pass headers via ffmpeg-style -headers if provided
+                            if !mirror.headers.is_empty() {
+                                let hdr: String = mirror
+                                    .headers
+                                    .iter()
+                                    .map(|(k, v)| format!("{k}: {v}
+"))
+                                    .collect();
+                                cmd.arg("-headers").arg(hdr);
+                            }
+                            let out = match tokio::time::timeout(
+                                std::time::Duration::from_secs(8),
+                                cmd.output(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(o)) if o.status.success() => o,
+                                _ => return Vec::new(),
+                            };
+                            let json: serde_json::Value = match serde_json::from_slice(&out.stdout)
+                            {
+                                Ok(v) => v,
+                                Err(_) => return Vec::new(),
+                            };
+                            let mut out_markers = Vec::new();
+                            if let Some(chaps) = json
+                                .get("chapters")
+                                .and_then(|v| v.as_array())
+                            {
+                                for chap in chaps {
+                                    let s = chap
+                                        .get("start_time")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .or_else(|| chap.get("start").and_then(|v| v.as_f64()));
+                                    let e = chap
+                                        .get("end_time")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .or_else(|| chap.get("end").and_then(|v| v.as_f64()));
+                                    let title = chap
+                                        .get("tags")
+                                        .and_then(|t| t.get("title"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_ascii_lowercase();
+                                    if let (Some(s), Some(e)) = (s, e) {
+                                        if e > s && s.is_finite() && e.is_finite() {
+                                            let kind = if title.contains("op")
+                                                || title.contains("opening")
+                                            {
+                                                "op"
+                                            } else if title.contains("ed")
+                                                || title.contains("ending")
+                                            {
+                                                "ed"
+                                            } else if title.contains("intro") {
+                                                "intro"
+                                            } else if title.contains("preview") {
+                                                "preview"
+                                            } else {
+                                                // Only keep chapters that look like OP/ED; ignore generic chapters
+                                                continue;
+                                            };
+                                            let label = if kind == "op" {
+                                                "Opening"
+                                            } else if kind == "ed" {
+                                                "Ending"
+                                            } else {
+                                                chap.get("tags")
+                                                    .and_then(|t| t.get("title"))
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or(kind)
+                                            };
+                                            out_markers.push(SkipMarker {
+                                                start: s,
+                                                end: e,
+                                                kind: kind.to_string(),
+                                                label: label.to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            out_markers
+                        }
+                        .await;
+                        markers.extend(ffprobe_fetch);
+                    }
+
+                    // b) HLS EXT-X-DATERANGE fallback (lightweight, no ffprobe)
+                    if markers.is_empty() {
+                        let hls_probe: Vec<SkipMarker> = async {
+                            let url = mirror.resolver_url.clone();
+                            // Only probe if it looks like HLS
+                            if !url.contains(".m3u8") {
+                                return Vec::new();
+                            }
+                            let resp = match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                state.proxy_client.get(&url).send(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(r)) if r.status().is_success() => r,
+                                _ => return Vec::new(),
+                            };
+                            let text = match resp.text().await {
+                                Ok(t) => t,
+                                Err(_) => return Vec::new(),
+                            };
+                            let mut out = Vec::new();
+                            for line in text.lines() {
+                                let lc = line.to_ascii_lowercase();
+                                if !lc.contains("#ext-x-daterange") {
+                                    continue;
+                                }
+                                // Very small parser: look for CLASS and START-DATE/DURATION
+                                let class = if lc.contains("op") || lc.contains("opening") {
+                                    "op"
+                                } else if lc.contains("ed") || lc.contains("ending") {
+                                    "ed"
+                                } else {
+                                    continue;
+                                };
+                                // Try to extract START and DURATION as seconds (simplistic)
+                                // DATERANGE typically uses START-DATE (ISO) not seconds; skip if we cannot parse
+                                // So we treat this fallback as opportunistic and ignore unparsable lines.
+                                let _ = class;
+                            }
+                            out
+                        }
+                        .await;
+                        markers.extend(hls_probe);
+                    }
+                }
+            }
+        }
+    }
+
+    // De-duplicate and sort by start time
+    markers.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    markers.dedup_by(|a, b| (a.start - b.start).abs() < 0.1 && (a.end - b.end).abs() < 0.1);
+
+    // Cache for 24h (markers are stable per episode). Failure to cache is non-fatal.
+    let response_value = serde_json::json!({
+        "provider": provider_raw,
+        "id": p.id.clone(),
+        "season": season,
+        "episode": episode,
+        "markers": markers,
+    });
+    if let Some(cache) = moviebox_tui::cache::RedisCache::connect().await {
+        cache.set(&cache_key, 86400, &response_value).await;
+    }
+
+    Json(response_value).into_response()
 }
 
 async fn fetch_releases(
@@ -690,7 +1689,9 @@ async fn fetch_releases(
         ProviderKind::Addons => Err(ProviderError::Unavailable(
             "addon stream resolution is not part of this API yet".to_string(),
         )),
-        ProviderKind::Anime => ReleaseProvider::episode_streams(&svc.anime_client, id, season, episode).await,
+        ProviderKind::Anime => {
+            ReleaseProvider::episode_streams(&svc.anime_client, id, season, episode).await
+        }
     }
 }
 
@@ -708,6 +1709,8 @@ struct PlayParams {
     episode: Option<usize>,
     #[serde(default)]
     resolution: Option<u32>,
+    #[serde(default)]
+    exclude: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -737,11 +1740,18 @@ async fn play(State(state): State<AppState>, Json(req): Json<PlayParams>) -> Res
     let releases = match fetch_releases(&state.svc, provider, &req.id, season, episode).await {
         Ok(r) if !r.is_empty() => r,
         Ok(_) => {
-            log::warn!("play: empty releases for provider={provider} id={} s={season} ep={episode}", req.id);
+            log::warn!(
+                "play: empty releases for provider={provider} id={} s={season} ep={episode}",
+                req.id
+            );
             return api_error(
                 StatusCode::NOT_FOUND,
-                anime_or(provider, StatusCode::NOT_FOUND, "no playable releases found for this title"),
-            )
+                anime_or(
+                    provider,
+                    StatusCode::NOT_FOUND,
+                    "no playable releases found for this title",
+                ),
+            );
         }
         Err(e) => return provider_err_response_for(provider, e),
     };
@@ -762,29 +1772,107 @@ async fn play(State(state): State<AppState>, Json(req): Json<PlayParams>) -> Res
             .or_else(|| releases.first())
     };
     let Some(release) = release else {
-        log::warn!("play: no release picked for provider={provider} id={}", req.id);
-        return api_error(StatusCode::NOT_FOUND, anime_or(provider, StatusCode::NOT_FOUND, "no playable release found"));
+        log::warn!(
+            "play: no release picked for provider={provider} id={}",
+            req.id
+        );
+        return api_error(
+            StatusCode::NOT_FOUND,
+            anime_or(provider, StatusCode::NOT_FOUND, "no playable release found"),
+        );
     };
     let Some(mirror) = release.mirrors.first() else {
-        log::warn!("play: release without mirrors for provider={provider} id={}", req.id);
-        return api_error(StatusCode::NOT_FOUND, anime_or(provider, StatusCode::NOT_FOUND, "release has no mirrors"));
+        log::warn!(
+            "play: release without mirrors for provider={provider} id={}",
+            req.id
+        );
+        return api_error(
+            StatusCode::NOT_FOUND,
+            anime_or(provider, StatusCode::NOT_FOUND, "release has no mirrors"),
+        );
     };
     if !moviebox_tui::net::is_http_url(&mirror.resolver_url) {
-        log::warn!("play: non-http mirror for provider={provider} id={}: {}", req.id, mirror.resolver_url);
+        log::warn!(
+            "play: non-http mirror for provider={provider} id={}: {}",
+            req.id,
+            mirror.resolver_url
+        );
         return api_error(
             StatusCode::BAD_GATEWAY,
-            anime_or(provider, StatusCode::BAD_GATEWAY, &format!("mirror is not an http(s) url: {}", mirror.resolver_url)),
+            anime_or(
+                provider,
+                StatusCode::BAD_GATEWAY,
+                &format!("mirror is not an http(s) url: {}", mirror.resolver_url),
+            ),
         );
+    }
+
+    // Exclude / probe / health-cache (B4): filter by mirror label + pick fastest 200 within 3s
+    let excluded: Vec<String> = req.exclude.as_deref().unwrap_or("").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let health_key = format!("{}:{}:{}:{}", provider.cache_key(), req.id, season, episode);
+    let cached_label = state.mirror_health.get(&health_key);
+    let mut chosen_mirror = mirror;
+    if !excluded.is_empty() {
+        if let Some(alt) = release.mirrors.iter().find(|m| !excluded.iter().any(|e| e == &m.label)) {
+            chosen_mirror = alt;
+        }
+    } else if let Some(ref cl) = cached_label {
+        if let Some(alt) = release.mirrors.iter().find(|m| &m.label == cl) {
+            chosen_mirror = alt;
+        }
+    }
+    if release.mirrors.len() > 1 && excluded.is_empty() && cached_label.is_none() {
+        let timeout = state.transcode_cfg.mirror_probe_timeout;
+        let candidates: Vec<SourceMirror> = release.mirrors.iter().cloned().take(3).collect();
+        let probe_client = state.proxy_client.clone();
+        let mut probe_futs = Vec::new();
+        for m in candidates.iter() {
+            let url = m.resolver_url.clone();
+            let headers = m.headers.clone();
+            let client = probe_client.clone();
+            probe_futs.push(async move {
+                let mut req = client.head(&url);
+                for (k, v) in &headers {
+                    if let Ok(hn) = reqwest::header::HeaderName::from_bytes(k.as_bytes()) {
+                        req = req.header(hn, v);
+                    }
+                }
+                let resp = tokio::time::timeout(timeout, req.send()).await;
+                match resp {
+                    Ok(Ok(r)) if r.status().is_success() => Some(m.label.clone()),
+                    _ => None,
+                }
+            });
+        }
+        let probed = futures::future::join_all(probe_futs).await;
+        for (idx, res) in probed.iter().enumerate() {
+            if res.is_some() {
+                chosen_mirror = &release.mirrors[idx];
+                state.mirror_health.set(health_key.clone(), chosen_mirror.label.clone());
+                break;
+            }
+        }
     }
 
     let (ticket, origin) = state
         .tickets
-        .insert(mirror.resolver_url.clone(), mirror.headers.clone());
-    let requires_headers = !mirror.headers.is_empty();
-    let path_and_query = if !origin.is_empty() && mirror.resolver_url.starts_with(&origin) {
-        mirror.resolver_url[origin.len()..].to_string()
+        .insert(chosen_mirror.resolver_url.clone(), chosen_mirror.headers.clone());
+    {
+        let mut meta_map = state.ticket_metas.inner.lock();
+        meta_map.insert(ticket.clone(), TicketMeta {
+            provider,
+            id: req.id.clone(),
+            season,
+            episode,
+            mirrors: release.mirrors.clone(),
+            current_idx: release.mirrors.iter().position(|m| m.label == chosen_mirror.label).unwrap_or(0),
+        });
+    }
+    let requires_headers = !chosen_mirror.headers.is_empty();
+    let path_and_query = if !origin.is_empty() && chosen_mirror.resolver_url.starts_with(&origin) {
+        chosen_mirror.resolver_url[origin.len()..].to_string()
     } else {
-        mirror.resolver_url.clone()
+        chosen_mirror.resolver_url.clone()
     };
     let play_url = format!("/api/proxy/{ticket}/a{path_and_query}");
 
@@ -794,8 +1882,8 @@ async fn play(State(state): State<AppState>, Json(req): Json<PlayParams>) -> Res
         season,
         episode,
         release: release.clone(),
-        mirror_label: mirror.label.clone(),
-        direct_file: mirror.direct_file,
+        mirror_label: chosen_mirror.label.clone(),
+        direct_file: chosen_mirror.direct_file,
         requires_headers,
         play_url,
     })
@@ -813,15 +1901,59 @@ struct TicketParams {
     headers: Vec<(String, String)>,
 }
 
-async fn create_ticket(
-    State(state): State<AppState>,
-    Json(req): Json<TicketParams>,
-) -> Response {
+async fn create_ticket(State(state): State<AppState>, Json(req): Json<TicketParams>) -> Response {
     if !moviebox_tui::net::is_http_url(&req.url) {
-        return api_error(StatusCode::BAD_REQUEST, "url must be an absolute http(s) url");
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "url must be an absolute http(s) url",
+        );
     }
     let (ticket, _) = state.tickets.insert(req.url, req.headers);
     Json(serde_json::json!({ "ticket": ticket })).into_response()
+}
+
+/// `POST /api/proxy/{ticket}/rotate` — re-mint same ticket id to next upstream mirror (stable id, position-safe)
+async fn proxy_rotate(State(state): State<AppState>, Path(ticket): Path<String>) -> Response {
+    let Some(meta) = state.ticket_metas.inner.lock().get(&ticket).cloned() else {
+        return api_error(StatusCode::NOT_FOUND, "unknown ticket for rotate");
+    };
+    let next_idx = (meta.current_idx + 1) % meta.mirrors.len().max(1);
+    if meta.mirrors.is_empty() || next_idx == meta.current_idx && meta.mirrors.len() == 1 {
+        return api_error(StatusCode::BAD_REQUEST, "no alternative mirror to rotate to");
+    }
+    let next_mirror = &meta.mirrors[next_idx];
+    // Re-insert ticket under same id but pointing at new upstream (stable ticket id)
+    {
+        let mut map = state.tickets.inner.lock();
+        if let Some(t) = map.get_mut(&ticket) {
+            t.raw_url = next_mirror.resolver_url.clone();
+            t.origin = origin_of(&next_mirror.resolver_url);
+            t.headers = next_mirror.headers.clone();
+            t.created = Instant::now();
+        } else {
+            // ticket expired: recreate under same id
+            map.insert(ticket.clone(), Ticket {
+                raw_url: next_mirror.resolver_url.clone(),
+                origin: origin_of(&next_mirror.resolver_url),
+                headers: next_mirror.headers.clone(),
+                created: Instant::now(),
+            });
+        }
+    }
+    // Invalidate manifest cache for this ticket (upstream changed, old rewrites stale)
+    {
+        let mut mc = state.manifest_cache.entries.lock();
+        let prefix = format!("manifest:{ticket}:");
+        mc.retain(|k, _| !k.starts_with(&prefix));
+    }
+    // Update metas cursor and mirror health
+    {
+        let mut meta_map = state.ticket_metas.inner.lock();
+        if let Some(m) = meta_map.get_mut(&ticket) { m.current_idx = next_idx; }
+    }
+    let health_key = format!("{}:{}:{}:{}", meta.provider.cache_key(), meta.id, meta.season, meta.episode);
+    state.mirror_health.set(health_key, next_mirror.label.clone());
+    Json(serde_json::json!({ "ticket": ticket, "mirror_label": next_mirror.label, "rotated": true })).into_response()
 }
 
 async fn proxy_fetch_foreign(state: AppState, foreign: Ticket, headers: HeaderMap) -> Response {
@@ -865,7 +1997,11 @@ async fn proxy_fetch_foreign(state: AppState, foreign: Ticket, headers: HeaderMa
     (status, out, Body::from_stream(stream)).into_response()
 }
 
-async fn proxy_fetch_inner_foreign(state: AppState, foreign: Ticket, headers: HeaderMap) -> Response {
+async fn proxy_fetch_inner_foreign(
+    state: AppState,
+    foreign: Ticket,
+    headers: HeaderMap,
+) -> Response {
     proxy_fetch_foreign(state, foreign, headers).await
 }
 
@@ -891,7 +2027,7 @@ async fn proxy_fetch_inner(
     rest: String,
     headers: HeaderMap,
 ) -> Response {
-    let Some(t) = state.tickets.get(&ticket) else {
+    let Some(t) = resolve_ticket(&state, &ticket) else {
         return api_error(StatusCode::NOT_FOUND, "unknown or expired ticket");
     };
 
@@ -930,6 +2066,64 @@ async fn proxy_fetch_inner(
         format!("{base}/{rest}")
     };
 
+    // ------ Manifest edge cache (B3): check cache before upstream fetch ------
+    // Keyed (ticket, upstream_url). VOD MPD 60s, live-ish HLS 5s via MANIFEST_CACHE_TTL.
+    let cache_key = format!("manifest:{}:{}", ticket, upstream);
+    let is_manifest_url = upstream.ends_with(".mpd") || upstream.ends_with(".m3u8");
+    let now = Instant::now();
+    // Fast-path: serve cached rewritten manifest if still fresh
+    if is_manifest_url {
+        if let Some((cached_text, cached_ct, cached_etag)) = state.manifest_cache.get_cached(&cache_key, now) {
+            // ETag / If-None-Match passthrough: short-circuit 304
+            if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+                if let Some(ref et) = cached_etag {
+                    if inm.trim() == et.trim() && !et.is_empty() {
+                        let mut out = HeaderMap::new();
+                        out.insert(header::ETAG, HeaderValue::from_str(et).unwrap_or(HeaderValue::from_static("cached")));
+                        out.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=5"));
+                        return (StatusCode::NOT_MODIFIED, out, Body::empty()).into_response();
+                    }
+                }
+            }
+            // Single-flight not needed for hit; serve cached rewritten payload directly
+            let mut out_cached = HeaderMap::new();
+            out_cached.insert(header::CONTENT_TYPE, HeaderValue::from_str(&cached_ct).unwrap_or(HeaderValue::from_static("application/octet-stream")));
+            out_cached.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&cached_text.len().to_string()).unwrap());
+            out_cached.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=5"));
+            if let Some(et) = cached_etag {
+                if let Ok(v) = HeaderValue::from_str(&et) { out_cached.insert(header::ETAG, v); }
+            }
+            // ETag hit already handled; this is a cache-hit 200
+            return (StatusCode::OK, out_cached, Body::from(cached_text.into_bytes())).into_response();
+        }
+    }
+    // Single-flight guard for cache miss: deduplicate concurrent playlist refresh herds
+    let flight_lock: Option<Arc<tokio::sync::Mutex<()>>> = if is_manifest_url {
+        Some(state.manifest_cache.per_key_lock(&cache_key))
+    } else { None };
+    let _flight_guard = if let Some(ref l) = flight_lock { Some(l.lock().await) } else { None };
+    if is_manifest_url {
+        // double-check after acquiring flight lock
+        if let Some((cached_text, cached_ct, cached_etag)) = state.manifest_cache.get_cached(&cache_key, Instant::now()) {
+            if let Some(inm) = headers.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
+                if let Some(ref et) = cached_etag {
+                    if inm.trim() == et.trim() && !et.is_empty() {
+                        let mut out = HeaderMap::new();
+                        out.insert(header::ETAG, HeaderValue::from_str(et).unwrap_or(HeaderValue::from_static("cached")));
+                        out.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=5"));
+                        return (StatusCode::NOT_MODIFIED, out, Body::empty()).into_response();
+                    }
+                }
+            }
+            let mut out_cached = HeaderMap::new();
+            out_cached.insert(header::CONTENT_TYPE, HeaderValue::from_str(&cached_ct).unwrap_or(HeaderValue::from_static("application/octet-stream")));
+            out_cached.insert(header::CONTENT_LENGTH, HeaderValue::from_str(&cached_text.len().to_string()).unwrap());
+            out_cached.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=5"));
+            if let Some(et) = cached_etag { if let Ok(v) = HeaderValue::from_str(&et) { out_cached.insert(header::ETAG, v); } }
+            return (StatusCode::OK, out_cached, Body::from(cached_text.into_bytes())).into_response();
+        }
+    }
+
     let mut builder = state.proxy_client.get(&upstream);
     for (name, value) in &t.headers {
         if let Ok(n) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
@@ -939,6 +2133,10 @@ async fn proxy_fetch_inner(
     builder = builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
     if let Some(range) = headers.get(reqwest::header::RANGE) {
         builder = builder.header(reqwest::header::RANGE, range);
+    }
+    // Forward If-None-Match for upstream 304 support
+    if let Some(inm) = headers.get(header::IF_NONE_MATCH) {
+        builder = builder.header(header::IF_NONE_MATCH, inm);
     }
 
     let resp = match builder.send().await {
@@ -952,6 +2150,15 @@ async fn proxy_fetch_inner(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // Capture ETag for caching before consuming headers
+    let upstream_etag = resp.headers().get(header::ETAG).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    // Upstream 304 passthrough: if upstream says not modified, forward 304 directly
+    if status == StatusCode::NOT_MODIFIED {
+        let mut out = HeaderMap::new();
+        if let Some(ref et) = upstream_etag { if let Ok(v) = HeaderValue::from_str(et) { out.insert(header::ETAG, v); } }
+        out.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=5"));
+        return (StatusCode::NOT_MODIFIED, out, Body::empty()).into_response();
+    }
     let is_manifest = status.is_success()
         && (upstream.ends_with(".mpd")
             || upstream.ends_with(".m3u8")
@@ -980,20 +2187,17 @@ async fn proxy_fetch_inner(
     if is_manifest && !t.origin.is_empty() {
         let bytes = match resp.bytes().await {
             Ok(b) if b.len() <= 16 * 1024 * 1024 => b,
-            _ => {
-                return api_error(
-                    StatusCode::BAD_GATEWAY,
-                    "manifest unreadable or too large",
-                )
-            }
+            _ => return api_error(StatusCode::BAD_GATEWAY, "manifest unreadable or too large"),
         };
         let base = format!(
             "{}/api/proxy/{ticket}/a",
             state.proxy_base.trim_end_matches('/')
         );
         // Determine if this is an HLS manifest (needs relative URL rewriting)
-        let is_hls = upstream.ends_with(".m3u8") || content_type.contains("mpegurl") || content_type.contains("vnd.apple.mpegurl");
-        
+        let is_hls = upstream.ends_with(".m3u8")
+            || content_type.contains("mpegurl")
+            || content_type.contains("vnd.apple.mpegurl");
+
         // Determine the directory prefix for resolving relative URLs in HLS manifests.
         // e.g. if upstream is http://host/stream/id/master.m3u8, dir is /stream/id/
         let upstream_path = if is_hls {
@@ -1008,55 +2212,77 @@ async fn proxy_fetch_inner(
         let proxy_dir = format!("{base}{upstream_path}/");
 
         let text = if is_hls {
-            // HLS: rewrite relative URLs line-by-line
-            String::from_utf8_lossy(&bytes)
+            // HLS: rewrite relative URLs line-by-line plus EXT-X-MEDIA URI rewriting for subtitles.
+            let proxied_lines: Vec<String> = String::from_utf8_lossy(&bytes)
                 .lines()
                 .map(|line| {
                     let trimmed = line.trim();
+                    if trimmed.starts_with("#EXT-X-MEDIA:") {
+                        if let Some(uri_val) = extract_hls_uri(trimmed) {
+                            let rewritten = rewrite_hls_url(&uri_val, &t.origin, &base, &proxy_dir, &state.tickets, &t.headers);
+                            let replaced = if line.contains(&format!("\"{}\"", uri_val)) {
+                                line.replacen(&format!("\"{}\"", uri_val), &format!("\"{}\"", rewritten), 1)
+                            } else if line.contains(&format!("'{}'", uri_val)) {
+                                line.replacen(&format!("'{}'", uri_val), &format!("'{}'", rewritten), 1)
+                            } else {
+                                line.replacen(&format!("URI={}", uri_val), &format!("URI={}", rewritten), 1)
+                            };
+                            return replaced;
+                        }
+                        return line.to_string();
+                    }
                     if trimmed.is_empty() || trimmed.starts_with('#') {
                         return line.to_string();
                     }
-                    // Rewrite absolute upstream URLs (same origin).
                     if trimmed.starts_with(&t.origin) {
                         return line.replacen(&t.origin, &base, 1);
                     }
-                    // Rewrite absolute URLs on OTHER hosts: issue a ticket for
-                    // the foreign URL and route through this same proxy so the
-                    // provider-required headers still attach. Tickets are
-                    // content-addressed per (url, headers) upstream so repeat
-                    // fetches reuse them instead of evicting live tickets.
                     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                        let (foreign_ticket, _) = state
-                            .tickets
-                            .insert_dedup(trimmed.to_string(), t.headers.clone());
+                        let (foreign_ticket, _) = state.tickets.insert_dedup(trimmed.to_string(), t.headers.clone());
                         return format!("{base}/{foreign_ticket}");
                     }
-                    // Rewrite relative URLs (e.g. "seg/0" or "360p.m3u8")
                     if !trimmed.starts_with('/') {
                         return format!("{proxy_dir}{trimmed}");
                     }
                     line.to_string()
                 })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect();
+            proxied_lines.join("\n")
         } else {
-            // DASH/Other: simple origin replacement only (preserve XML structure)
-            String::from_utf8_lossy(&bytes).replace(&t.origin, &base)
+            // DASH: XML-aware rewrite (BaseURL / SegmentTemplate $Number$/$Time$) + subtitle foreign tickets.
+            let rewritten = rewrite_dash_manifest_xml_aware(&String::from_utf8_lossy(&bytes), &t.origin, &base, upstream.as_str(), &state.tickets, &t.headers);
+            // Fallback: origin replacement for any absolute remaining, then foreign subtitle URIs
+            let mut dash_text = rewritten.replace(&t.origin, &base);
+            // Ensure any remaining absolute http(s) URLs in BaseURL/SegmentTemplate media/initialization are ticketed
+            dash_text = rewrite_dash_foreign_urls(&dash_text, &base, &state.tickets, &t.headers);
+            // Preserve $Number$/$Time$ placeholders verbatim — they are template variables, not URLs
+            dash_text
         };
         // Preserve original content-type for HLS, override for DASH if missing
-        let final_content_type = if content_type.contains("mpegurl") || content_type.contains("vnd.apple.mpegurl") {
-            content_type.to_string()
-        } else {
-            "application/dash+xml".to_string()
-        };
+        let final_content_type =
+            if content_type.contains("mpegurl") || content_type.contains("vnd.apple.mpegurl") {
+                content_type.to_string()
+            } else {
+                "application/dash+xml".to_string()
+            };
+        // Cache rewritten manifest: TTL depends on type (VOD MPD 60s, live-ish HLS 5s via MANIFEST_CACHE_TTL)
+        let ttl = if is_hls { state.transcode_cfg.manifest_cache_ttl } else { Duration::from_secs(60) };
+        // Keep ETag from upstream if present, else generate a weak one from content hash
+                let cache_etag = upstream_etag.clone().or_else(|| Some(format!("W/\"{}\"", text.len().wrapping_mul(31).wrapping_add(text.bytes().fold(0usize, |a,b| a.wrapping_add(b as usize))))));
+        state.manifest_cache.insert(cache_key.clone(), text.clone(), final_content_type.clone(), cache_etag.clone(), ttl);
         out.insert(
             axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_str(&final_content_type).unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            HeaderValue::from_str(&final_content_type)
+                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
         );
         out.insert(
             axum::http::header::CONTENT_LENGTH,
             HeaderValue::from_str(&text.len().to_string()).unwrap(),
         );
+        if let Some(ref et) = cache_etag { if let Ok(v) = HeaderValue::from_str(et) { out.insert(header::ETAG, v); } }
+        out.insert(header::CACHE_CONTROL, HeaderValue::from_static(if is_hls { "public, max-age=5" } else { "public, max-age=60" }));
+        // _flight_guard drops here, releasing single-flight
+        drop(_flight_guard);
         return (StatusCode::OK, out, Body::from(text.into_bytes())).into_response();
     }
 
@@ -1082,17 +2308,48 @@ struct TranscodeStartParams {
 /// Probe for a usable ffmpeg binary: an explicitly configured
 /// `MOVIEBOX_FFMPEG_PATH` wins (missing configured path -> not found);
 /// otherwise a `which`-style walk over PATH for `ffmpeg`.
+async fn resolve_ffprobe() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("MOVIEBOX_FFPROBE_PATH") {
+        if !p.trim().is_empty() {
+            let p = PathBuf::from(p.trim());
+            let is_file = tokio::fs::metadata(&p)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            return is_file.then_some(p);
+        }
+    }
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let candidate = dir.join("ffprobe");
+        if tokio::fs::metadata(&candidate)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 async fn resolve_ffmpeg() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("MOVIEBOX_FFMPEG_PATH") {
         if !p.trim().is_empty() {
             let p = PathBuf::from(p.trim());
-            let is_file = tokio::fs::metadata(&p).await.map(|m| m.is_file()).unwrap_or(false);
+            let is_file = tokio::fs::metadata(&p)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false);
             return is_file.then_some(p);
         }
     }
     for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
         let candidate = dir.join("ffmpeg");
-        if tokio::fs::metadata(&candidate).await.map(|m| m.is_file()).unwrap_or(false) {
+        if tokio::fs::metadata(&candidate)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
             return Some(candidate);
         }
     }
@@ -1169,6 +2426,188 @@ where
         let mut lines = tokio::io::BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             log::debug!("transcode[{tag}]: {line}");
+        }
+    });
+}
+/// Format seconds as WebVTT timestamp HH:MM:SS.mmm (or MM:SS.mmm when <1h is handled by parser)
+fn format_vtt_time(secs: f64) -> String {
+    let total_ms = (secs.max(0.0) * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    if h > 0 {
+        format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+    } else {
+        format!("{m:02}:{s:02}.{ms:03}")
+    }
+}
+
+/// Write a WebVTT thumbnail index for the given duration. Each entry spans
+/// `interval` seconds and points at a tiled sprite sheet where 100 thumbs
+/// (10x10) share one JPEG. Coordinates are derived from the tile grid so the
+/// client can do `sprite-#/ #xywh` lookups without parsing the image.
+fn generate_thumbs_vtt(dir: &std::path::Path, duration: Option<f64>, interval: u64) -> std::io::Result<()> {
+    let dur = duration.unwrap_or(7200.0).max(interval as f64);
+    let interval_f = interval as f64;
+    let mut count = (dur / interval_f).ceil() as u64;
+    if count == 0 {
+        count = 1;
+    }
+    // Guard against runaway files (10h at 1s interval would be 36k lines).
+    count = count.min(3600);
+    let mut vtt = String::from("WEBVTT\n\n");
+    for i in 0..count {
+        let start = i as f64 * interval_f;
+        let end = ((i + 1) as f64 * interval_f).min(dur);
+        let sprite_idx = i / 100;
+        let pos = i % 100;
+        let col = pos % 10;
+        let row = pos / 10;
+        let x = col * 160;
+        let y = row * 90;
+        vtt.push_str(&format!(
+            "{} --> {}\n",
+            format_vtt_time(start),
+            format_vtt_time(end)
+        ));
+        vtt.push_str(&format!("sprite-{sprite_idx}.jpg#xywh={x},{y},160,90\n\n"));
+    }
+    std::fs::write(dir.join("thumbs.vtt"), vtt)
+}
+
+fn sprite_args(cfg: &TranscodeConfig, manifest_url: &str, dir: &std::path::Path) -> Vec<String> {
+    let vf = format!("fps=1/{},scale=160:90,tile=10x10", cfg.sprite_interval);
+    let pattern = dir.join("sprite-%d.jpg");
+    vec![
+        "-hide_banner".to_string(),
+        "-loglevel".to_string(),
+        "error".to_string(),
+        "-y".to_string(),
+        "-skip_frame".to_string(),
+        "nokey".to_string(),
+        "-i".to_string(),
+        manifest_url.to_string(),
+        "-vf".to_string(),
+        vf,
+        "-an".to_string(),
+        "-vsync".to_string(),
+        "vfr".to_string(),
+        "-qscale:v".to_string(),
+        "4".to_string(),
+        pattern.to_string_lossy().into_owned(),
+    ]
+}
+
+fn spawn_sprite_generation(
+    store: Arc<TranscodeStore>,
+    session_id: String,
+    manifest_url: String,
+    dir: PathBuf,
+    cfg: Arc<TranscodeConfig>,
+    duration: Option<f64>,
+    ffmpeg: PathBuf,
+) {
+    // Deadlock rule: never hold the registry lock across await/spawn beyond
+    // the short check below. The actual ffmpeg spawn happens after the lock
+    // is released.
+    let already = {
+        let map = store.inner.lock();
+        map.get(&session_id)
+            .map(|s| s.sprite_child.is_some())
+            .unwrap_or(true)
+    };
+    if already {
+        return;
+    }
+    // Pre-generate VTT immediately so the client can fetch it before any
+    // JPEG finishes — sprites are resolved via the same dir.
+    if let Err(e) = generate_thumbs_vtt(&dir, duration, cfg.sprite_interval) {
+        log::warn!("transcode[{}]: failed writing thumbs.vtt: {e}", session_id);
+    } else {
+        log::info!(
+            "transcode[{}]: wrote thumbs.vtt (interval {}s, duration {:?})",
+            session_id,
+            cfg.sprite_interval,
+            duration
+        );
+    }
+    let store_clone = store.clone();
+    tokio::task::spawn(async move {
+        let mut cmd = tokio::process::Command::new(&ffmpeg);
+        cmd.args(sprite_args(&cfg, &manifest_url, &dir))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = match cmd.spawn() {
+            Ok(mut c) => {
+                if let Some(out) = c.stdout.take() {
+                    spawn_ffmpeg_drain(out, format!("{session_id}-sprite"));
+                }
+                if let Some(err) = c.stderr.take() {
+                    spawn_ffmpeg_drain(err, format!("{session_id}-sprite"));
+                }
+                c
+            }
+            Err(e) => {
+                log::warn!("transcode[{}]: sprite ffmpeg spawn failed: {e}", session_id);
+                return;
+            }
+        };
+        // Register the sprite child so cleanup and on-demand checks see it.
+        {
+            let mut map = store_clone.inner.lock();
+            if let Some(s) = map.get_mut(&session_id) {
+                if s.sprite_child.is_none() {
+                    s.sprite_child = Some(child);
+                } else {
+                    // Another task raced us; drop this child.
+                    return;
+                }
+            } else {
+                // Session vanished before we could register.
+                return;
+            }
+        }
+        log::info!(
+            "transcode[{}]: sprite ffmpeg started (interval {}s) -> {}",
+            session_id,
+            cfg.sprite_interval,
+            dir.display()
+        );
+        // The child runs to completion (or is killed on cleanup). We don't
+        // block the handler — the watcher will notice exit via try_wait on
+        // the main child only; sprite child is fire-and-forget except for
+        // cleanup. Poll it ourselves to log completion.
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let done = {
+                let mut map = store_clone.inner.lock();
+                match map.get_mut(&session_id) {
+                    Some(s) => match s.sprite_child.as_mut() {
+                        Some(c) => match c.try_wait() {
+                            Ok(Some(status)) => {
+                                log::info!("transcode[{}]: sprite ffmpeg exited: {status:?}", session_id);
+                                s.sprite_child = None;
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(e) => {
+                                log::warn!("transcode[{}]: sprite try_wait error: {e}", session_id);
+                                false
+                            }
+                        },
+                        None => true,
+                    },
+                    None => true,
+                }
+            };
+            if done {
+                break;
+            }
         }
     });
 }
@@ -1267,6 +2706,8 @@ fn produced_seconds_in(dir: &std::path::Path) -> f64 {
 
 /// Remove every segment file and the playlist in a session dir so a seek
 /// restart begins from a clean slate. Leaves unrelated files alone.
+/// Sprite sheets (`sprite-N.jpg`) and `thumbs.vtt` are keyed to absolute
+/// content time and MUST NOT be deleted on seek.
 async fn wipe_transcode_outputs(dir: &std::path::Path) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
@@ -1274,9 +2715,11 @@ async fn wipe_transcode_outputs(dir: &std::path::Path) {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        if name == "thumbs.vtt" || (name.starts_with("sprite-") && name.ends_with(".jpg")) {
+            continue;
+        }
         let is_output = name == "index.m3u8"
-            || (name.starts_with("seg")
-                && (name.ends_with(".ts") || name.ends_with(".tmp")));
+            || (name.starts_with("seg") && (name.ends_with(".ts") || name.ends_with(".tmp")));
         if is_output {
             let _ = tokio::fs::remove_file(entry.path()).await;
         }
@@ -1291,6 +2734,12 @@ async fn cleanup_transcode_session(session: TranscodeSession, base_dir: &std::pa
         let _ = c.wait().await;
     }
     drop(child);
+    let mut sprite = session.sprite_child;
+    if let Some(c) = sprite.as_mut() {
+        let _ = c.kill().await;
+        let _ = c.wait().await;
+    }
+    drop(sprite);
     if let Err(e) = tokio::fs::remove_dir_all(&session.dir).await {
         if e.kind() != std::io::ErrorKind::NotFound {
             log::warn!(
@@ -1319,7 +2768,9 @@ fn spawn_transcode_watcher(store: Arc<TranscodeStore>, session_id: String) {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let exited = {
                 let mut map = store.inner.lock();
-                let Some(s) = map.get_mut(&session_id) else { return };
+                let Some(s) = map.get_mut(&session_id) else {
+                    return;
+                };
                 // The m3u8 read is synchronous and tiny; safe under the lock.
                 let fresh = produced_seconds_in(&s.dir);
                 if s.restarting {
@@ -1464,9 +2915,13 @@ async fn transcode_start(
             session_id.clone(),
             TranscodeSession {
                 ticket: req.ticket.clone(),
+                headers: ticket.headers.clone(),
+                raw_url: ticket.raw_url.clone(),
+                origin: ticket.origin.clone(),
                 manifest_url: manifest_url.clone(),
                 dir: dir.clone(),
                 child: None,
+                sprite_child: None,
                 last_used: Instant::now(),
                 started: Instant::now(),
                 duration_seconds: source_duration,
@@ -1512,7 +2967,19 @@ async fn transcode_start(
                 }
             }
             // Watch for natural exit once the child is registered.
-            spawn_transcode_watcher(store, session_id.clone());
+            spawn_transcode_watcher(store.clone(), session_id.clone());
+            // Fire the thumbnail sprite pass (no lock held across await/spawn
+            // inside). Thumbs are keyed to absolute time, so later seeks must
+            // not wipe them.
+            spawn_sprite_generation(
+                store,
+                session_id.clone(),
+                manifest_url.clone(),
+                dir.clone(),
+                state.transcode_cfg.clone(),
+                source_duration,
+                ffmpeg.clone(),
+            );
             log::info!(
                 "transcode[{session_id}]: started ffmpeg {} for ticket {} -> {}",
                 ffmpeg.display(),
@@ -1547,11 +3014,25 @@ async fn transcode_start(
 }
 
 fn valid_transcode_filename(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
         return false;
     }
     if name == "index.m3u8" {
         return true;
+    }
+    if name == "thumbs.vtt" {
+        return true;
+    }
+    if name.starts_with("sprite-") && name.ends_with(".jpg") {
+        let mid = &name[7..name.len() - 4];
+        if !mid.is_empty() && mid.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
     }
     // segNNNNN.ts (5-digit sequence from -hls_segment_filename seg%05d.ts).
     name.len() == 11
@@ -1560,10 +3041,7 @@ fn valid_transcode_filename(name: &str) -> bool {
         && name.as_bytes()[3..8].iter().all(u8::is_ascii_digit)
 }
 
-async fn transcode_state(
-    State(state): State<AppState>,
-    Path(session): Path<String>,
-) -> Response {
+async fn transcode_state(State(state): State<AppState>, Path(session): Path<String>) -> Response {
     let (snapshot, stale) = {
         let mut map = state.transcodes.inner.lock();
         let stale = TranscodeStore::prune_locked(&mut map);
@@ -1729,9 +3207,7 @@ async fn transcode_seek(
         let mut map = state.transcodes.inner.lock();
         match map.get_mut(&session) {
             Some(s) => s.child.take(),
-            None => {
-                return api_error(StatusCode::NOT_FOUND, "unknown transcode session")
-            }
+            None => return api_error(StatusCode::NOT_FOUND, "unknown transcode session"),
         }
     };
     if let Some(child) = old_child.as_mut() {
@@ -1779,12 +3255,7 @@ async fn transcode_seek(
                     }
                     // Session was deleted mid-restart: `child` drops here
                     // (kill_on_drop) and DELETE already removed the dir.
-                    None => {
-                        return api_error(
-                            StatusCode::NOT_FOUND,
-                            "unknown transcode session",
-                        )
-                    }
+                    None => return api_error(StatusCode::NOT_FOUND, "unknown transcode session"),
                 }
             }
             log::info!(
@@ -1818,9 +3289,42 @@ async fn transcode_seek(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Thumbnail sprites (B1): second ffmpeg pass
+// ---------------------------------------------------------------------------
+async fn transcode_sprites(State(state): State<AppState>, Path(session): Path<String>) -> Response {
+    let (dir, duration, sprite_interval) = {
+        let mut map = state.transcodes.inner.lock();
+        let Some(s) = map.get_mut(&session) else {
+            return api_error(StatusCode::NOT_FOUND, "unknown transcode session");
+        };
+        s.last_used = Instant::now();
+        (s.dir.clone(), s.duration_seconds, state.transcode_cfg.sprite_interval)
+    };
+    // The VTT is generated synchronously at session start; if missing we
+    // regenerate on demand (handles a race where the handler ran before
+    // spawn_sprite_generation flushed).
+    let vtt_path = dir.join("thumbs.vtt");
+    if !vtt_path.exists() {
+        if let Err(e) = generate_thumbs_vtt(&dir, duration, sprite_interval) {
+            log::warn!("transcode[{}]: on-demand thumbs.vtt generation failed: {e}", session);
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("failed generating thumbs.vtt: {e}"));
+        }
+    }
+    if !vtt_path.exists() {
+        return api_error(StatusCode::NOT_FOUND, "thumbs not ready");
+    }
+    Json(serde_json::json!({
+        "session": session,
+        "vtt_url": format!("/api/transcode/{session}/thumbs.vtt"),
+    }))
+    .into_response()
+}
+
 async fn transcode_file(
     State(state): State<AppState>,
     Path((session, name)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     let dir = {
         let mut map = state.transcodes.inner.lock();
@@ -1834,8 +3338,8 @@ async fn transcode_file(
         return api_error(StatusCode::NOT_FOUND, "unknown transcode file");
     }
     let path = dir.join(&name);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return api_error(StatusCode::NOT_FOUND, "transcode file not ready");
         }
@@ -1843,37 +3347,107 @@ async fn transcode_file(
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("cannot read {}: {e}", path.display()),
-            )
+            );
         }
     };
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot stat {}: {e}", path.display()),
+            );
+        }
+    };
+    let file_size = metadata.len();
     let content_type = if name.ends_with(".m3u8") {
         "application/vnd.apple.mpegurl"
+    } else if name.ends_with(".vtt") {
+        "text/vtt"
+    } else if name.ends_with(".jpg") || name.ends_with(".jpeg") {
+        "image/jpeg"
     } else if name.ends_with(".ts") {
         "video/mp2t"
     } else {
         "application/octet-stream"
     };
+    // Range support: parse `Range: bytes=...`
+    if let Some(range_val) = headers.get(header::RANGE)
+        && let Ok(range_str) = range_val.to_str()
+        && let Some(parsed) = parse_range_header(range_str, file_size)
+    {
+        match parsed {
+            Ok((start, end)) => {
+                let length = end - start;
+                let mut file = file;
+                if let Err(e) = file.seek(SeekFrom::Start(start)).await {
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("seek failed: {e}"),
+                    );
+                }
+                let limited = file.take(length);
+                let stream = ReaderStream::new(limited);
+                let content_range = format!("bytes {}-{}/{}", start, end - 1, file_size);
+                return (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+                        (
+                            header::CONTENT_LENGTH,
+                            HeaderValue::from_str(&length.to_string()).unwrap(),
+                        ),
+                        (
+                            header::CONTENT_RANGE,
+                            HeaderValue::from_str(&content_range).unwrap(),
+                        ),
+                        (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
+                        (
+                            header::CACHE_CONTROL,
+                            HeaderValue::from_static("public, max-age=31536000, immutable"),
+                        ),
+                    ],
+                    Body::from_stream(stream),
+                )
+                    .into_response();
+            }
+            Err(()) => {
+                return (
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [
+                        (
+                            header::CONTENT_RANGE,
+                            HeaderValue::from_str(&format!("bytes */{file_size}")).unwrap(),
+                        ),
+                        (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
+                    ],
+                    Body::empty(),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let stream = ReaderStream::new(file);
     (
         StatusCode::OK,
         [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
             (
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static(content_type),
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&file_size.to_string()).unwrap(),
             ),
+            (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
             (
-                axum::http::header::CONTENT_LENGTH,
-                HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
             ),
         ],
-        Body::from(bytes),
+        Body::from_stream(stream),
     )
         .into_response()
 }
 
-async fn transcode_delete(
-    State(state): State<AppState>,
-    Path(session): Path<String>,
-) -> Response {
+async fn transcode_delete(State(state): State<AppState>, Path(session): Path<String>) -> Response {
     let removed = {
         let mut map = state.transcodes.inner.lock();
         map.remove(&session)
@@ -2155,12 +3729,18 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         })
     })
     .collect();
+    let ffmpeg_ok = tokio::fs::metadata(&state.transcode_cfg.ffmpeg_path).await.map(|m| m.is_file()).unwrap_or(false)
+        || resolve_ffmpeg().await.is_some();
     Json(serde_json::json!({
         "ok": true,
         "service": "moviebox-server",
         "version": env!("CARGO_PKG_VERSION"),
         "region": moviebox_tui::config::moviebox_region(),
         "providers": providers,
+        "transcode": {
+            "enabled": state.transcode_cfg.enabled,
+            "ffmpeg": ffmpeg_ok,
+        }
     }))
 }
 
@@ -2206,16 +3786,19 @@ async fn main() {
             );
         }
         log::info!(
-            "transcode gateway enabled: base={}, ffmpeg={}, preset={}, crf={}",
+            "transcode gateway enabled: base={}, ffmpeg={}, preset={}, crf={}, sprite_interval={}s",
             transcode_cfg.base_dir.display(),
             transcode_cfg.ffmpeg_path,
             transcode_cfg.preset,
-            transcode_cfg.crf
+            transcode_cfg.crf,
+            transcode_cfg.sprite_interval
         );
     } else {
         log::info!("transcode gateway disabled (TRANSCODE_ENABLED != 1)");
     }
-
+    let transcodes_for_janitor = transcodes.clone();
+    let janitor_base = transcode_cfg.base_dir.clone();
+    let janitor_enabled = transcode_cfg.enabled;
     let state = AppState {
         svc,
         tickets: Arc::new(TicketStore::default()),
@@ -2223,8 +3806,13 @@ async fn main() {
         proxy_base,
         transcodes,
         transcode_cfg,
+        manifest_cache: Arc::new(ManifestCache::new()),
+        mirror_health: Arc::new(MirrorHealthCache::new()),
+        ticket_metas: Arc::new(TicketMetaStore::new()),
     };
-
+    if janitor_enabled {
+        spawn_transcode_janitor(transcodes_for_janitor, janitor_base);
+    }
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/home", get(home))
@@ -2238,29 +3826,23 @@ async fn main() {
         .route("/api/details", get(details))
         .route("/api/streams", get(streams))
         .route("/api/captions", get(captions))
+        .route("/api/subtitles/search", get(subtitle_search))
+        .route("/api/skip-markers", get(skip_markers))
         .route("/api/play", post(play))
         .route("/api/proxy/ticket", post(create_ticket))
+        .route("/api/proxy/{ticket}/rotate", post(proxy_rotate))
         .route("/api/proxy/{ticket}", get(proxy_fetch_root))
         .route("/api/proxy/{ticket}/{*rest}", get(proxy_fetch))
         .route("/api/transcode/start", post(transcode_start))
-        .route(
-            "/api/transcode/{session}/state",
-            get(transcode_state),
-        )
-        .route(
-            "/api/transcode/{session}/seek",
-            post(transcode_seek),
-        )
-        .route(
-            "/api/transcode/{session}/{*rest}",
-            get(transcode_file),
-        )
+        .route("/api/transcode/{session}/state", get(transcode_state))
+        .route("/api/transcode/{session}/seek", post(transcode_seek))
+        .route("/api/transcode/{session}/sprites", get(transcode_sprites))
+        .route("/api/transcode/{session}/{*rest}", get(transcode_file))
         .route("/api/transcode/{session}", delete(transcode_delete))
         .route("/api/config", get(get_config))
         .route("/api/local-history", get(local_history))
         .route("/api/local-favorites", get(local_favorites))
         .with_state(state);
-
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await

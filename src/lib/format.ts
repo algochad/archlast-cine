@@ -45,3 +45,9 @@ export function cleanFilename(name: string): string {
     .replace(/\s+/g, " ")
     .trim();
 }
+export function formatRemaining(display: number, duration: number): string {
+  if (!Number.isFinite(display) || !Number.isFinite(duration) || duration <= 0) return `-${formatClock(0)}`;
+  const clampedDisplay = Math.max(0, display);
+  const remaining = Math.max(0, duration - clampedDisplay);
+  return `-${formatClock(remaining)}`;
+}

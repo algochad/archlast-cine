@@ -1910,6 +1910,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "env_logger",
+ "futures",
  "log",
  "moviebox-tui",
  "parking_lot",
@@ -1918,6 +1919,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

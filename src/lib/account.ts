@@ -5,6 +5,7 @@
 // CatalogItem/MediaDetails so lists can render without extra fetches.
 
 import type { MediaType } from "@/lib/media-types";
+import type { SubStyle } from "@/lib/sub-style";
 
 // Re-export the unified media model union ("movie" | "series" | "anime").
 // Persisted account entries can now carry any of the three media types,
@@ -20,11 +21,23 @@ export interface AccountUser {
   createdAt: string;
 }
 
+export interface PlayerPrefsSubset {
+  seekStep?: 5 | 10 | 15 | 30 | 60;
+  playbackRate?: number;
+  autoplay?: boolean;
+  prefSubLang?: string[];
+  prefAudioLang?: string[];
+  subStyle?: SubStyle;
+  aspectMode?: 'contain' | 'cover' | 'fill';
+}
+
 export interface AccountSettings {
   /** Streaming-market region; maps to a Rust backend in the region pool. */
   region: RegionId;
   /** Default content provider. */
   provider: "moviebox" | "fourkhdhub";
+  /** Synced player prefs subset (cross-device). Device-local prefs stay in localStorage only. */
+  player?: PlayerPrefsSubset;
 }
 
 export interface AccountState {

@@ -13,6 +13,15 @@ import {
 import { accountApi, AccountError, type WatchEntryInput } from "@/lib/api-account";
 import type { AccountSettings, MyListItem, RegionId, WatchEntry } from "@/lib/account";
 import type { HistoryApi, MyListState, SessionState } from "@/lib/session-contract";
+import {
+  getPrefs,
+  setPrefs,
+  subscribePrefs,
+  extractSyncSubset,
+  PLAYER_PREFS_SEEDED_KEY,
+  PLAYER_PREFS_SEEDED_LEGACY_KEY,
+} from "@/lib/player-prefs";
+import type { PlayerPrefs } from "@/lib/player-prefs";
 
 const DEFAULT_SETTINGS: AccountSettings = { region: "ph", provider: "moviebox" };
 
@@ -78,6 +87,30 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     itemsRef.current = items;
   }, [status, items]);
 
+  // ---- Player prefs sync: server-wins-with-local-seed (once) + 2s debounce push ----
+  const prefsPushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastPushedSubsetRef = useRef<string>("");
+  const seededAppliedRef = useRef(false);
+
+  const schedulePrefsPush = useCallback((subset: ReturnType<typeof extractSyncSubset>) => {
+    const serialized = JSON.stringify(subset);
+    if (serialized === lastPushedSubsetRef.current) return;
+    if (prefsPushTimerRef.current) clearTimeout(prefsPushTimerRef.current);
+    prefsPushTimerRef.current = setTimeout(() => {
+      prefsPushTimerRef.current = null;
+      if (statusRef.current !== "authed") return;
+      // Don't push empty subset on initial seed when server already had values
+      lastPushedSubsetRef.current = serialized;
+      void accountApi
+        .updateSettings({ player: subset })
+        .catch((err) => {
+          console.warn("[session] player prefs sync failed:", err);
+          // allow retry by resetting last pushed
+          lastPushedSubsetRef.current = "";
+        });
+    }, 2000);
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const state = await accountApi.me();
@@ -98,6 +131,102 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // One-time merge: server-wins-with-local-seed via prefsSeeded flag
+  useEffect(() => {
+    if (status !== "authed") return;
+    if (typeof window === "undefined") return;
+    if (seededAppliedRef.current) return;
+    // Flag stored as "1" once initial merge has run on this device
+    const alreadySeeded =
+      window.localStorage.getItem(PLAYER_PREFS_SEEDED_KEY) ||
+      window.localStorage.getItem(PLAYER_PREFS_SEEDED_LEGACY_KEY);
+    if (alreadySeeded) {
+      seededAppliedRef.current = true;
+      // Initialize lastPushed to current sync subset so first local edit is detected
+      try {
+        lastPushedSubsetRef.current = JSON.stringify(extractSyncSubset(getPrefs()));
+      } catch {}
+      return;
+    }
+    seededAppliedRef.current = true;
+    try {
+      const local = getPrefs();
+      const serverPlayer = (settings as AccountSettings & { player?: Record<string, unknown> }).player;
+      const hasServerPlayer = serverPlayer && typeof serverPlayer === "object" && Object.keys(serverPlayer).length > 0;
+
+      if (hasServerPlayer) {
+        // Server wins: merge server subset over local, preserving device-local keys
+        const patch: Partial<PlayerPrefs> = {};
+        const sp = serverPlayer as Record<string, unknown>;
+        if (sp.seekStep !== undefined) patch.seekStep = sp.seekStep as PlayerPrefs["seekStep"];
+        if (sp.playbackRate !== undefined) patch.playbackRate = sp.playbackRate as number;
+        if (sp.autoplay !== undefined) patch.autoplay = sp.autoplay as boolean;
+        if (Array.isArray(sp.prefSubLang)) patch.prefSubLang = (sp.prefSubLang as string[]).slice();
+        if (Array.isArray(sp.prefAudioLang)) patch.prefAudioLang = (sp.prefAudioLang as string[]).slice();
+        if (typeof sp.aspectMode === "string") patch.aspectMode = sp.aspectMode as PlayerPrefs["aspectMode"];
+        if (sp.subStyle && typeof sp.subStyle === "object") patch.subStyle = { ...local.subStyle, ...(sp.subStyle as object) } as PlayerPrefs["subStyle"];
+        if (Object.keys(patch).length > 0) {
+          const merged = setPrefs(patch);
+          lastPushedSubsetRef.current = JSON.stringify(extractSyncSubset(merged));
+        } else {
+          lastPushedSubsetRef.current = JSON.stringify(extractSyncSubset(local));
+        }
+      } else {
+        // No server prefs yet: seed server with local sync subset
+        const subset = extractSyncSubset(local);
+        lastPushedSubsetRef.current = JSON.stringify(subset);
+        schedulePrefsPush(subset);
+      }
+      window.localStorage.setItem(PLAYER_PREFS_SEEDED_KEY, "1");
+      try { window.localStorage.setItem(PLAYER_PREFS_SEEDED_LEGACY_KEY, "1"); } catch {}
+    } catch (err) {
+      console.warn("[session] prefs merge failed:", err);
+      try {
+        window.localStorage.setItem(PLAYER_PREFS_SEEDED_KEY, "1");
+        window.localStorage.setItem(PLAYER_PREFS_SEEDED_LEGACY_KEY, "1");
+      } catch {}
+    }
+  }, [status, settings, schedulePrefsPush]);
+
+  // Debounced push: subscribe to local prefs changes while authed
+  useEffect(() => {
+    if (status !== "authed") return;
+    if (typeof window === "undefined") return;
+    // Don't subscribe until initial seeded merge has run
+    if (!seededAppliedRef.current) return;
+    // Ensure lastPushed is initialized
+    try {
+      if (!lastPushedSubsetRef.current) lastPushedSubsetRef.current = JSON.stringify(extractSyncSubset(getPrefs()));
+    } catch {}
+    const unsub = subscribePrefs((next) => {
+      const subset = extractSyncSubset(next);
+      schedulePrefsPush(subset);
+    });
+    return () => {
+      unsub();
+      if (prefsPushTimerRef.current) {
+        clearTimeout(prefsPushTimerRef.current);
+        prefsPushTimerRef.current = null;
+      }
+    };
+  }, [status, schedulePrefsPush]);
+
+  // Reset seeded flag on logout so next sign-in re-seeds if needed
+  // (kept device-local; logout clears to allow fresh merge on next auth)
+  const clearSeededFlag = useCallback(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.removeItem(PLAYER_PREFS_SEEDED_KEY);
+      try { window.localStorage.removeItem(PLAYER_PREFS_SEEDED_LEGACY_KEY); } catch {}
+    } catch {}
+    seededAppliedRef.current = false;
+    lastPushedSubsetRef.current = "";
+    if (prefsPushTimerRef.current) {
+      clearTimeout(prefsPushTimerRef.current);
+      prefsPushTimerRef.current = null;
+    }
+  }, []);
 
   // My list + server history follow the session: load on sign-in, clear on
   // sign-out. Anon settles immediately with empty state.
@@ -163,10 +292,11 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     setListReady(true);
     setHistoryReady(true);
     setStatus("anon");
-  }, []);
+    clearSeededFlag();
+  }, [clearSeededFlag]);
 
-  const updateSettings = useCallback(async (patch: { region?: string; provider?: string }) => {
-    const updated = await accountApi.updateSettings(patch);
+  const updateSettings = useCallback(async (patch: { region?: string; provider?: string; player?: import("@/lib/account").PlayerPrefsSubset }) => {
+    const updated = await accountApi.updateSettings(patch as unknown as { region?: string; provider?: string });
     setSettings(updated);
   }, []);
 
