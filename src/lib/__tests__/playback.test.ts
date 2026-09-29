@@ -163,6 +163,13 @@ describe("sniffManifest", () => {
   it("detects marker-less video sets by codec", () => {
     expect(sniffManifest(MARKERLESS_HEVC).hevcOnly).toBe(true);
   });
+  it("detects unquoted codecs attributes (MovieBox MPDs omit quotes)", () => {
+    const s = sniffManifest(
+      `<MPD><Period><AdaptationSet contentType=video mimeType=video/mp4><Representation id="v0" codecs=hev1.1.6.L120.90/></AdaptationSet></Period></MPD>`,
+    );
+    expect(s.videoCodecs).toContain("hevc");
+    expect(s.hevcOnly).toBe(true);
+  });
   it("accepts AV1 as a broadly-decodable fallback", () => {
     const s = sniffManifest(AV1_HEVC_MIXED);
     expect(s.hasFallback).toBe(true);

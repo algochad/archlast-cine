@@ -25,7 +25,7 @@ import {
 } from "@/lib/captions";
 import { formatClock, formatRemaining } from "@/lib/format";
 import { getHistory, isComplete } from "@/lib/history";
-import { browserSupportsHevc, parseMpdDuration, pickPlayableManifest, rewriteRelativeTo, sniffHls, sniffSubtitles } from "@/lib/playback";
+import { browserSupportsHevc, parseMpdDuration, pickPlayableManifest, rewriteRelativeTo, sniffHls, sniffManifest, sniffSubtitles } from "@/lib/playback";
 import { applyScrubSensitivity, chapterLeftPct, chapterWidthPct, clampSeekTarget, isSeekableDuration, resolveDisplayTime, seekProgressPct, resolveSeekStep } from "@/lib/seek";
 import { useMyList, useServerHistory, useSession } from "@/lib/session";
 import type { Chapter, MediaDetails, Release, StreamsResponse, SubtitleOption } from "@/lib/types";
@@ -1889,6 +1889,8 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
 
         let dashSource = source;
         if (manifestText !== null) {
+          const pre = sniffManifest(manifestText);
+          console.warn(`[playback] sniff codecs=[${pre.videoCodecs.join(",")}] hevcOnly=${pre.hevcOnly} fallback=${pre.hasFallback} bytes=${manifestText.length}`);
           const decision = pickPlayableManifest(manifestText, video);
           if (decision.mode === "transcode") {
             console.warn("[playback] HEVC-family video without a fallback for this browser; routing to transcode");

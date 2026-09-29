@@ -71,10 +71,12 @@ function codecFamilies(codecsAttr: string): string[] {
 function collectFamilies(scope: string): string[] {
   if (typeof scope !== "string" || scope === "") return [];
   const seen = new Set<string>();
-  const re = /codecs\s*=\s*["']([^"']*)["']/gi;
+  // Quoted codecs="..." (standard) AND unquoted codecs=hev1... (some MovieBox MPDs omit quotes).
+  const re = /codecs\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>/]+))/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(scope)) !== null) {
-    for (const fam of codecFamilies(m[1])) seen.add(fam);
+    const payload = m[1] ?? m[2] ?? m[3] ?? "";
+    for (const fam of codecFamilies(payload)) seen.add(fam);
   }
   return [...seen];
 }
@@ -107,10 +109,9 @@ export function sniffManifest(text: string): Sniff {
 
   const families = new Set<string>();
   const isVideoSet = (set: string): boolean => {
-    const lower = set.toLowerCase();
     if (
-      /contenttype\s*=\s*["']video["']/.test(lower) ||
-      /mimetype\s*=\s*["']video\//.test(lower)
+      /contenttype\s*=\s*(?:"video"|'video'|video(?=[\s>/]))/i.test(set) ||
+      /mimetype\s*=\s*(?:"video\/|'video\/|video\/)/i.test(set)
     ) {
       return true;
     }
@@ -118,10 +119,9 @@ export function sniffManifest(text: string): Sniff {
   };
   let sawVideoMarker = false;
   for (const set of sets) {
-    const lower = set.toLowerCase();
     if (
-      /contenttype\s*=\s*["']video["']/.test(lower) ||
-      /mimetype\s*=\s*["']video\//.test(lower)
+      /contenttype\s*=\s*(?:"video"|'video'|video(?=[\s>/]))/i.test(set) ||
+      /mimetype\s*=\s*(?:"video\/|'video\/|video\/)/i.test(set)
     ) {
       sawVideoMarker = true;
     }
