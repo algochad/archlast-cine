@@ -509,6 +509,11 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
 
   const maybeMirrorFailoverInner = useCallback(
     async (reason: string, httpCode?: number, loadMs?: number) => {
+      // Transcode path: segments are same-origin ffmpeg output, never a CDN mirror.
+      // A 403/504 or slow frag here is the local pipeline warming, not a dead edge —
+      // rotating the ticket rewrites the session's upstream mid-transcode and restarts
+      // playback from 0 (the 6s loop). Only direct (non-transcode) sources may fail over.
+      if (transcodeActiveRef.current) return;
       const now = Date.now();
       if (now - lastFailoverAtRef.current < 8000) return;
       if (failoverPendingRef.current) return;
