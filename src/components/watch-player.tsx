@@ -1748,6 +1748,10 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         });
         hls.loadSource(indexUrl);
         hls.attachMedia(video);
+        // NOTE: no native fallback here. Setting video.src on an MSE-managed element detaches the
+        // MediaSource the engine just attached — the element then fetches the playlist as a native
+        // resource, fails ("Content-Type not supported"), and fires the decoder error in the report.
+      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
         const onMeta = () => {
           reapplyCaptions();
           video.removeEventListener("loadedmetadata", onMeta);
