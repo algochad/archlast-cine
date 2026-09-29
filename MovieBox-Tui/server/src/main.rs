@@ -561,20 +561,14 @@ fn extract_hls_uri(line: &str) -> Option<String> {
     None
 }
 
-fn rewrite_hls_url(
-    uri: &str,
-    origin: &str,
-    base: &str,
-    proxy_dir: &str,
-    tickets: &TicketStore,
-    headers: &[(String, String)],
-) -> String {
+fn rewrite_hls_url(uri: &str, origin: &str, base: &str, ticket_base: &str, proxy_dir: &str, tickets: &TicketStore, headers: &[(String, String)]) -> String {
     if uri.starts_with(origin) {
-        return uri.replacen(origin, base, 1);
+        let rel = uri[origin.len()..].trim_start_matches('/').to_string();
+        return format!("{base}/{rel}");
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
         let (foreign_ticket, _) = tickets.insert_dedup(uri.to_string(), headers.to_vec());
-        return format!("{base}/{foreign_ticket}");
+        return format!("{ticket_base}/{foreign_ticket}");
     }
     if !uri.starts_with('/') {
         return format!("{proxy_dir}{uri}");
@@ -587,14 +581,7 @@ fn rewrite_hls_url(
 /// without mistaking them for URLs. Resolves relative references against the manifest's
 /// directory, rewrites same-origin via base, and foreign hosts via dedup tickets so
 /// provider headers still attach. Keeps client `rewriteRelativeTo` fallback intact.
-fn rewrite_dash_manifest_xml_aware(
-    text: &str,
-    origin: &str,
-    base: &str,
-    upstream_url: &str,
-    tickets: &TicketStore,
-    headers: &[(String, String)],
-) -> String {
+fn rewrite_dash_manifest_xml_aware(text: &str, origin: &str, base: &str, ticket_base: &str, upstream_url: &str, tickets: &TicketStore, headers: &[(String, String)]) -> String {
     // Derive the upstream directory for relative resolution (like proxy_dir but for DASH)
     let upstream_dir = upstream_url
         .rsplit_once('/')
@@ -630,15 +617,15 @@ fn rewrite_dash_manifest_xml_aware(
                         && !inner.contains("$Time$")
                         && !inner.starts_with('/');
                     if should_rewrite {
-                        // Resolve relative against upstream_dir if it looks relative
                         let resolved = if inner.starts_with("http") { inner.clone() } else { format!("{}{}", upstream_dir, inner.trim_start_matches('/')) };
                         let rewritten = if resolved.starts_with(origin) {
-                            resolved.replacen(origin, base, 1)
+                            let rel = resolved[origin.len()..].trim_start_matches('/').to_string();
+                            format!("{base}/{rel}")
                         } else if resolved.starts_with("http://") || resolved.starts_with("https://") {
                             let (foreign_ticket, _) = tickets.insert_dedup(resolved.clone(), headers.to_vec());
-                            format!("{base}/{foreign_ticket}")
+                            format!("{ticket_base}/{foreign_ticket}")
                         } else {
-                            format!("{}{}", base, inner)
+                            format!("{base}/{inner}")
                         };
                         rebuilt.push_str(&out[last..content_start]);
                         rebuilt.push_str(&rewritten);
@@ -668,8 +655,9 @@ fn rewrite_dash_manifest_xml_aware(
         let find_media = remaining_lower.find("media=\"");
         let find_init = remaining_lower.find("initialization=\"");
         let (attr_off, attr_len) = match (find_media, find_init) {
-            (Some(a), Some(b)) => if a < b { (a, 9) } else { (b, 16) },
-            (Some(a), None) => (a, 9),
+            // `media="` is 7 bytes, `initialization="` is 16 (off-by-two ate template prefixes).
+            (Some(a), Some(b)) => if a < b { (a, 7) } else { (b, 16) },
+            (Some(a), None) => (a, 7),
             (None, Some(b)) => (b, 16),
             (None, None) => break,
         };
@@ -682,19 +670,19 @@ fn rewrite_dash_manifest_xml_aware(
             let has_template = url_val.contains("$Number$") || url_val.contains("$Time$") || url_val.contains("$RepresentationID$");
             if !already_rewritten && !url_val.is_empty() {
                 let rewritten_opt: Option<String> = if url_val.starts_with(origin) {
-                    Some(url_val.replacen(origin, base, 1))
+                    let rel = url_val[origin.len()..].trim_start_matches('/').to_string();
+                    Some(format!("{base}/{rel}"))
                 } else if url_val.starts_with("http://") || url_val.starts_with("https://") {
                     let (foreign_ticket, _) = tickets.insert_dedup(url_val.to_string(), headers.to_vec());
-                    Some(format!("{base}/{foreign_ticket}"))
+                    Some(format!("{ticket_base}/{foreign_ticket}"))
                 } else if has_template {
-                    // Relative template like "chunk-$Number$.m4s" — make it proxy-absolute via base + upstream_dir
-                    // Templates without host are relative; qualify with base+upstream_dir when not already absolute.
                     if !url_val.starts_with('/') && !url_val.starts_with("http") {
-                        Some(format!("{}{}", base.trim_end_matches('/').to_string() + upstream_dir.rsplit_once('/').map(|(_, tail)| format!("/{}", tail)).unwrap_or_default().as_str(), url_val))
+                        Some(format!("{base}/{url_val}"))
                     } else { None }
                 } else if !url_val.starts_with('/') && !url_val.starts_with("//") && !url_val.starts_with("data:") {
-                    // bare relative segment template
-                    Some(format!("{}{}", upstream_dir.replacen(origin, base, 1), url_val))
+                    let full = format!("{}{}", upstream_dir, url_val);
+                    let rel = full.strip_prefix(origin).map(|s| s.trim_start_matches('/')).unwrap_or(url_val);
+                    Some(format!("{base}/{rel}"))
                 } else { None };
                 if let Some(replacement) = rewritten_opt {
                     st_rebuilt.push_str(&out[last2..val_start]);
@@ -721,12 +709,7 @@ fn rewrite_dash_manifest_xml_aware(
 /// Rewrite any remaining absolute http(s) URLs inside DASH subtitle adaptation
 /// sets (e.g. `<BaseURL>http://cdn/.../en.vtt</BaseURL>` or
 /// `<SegmentTemplate media="http://...">`) to foreign proxy tickets.
-fn rewrite_dash_foreign_urls(
-    text: &str,
-    base: &str,
-    tickets: &TicketStore,
-    headers: &[(String, String)],
-) -> String {
+fn rewrite_dash_foreign_urls(text: &str, base: &str, ticket_base: &str, tickets: &TicketStore, headers: &[(String, String)]) -> String {
     let mut out = text.to_string();
     let lower = out.to_lowercase();
     let mut rewritten = String::with_capacity(out.len());
@@ -744,7 +727,7 @@ fn rewrite_dash_foreign_urls(
                         && !content.starts_with(base)
                     {
                         let (foreign_ticket, _) = tickets.insert_dedup(content.clone(), headers.to_vec());
-                        let replacement = format!("{base}/{foreign_ticket}");
+                        let replacement = format!("{ticket_base}/{foreign_ticket}");
                         rewritten.push_str(&out[last..content_start]);
                         rewritten.push_str(&replacement);
                         last = content_start + content.len();
@@ -784,7 +767,7 @@ fn rewrite_dash_foreign_urls(
             let url_val = &out[val_start..val_end];
             if (url_val.starts_with("http://") || url_val.starts_with("https://")) && !url_val.starts_with(base) {
                 let (foreign_ticket, _) = tickets.insert_dedup(url_val.to_string(), headers.to_vec());
-                let replacement = format!("{base}/{foreign_ticket}");
+                let replacement = format!("{ticket_base}/{foreign_ticket}");
                 final_out.push_str(&out[last2..val_start]);
                 final_out.push_str(&replacement);
                 last2 = val_end;
@@ -2189,10 +2172,9 @@ async fn proxy_fetch_inner(
             Ok(b) if b.len() <= 16 * 1024 * 1024 => b,
             _ => return api_error(StatusCode::BAD_GATEWAY, "manifest unreadable or too large"),
         };
-        let base = format!(
-            "{}/api/proxy/{ticket}/a",
-            state.proxy_base.trim_end_matches('/')
-        );
+        let ticket_base = format!("{}/api/proxy/{}", state.proxy_base.trim_end_matches('/'), ticket);
+        let origin_base = format!("{ticket_base}/a");
+        let base: &str = &origin_base;
         // Determine if this is an HLS manifest (needs relative URL rewriting)
         let is_hls = upstream.ends_with(".m3u8")
             || content_type.contains("mpegurl")
@@ -2219,7 +2201,7 @@ async fn proxy_fetch_inner(
                     let trimmed = line.trim();
                     if trimmed.starts_with("#EXT-X-MEDIA:") {
                         if let Some(uri_val) = extract_hls_uri(trimmed) {
-                            let rewritten = rewrite_hls_url(&uri_val, &t.origin, &base, &proxy_dir, &state.tickets, &t.headers);
+                            let rewritten = rewrite_hls_url(&uri_val, &t.origin, &base, &ticket_base, &proxy_dir, &state.tickets, &t.headers);
                             let replaced = if line.contains(&format!("\"{}\"", uri_val)) {
                                 line.replacen(&format!("\"{}\"", uri_val), &format!("\"{}\"", rewritten), 1)
                             } else if line.contains(&format!("'{}'", uri_val)) {
@@ -2235,11 +2217,12 @@ async fn proxy_fetch_inner(
                         return line.to_string();
                     }
                     if trimmed.starts_with(&t.origin) {
-                        return line.replacen(&t.origin, &base, 1);
+                        let rel = trimmed[t.origin.len()..].trim_start_matches('/').to_string();
+                        return format!("{base}/{rel}");
                     }
                     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
                         let (foreign_ticket, _) = state.tickets.insert_dedup(trimmed.to_string(), t.headers.clone());
-                        return format!("{base}/{foreign_ticket}");
+                        return format!("{ticket_base}/{foreign_ticket}");
                     }
                     if !trimmed.starts_with('/') {
                         return format!("{proxy_dir}{trimmed}");
@@ -2250,11 +2233,13 @@ async fn proxy_fetch_inner(
             proxied_lines.join("\n")
         } else {
             // DASH: XML-aware rewrite (BaseURL / SegmentTemplate $Number$/$Time$) + subtitle foreign tickets.
-            let rewritten = rewrite_dash_manifest_xml_aware(&String::from_utf8_lossy(&bytes), &t.origin, &base, upstream.as_str(), &state.tickets, &t.headers);
-            // Fallback: origin replacement for any absolute remaining, then foreign subtitle URIs
-            let mut dash_text = rewritten.replace(&t.origin, &base);
+            let rewritten = rewrite_dash_manifest_xml_aware(&String::from_utf8_lossy(&bytes), &t.origin, &base, &ticket_base, upstream.as_str(), &state.tickets, &t.headers);
+            // The XML-aware pass already emits origin-relative `base/a/<path>` plus `ticket_base/<foreign>`
+            // tickets. A blind origin→base string replace here would re-introduce the double-path 403, so
+            // only absolutize leftovers NOT already under base.
+            let mut dash_text = rewritten;
             // Ensure any remaining absolute http(s) URLs in BaseURL/SegmentTemplate media/initialization are ticketed
-            dash_text = rewrite_dash_foreign_urls(&dash_text, &base, &state.tickets, &t.headers);
+            dash_text = rewrite_dash_foreign_urls(&dash_text, &base, &ticket_base, &state.tickets, &t.headers);
             // Preserve $Number$/$Time$ placeholders verbatim — they are template variables, not URLs
             dash_text
         };
@@ -3849,4 +3834,38 @@ async fn main() {
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
     log::info!("moviebox-server listening on http://{addr}");
     axum::serve(listener, app).await.expect("server error");
+}
+
+#[cfg(test)]
+mod proxy_rewrite_tests {
+    use super::*;
+
+    fn rig() -> (String, String, String, TicketStore) {
+        (
+            "https://cdn.example.com".to_string(),
+            "https://cine.archlast.com/api/proxy/TESTTICKET/a".to_string(),
+            "https://cine.archlast.com/api/proxy/TESTTICKET".to_string(),
+            TicketStore::default(),
+        )
+    }
+
+    #[test]
+    fn relative_template_rewrites_to_proxy_relative_form() {
+        let (origin, base, ticket_base, tickets) = rig();
+        let mpd = r#"<MPD><Period><AdaptationSet><SegmentTemplate media="dash/abc123/chunk-stream$Number$.m4s" initialization="dash/abc123/init-stream$Number$.m4s"/></AdaptationSet></Period></MPD>"#;
+        let out = rewrite_dash_manifest_xml_aware(mpd, &origin, &base, &ticket_base, "https://cdn.example.com/videos/x/manifest.mpd", &tickets, &[]);
+        assert!(out.contains("https://cine.archlast.com/api/proxy/TESTTICKET/a/dash/abc123/chunk-stream$Number$.m4s"), "media template must be proxy-relative, got: {out}");
+        assert!(out.contains("https://cine.archlast.com/api/proxy/TESTTICKET/a/dash/abc123/init-stream$Number$.m4s"), "init template must be proxy-relative, got: {out}");
+        assert!(!out.contains("videos/x/dash/abc123"), "must not embed the manifest directory twice, got: {out}");
+        assert!(!out.contains("/a/a/"), "must not double the /a/ prefix, got: {out}");
+    }
+
+    #[test]
+    fn absolute_same_origin_template_rewrites_without_double_path() {
+        let (origin, base, ticket_base, tickets) = rig();
+        let mpd = r#"<MPD><Period><AdaptationSet><SegmentTemplate media="https://cdn.example.com/dash/abc123/chunk-stream$Number$.m4s" initialization="https://cdn.example.com/dash/abc123/init-stream$Number$.m4s"/></AdaptationSet></Period></MPD>"#;
+        let out = rewrite_dash_manifest_xml_aware(mpd, &origin, &base, &ticket_base, "https://cdn.example.com/videos/x/manifest.mpd", &tickets, &[]);
+        assert!(out.contains("/a/dash/abc123/chunk-stream$Number$.m4s"), "absolute template must stay single-path, got: {out}");
+        assert!(!out.contains("cdn.example.com/dash") || out.contains("/api/proxy/TESTTICKET/a/dash"), "no raw upstream host must leak, got: {out}");
+    }
 }
