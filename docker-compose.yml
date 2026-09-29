@@ -116,6 +116,7 @@ services:
       MB_BACKEND_URL: "http://127.0.0.1:9797"
       # Backend reaches the Go sidecar over compose DNS (see `scraper` above).
       ANIME_SIDECAR_URL: "http://scraper:9798"
+      RUST_LOG: ${RUST_LOG:-moviebox_server=debug,moviebox_tui=info}
       # External origin browsers use for DASH/HLS manifests behind Coolify's
       # reverse proxy. Set to your public domain, e.g. https://cine.example.com
       MOVIEBOX_PROXY_BASE: ${MOVIEBOX_PROXY_BASE:-}

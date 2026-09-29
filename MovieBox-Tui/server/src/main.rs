@@ -1840,6 +1840,7 @@ async fn play(State(state): State<AppState>, Json(req): Json<PlayParams>) -> Res
     let (ticket, origin) = state
         .tickets
         .insert(chosen_mirror.resolver_url.clone(), chosen_mirror.headers.clone());
+    log::info!("play: ticket={ticket} origin={origin} mirror={} url={}", chosen_mirror.label, chosen_mirror.resolver_url);
     {
         let mut meta_map = state.ticket_metas.inner.lock();
         meta_map.insert(ticket.clone(), TicketMeta {
@@ -2011,6 +2012,7 @@ async fn proxy_fetch_inner(
     headers: HeaderMap,
 ) -> Response {
     let Some(t) = resolve_ticket(&state, &ticket) else {
+        log::warn!("proxy_fetch: unknown or expired ticket={ticket} rest={rest:?}");
         return api_error(StatusCode::NOT_FOUND, "unknown or expired ticket");
     };
 
@@ -2022,12 +2024,14 @@ async fn proxy_fetch_inner(
         t.raw_url.clone()
     } else if let Some(abs) = rest.strip_prefix("a/") {
         if abs.is_empty() || t.origin.is_empty() {
+            log::warn!("proxy_fetch: bad proxy path ticket={ticket} rest={rest:?} origin={:?}", t.origin);
             return api_error(StatusCode::BAD_REQUEST, "bad proxy path");
         }
         // A foreign-ticket reference minted by the HLS rewrite for a
         // cross-host segment URL: resolve it to the stored upstream URL and
         // adopt ITS headers (provider-required Referer/UA).
         if let Some(foreign) = state.tickets.get(abs) {
+            log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
             return proxy_fetch_inner_foreign(state, foreign, headers).await;
         }
         if abs.starts_with("http://") || abs.starts_with("https://") {
@@ -2048,6 +2052,7 @@ async fn proxy_fetch_inner(
             .unwrap_or_else(|| t.raw_url.clone());
         format!("{base}/{rest}")
     };
+    log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} origin={} upstream={upstream}", t.origin);
 
     // ------ Manifest edge cache (B3): check cache before upstream fetch ------
     // Keyed (ticket, upstream_url). VOD MPD 60s, live-ish HLS 5s via MANIFEST_CACHE_TTL.
@@ -3750,7 +3755,7 @@ async fn get_config() -> Json<serde_json::Value> {
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("moviebox_server=info,warn"),
+        env_logger::Env::default().default_filter_or("moviebox_server=debug,moviebox_tui=info"),
     )
     .init();
 

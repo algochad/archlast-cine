@@ -28,7 +28,8 @@ ENV NODE_ENV=production \
     MOVIEBOX_SERVER_HOST=127.0.0.1 \
     MOVIEBOX_SERVER_PORT=9797 \
     MOVIEBOX_REGION=ph \
-    MB_BACKEND_URL=http://127.0.0.1:9797
+    MB_BACKEND_URL=http://127.0.0.1:9797 \
+    RUST_LOG=moviebox_server=debug,moviebox_tui=info
 # Override at run time with the externally visible origin, e.g.
 # MOVIEBOX_PROXY_BASE=https://movies.example.com
 COPY --from=backend /src/moviebox/server/target/release/moviebox-server /usr/local/bin/moviebox-server
