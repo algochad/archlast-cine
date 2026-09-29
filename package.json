@@ -7,7 +7,7 @@
     "dev": "node scripts/dev.mjs",
     "dev:web": "next dev",
     "backend": "cargo run --release --manifest-path MovieBox-Tui/server/Cargo.toml",
-    "build": "next build",
+    "build": "next build --webpack",
     "start": "next start",
     "sync:backend": "bash scripts/sync-backend.sh",
     "scraper": "node scripts/anime-scraper/server.js",
