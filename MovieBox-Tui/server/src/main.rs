@@ -576,11 +576,19 @@ fn rewrite_hls_url(uri: &str, origin: &str, base: &str, ticket_base: &str, proxy
     uri.to_string()
 }
 
+/// Merge a relative reference against a base directory URL: plain append.
+/// Base dir `https://h/dash/xxx/` + `init-stream$Number$.m4s` yields
+/// `https://h/dash/xxx/init-stream$Number$.m4s`. A qualified `dash/abc/f.m4s` appends
+/// as-is (dash.js resolves against the manifest URL the same way). Callers strip the
+/// origin to express the result proxy-relative.
+fn merge_url_path(base_dir: &str, reference: &str) -> String {
+    format!("{}{}", base_dir.trim_end_matches('/'), format!("/{}", reference.trim_start_matches('/')))
+}
+
 /// XML-aware DASH manifest rewrite: handles BaseURL relative/absolute, SegmentTemplate
 /// attributes (media/initialization), and preserves $Number$/$Time$ template placeholders
 /// without mistaking them for URLs. Resolves relative references against the manifest's
 /// directory, rewrites same-origin via base, and foreign hosts via dedup tickets so
-/// provider headers still attach. Keeps client `rewriteRelativeTo` fallback intact.
 fn rewrite_dash_manifest_xml_aware(text: &str, origin: &str, base: &str, ticket_base: &str, upstream_url: &str, tickets: &TicketStore, headers: &[(String, String)]) -> String {
     // Derive the upstream directory for relative resolution (like proxy_dir but for DASH)
     let upstream_dir = upstream_url
@@ -667,7 +675,6 @@ fn rewrite_dash_manifest_xml_aware(text: &str, origin: &str, base: &str, ticket_
             let val_end = val_start + end_q;
             let url_val = &out[val_start..val_end];
             let already_rewritten = url_val.starts_with(base);
-            let has_template = url_val.contains("$Number$") || url_val.contains("$Time$") || url_val.contains("$RepresentationID$");
             if !already_rewritten && !url_val.is_empty() {
                 let rewritten_opt: Option<String> = if url_val.starts_with(origin) {
                     let rel = url_val[origin.len()..].trim_start_matches('/').to_string();
@@ -675,13 +682,30 @@ fn rewrite_dash_manifest_xml_aware(text: &str, origin: &str, base: &str, ticket_
                 } else if url_val.starts_with("http://") || url_val.starts_with("https://") {
                     let (foreign_ticket, _) = tickets.insert_dedup(url_val.to_string(), headers.to_vec());
                     Some(format!("{ticket_base}/{foreign_ticket}"))
-                } else if has_template {
-                    if !url_val.starts_with('/') && !url_val.starts_with("http") {
-                        Some(format!("{base}/{url_val}"))
-                    } else { None }
-                } else if !url_val.starts_with('/') && !url_val.starts_with("//") && !url_val.starts_with("data:") {
-                    let full = format!("{}{}", upstream_dir, url_val);
-                    let rel = full.strip_prefix(origin).map(|s| s.trim_start_matches('/')).unwrap_or(url_val);
+                } else if url_val.starts_with('/') && !url_val.starts_with("//") {
+                    // Origin-relative (e.g. "/dash/xxx/init-stream$Number$.m4s").
+                    let rel = url_val.trim_start_matches('/').to_string();
+                    Some(format!("{base}/{rel}"))
+                } else if !url_val.starts_with("//") && !url_val.starts_with("data:") {
+                    // Relative incl. $Number$/$Time$ templates. Two real shapes:
+                    // - Bare "init-stream$Number$.m4s" at /dash/xxx/index.mpd -> append manifest dir.
+                    // - Qualified "dash/abc123/chunk-$Number$.m4s": the template already carries its
+                    //   directory (starts with the manifest dir's first segment), so emit origin-relative
+                    //   as-is — appending the manifest dir again doubles it (/dash/abc123/dash/abc123/).
+                    let trimmed = url_val.trim_start_matches('/');
+                    let dir_first = upstream_dir
+                        .trim_start_matches(origin)
+                        .trim_matches('/')
+                        .split('/')
+                        .next()
+                        .unwrap_or("");
+                    let first = trimmed.split('/').next().unwrap_or("");
+                    let merged = if trimmed.contains('/') && !dir_first.is_empty() && first == dir_first {
+                        format!("{}{}", origin.trim_end_matches('/'), format!("/{trimmed}"))
+                    } else {
+                        merge_url_path(&upstream_dir, trimmed)
+                    };
+                    let rel = merged.strip_prefix(origin).map(|s| s.trim_start_matches('/')).unwrap_or(url_val);
                     Some(format!("{base}/{rel}"))
                 } else { None };
                 if let Some(replacement) = rewritten_opt {
@@ -3860,11 +3884,12 @@ mod proxy_rewrite_tests {
     #[test]
     fn relative_template_rewrites_to_proxy_relative_form() {
         let (origin, base, ticket_base, tickets) = rig();
+        // Qualified template at the manifest dir: manifest at /dash/abc123/index.mpd, template carries the
+        // same dir prefix. Emitted origin-relative as-is (proxy rebuilds origin + path).
         let mpd = r#"<MPD><Period><AdaptationSet><SegmentTemplate media="dash/abc123/chunk-stream$Number$.m4s" initialization="dash/abc123/init-stream$Number$.m4s"/></AdaptationSet></Period></MPD>"#;
-        let out = rewrite_dash_manifest_xml_aware(mpd, &origin, &base, &ticket_base, "https://cdn.example.com/videos/x/manifest.mpd", &tickets, &[]);
+        let out = rewrite_dash_manifest_xml_aware(mpd, &origin, &base, &ticket_base, "https://cdn.example.com/dash/abc123/index.mpd", &tickets, &[]);
         assert!(out.contains("https://cine.archlast.com/api/proxy/TESTTICKET/a/dash/abc123/chunk-stream$Number$.m4s"), "media template must be proxy-relative, got: {out}");
         assert!(out.contains("https://cine.archlast.com/api/proxy/TESTTICKET/a/dash/abc123/init-stream$Number$.m4s"), "init template must be proxy-relative, got: {out}");
-        assert!(!out.contains("videos/x/dash/abc123"), "must not embed the manifest directory twice, got: {out}");
         assert!(!out.contains("/a/a/"), "must not double the /a/ prefix, got: {out}");
     }
 
@@ -3875,5 +3900,15 @@ mod proxy_rewrite_tests {
         let out = rewrite_dash_manifest_xml_aware(mpd, &origin, &base, &ticket_base, "https://cdn.example.com/videos/x/manifest.mpd", &tickets, &[]);
         assert!(out.contains("/a/dash/abc123/chunk-stream$Number$.m4s"), "absolute template must stay single-path, got: {out}");
         assert!(!out.contains("cdn.example.com/dash") || out.contains("/api/proxy/TESTTICKET/a/dash"), "no raw upstream host must leak, got: {out}");
+    }
+
+    #[test]
+    fn bare_template_name_resolves_against_manifest_directory() {
+        // Real MovieBox shape: manifest at /dash/<id>/index.mpd, templates are bare filenames.
+        let (origin, base, ticket_base, tickets) = rig();
+        let mpd = r#"<MPD><Period><AdaptationSet><SegmentTemplate media="chunk-stream$Number$.m4s" initialization="init-stream$Number$.m4s"/></AdaptationSet></Period></MPD>"#;
+        let out = rewrite_dash_manifest_xml_aware(mpd, &origin, &base, &ticket_base, "https://cdn.example.com/dash/abc123/index.mpd", &tickets, &[]);
+        assert!(out.contains("https://cine.archlast.com/api/proxy/TESTTICKET/a/dash/abc123/init-stream$Number$.m4s"), "bare init template must keep manifest dir, got: {out}");
+        assert!(out.contains("https://cine.archlast.com/api/proxy/TESTTICKET/a/dash/abc123/chunk-stream$Number$.m4s"), "bare media template must keep manifest dir, got: {out}");
     }
 }
