@@ -83,6 +83,8 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   // the index URL of the stream currently bound to hls.js (needed to restore
   // playback when a remote seek is refused)
   const transcodeIndexUrlRef = useRef<string | null>(null);
+  // fatal playlist-load retries while ffmpeg warms the transcode playlist
+  const transcodeRetryRef = useRef(0);
   // bumped whenever the whole source is (re)started — in-flight async work
   // (e.g. a seek restart) checks it before touching playback state
   const sourceEpochRef = useRef(0);
@@ -757,7 +759,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     }
     currentSourceRef.current = null;
     transcodeIndexUrlRef.current = null;
-    remoteSeekBusyRef.current = false;
+    transcodeRetryRef.current = 0;
     queuedRemoteSeekRef.current = null;
     deferredSeekRef.current = null;
     if (pendingClearRef.current != null) {
@@ -1704,12 +1706,14 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           }, 1000);
         } catch {}
         hls.on(Hls.Events.ERROR, (_event: unknown, data: { fatal: boolean; type: string; details?: string; networkDetails?: { status?: number } | null; response?: { code?: number } }) => {
-          // mirror failover on 403/504 even when not yet fatal (e.g. frag load error retrying)
-          try {
-            const code = (data as unknown as { networkDetails?: { status?: number } })?.networkDetails?.status
-              ?? (data as unknown as { response?: { code?: number } })?.response?.code;
-            if (code === 403 || code === 504) void maybeMirrorFailover("frag error", code);
-          } catch {}
+          const netStatus =
+            data.networkDetails != null && typeof data.networkDetails.status === "number"
+              ? data.networkDetails.status
+              : undefined;
+          const respCode =
+            data.response != null && typeof data.response.code === "number" ? data.response.code : undefined;
+          const code = netStatus ?? respCode;
+          if (code === 403 || code === 504) void maybeMirrorFailover("frag error", code);
           if (!data.fatal) {
             // hls.js fires non-fatal BUFFER_STALLED_ERROR while it fills the
             // buffer after a seek jump; the engine recovers on its own.
@@ -1719,9 +1723,29 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           }
           // A superseded engine's fatal error must not tear down the live one.
           if (hlsRef.current !== hls || sourceEpochRef.current !== epoch) return;
+          // Transient: the transcode playlist may not exist yet when the engine attaches
+          // (ffmpeg still warming). Retry the load instead of tearing down on the first fatal
+          // network error — hls.js recovers once index.m3u8 appears.
+          if (data.type === "networkError") {
+            const d = typeof data.details === "string" ? data.details : "";
+            const fatalNet =
+              d === "manifestLoadError" || d === "manifestLoadTimeOut" || d === "levelLoadError" || d === "levelLoadTimeOut";
+            if (fatalNet && transcodeActiveRef.current) {
+              const idx = transcodeIndexUrlRef.current;
+              if (idx && transcodeRetryRef.current < 8) {
+                transcodeRetryRef.current += 1;
+                window.setTimeout(() => {
+                  if (hlsRef.current === hls && sourceEpochRef.current === epoch) {
+                    try {
+                      hls.loadSource(idx);
+                    } catch {}
+                  }
+                }, 1500);
+                return;
+              }
+            }
+          }
           teardown();
-          setError("This title isn't available right now. Try again or pick another source.");
-          setState("error");
         });
         hls.on(Hls.Events.FRAG_LOADED, (_event: string, data: unknown) => {
           try {
