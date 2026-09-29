@@ -2277,6 +2277,9 @@ async fn proxy_fetch_inner(
             HeaderValue::from_str(&len.to_string()).unwrap(),
         );
     }
+    if status.is_client_error() || status.is_server_error() {
+        log::warn!("proxy_fetch: upstream {status} for ticket={ticket} rest={rest:?} upstream={upstream}");
+    }
     let stream = resp.bytes_stream();
     (status, out, Body::from_stream(stream)).into_response()
 }
