@@ -43,7 +43,8 @@ export function Billboard({
 }) {
   const myList = useMyList();
   const [savingList, setSavingList] = useState(false);
-  const saved = myList.has(item.id.provider, item.id.value);
+  const bid = item.id ?? null;
+  const saved = bid ? myList.has(bid.provider, bid.value) : false;
   const year = item.year ?? null;
   const rating = metrics?.rating != null ? metrics.rating : null;
   const trending = metrics?.trending != null ? metrics.trending : null;
@@ -113,7 +114,7 @@ export function Billboard({
               {playing ? "Buffering…" : "Play"}
             </button>
             <Link
-              href={`/title/${item.id.provider}/${item.id.value}`}
+              href={bid ? `/title/${bid.provider}/${bid.value}` : "#"}
               className="btn-glass mono-meta px-6 py-3 text-[13px] font-semibold uppercase tracking-[0.14em]"
             >
               <InfoIcon width={15} height={15} />
@@ -121,12 +122,12 @@ export function Billboard({
             </Link>
             <button
               onClick={() => {
-                if (savingList) return;
+                if (savingList || !bid) return;
                 setSavingList(true);
                 void myList
                   .toggle({
-                    provider: item.id.provider,
-                    id: item.id.value,
+                    provider: bid.provider,
+                    id: bid.value,
                     title: item.title,
                     poster: item.poster_url,
                     mediaType: item.media_type,

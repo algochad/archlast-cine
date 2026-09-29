@@ -1620,9 +1620,14 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     async (session: string, indexUrl: string): Promise<void> => {
       const deadline = Date.now() + 20_000;
       while (Date.now() < deadline) {
-        const state = await api.transcodeState(session);
-        applyTranscodeState(state);
-        if (!state.restarting && state.ready && state.segments >= 1) return;
+        try {
+          const state = await api.transcodeState(session);
+          applyTranscodeState(state);
+          if (!state.restarting && state.ready && state.segments >= 1) return;
+        } catch {
+          // Backend recycle / session restart mid-poll surfaces as 404/502: keep waiting
+          // for the deadline instead of failing the whole title on a transient miss.
+        }
         if (await indexHasSegments(indexUrl)) return;
         await delay(1500);
       }
@@ -1903,10 +1908,15 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       });
       const rel = play.release;
 
+      const looksMp4 =
+        /\.mp4($|\?)/i.test(source) ||
+        rel.mirrors.some((m) => /\.mp4($|\?)/i.test(m.resolver_url)) ||
+        /\.mp4($|\?)/i.test(rel.filename ?? "");
       const isDash =
-        source.endsWith(".mpd") ||
-        rel.quality?.toLowerCase().includes("multi") ||
-        rel.mirrors.some((m) => m.resolver_url.includes(".mpd"));
+        !looksMp4 &&
+        (source.endsWith(".mpd") ||
+          rel.quality?.toLowerCase().includes("multi") ||
+          rel.mirrors.some((m) => m.resolver_url.includes(".mpd")));
 
       if (isDash) {
         // Sniff the manifest before dash.js: HEVC-family streams are undecodable
@@ -3203,7 +3213,8 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
             applyTranscodeState(state);
             ready = !state.restarting && state.ready && state.segments >= 1;
           } catch {
-            /* transient poll error — keep waiting */
+            // Backend recycle / restart mid-seek: the old playlist may still serve
+            // while the new pipeline warms — the indexHasSegments check below covers it.
           }
           if (!ready && (await indexHasSegments(indexUrl))) ready = true;
           if (!ready) await delay(1200);

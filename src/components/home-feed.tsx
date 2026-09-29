@@ -106,9 +106,10 @@ export function HomeFeed({ feed, metrics, error }: FeedProps) {
         item={hero}
         metrics={{ rating: heroMetrics.rating ?? null, trending: heroMetrics.trending ?? null }}
         playing={false}
-        onPlay={() =>
-          window.location.assign(`/watch/${hero.id.provider}/${hero.id.value}`)
-        }
+        onPlay={() => {
+          if (!hero.id) return;
+          window.location.assign(`/watch/${hero.id.provider}/${hero.id.value}`);
+        }}
       />
 
       {/* Feed docks over the hero fade; gutters match the hero column exactly */}

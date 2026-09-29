@@ -43,12 +43,12 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
   const myList = useMyList();
   const [savingList, setSavingList] = useState(false);
   const [seasonIdx, setSeasonIdx] = useState(0);
-  const saved = myList.has(details.id.provider, details.id.value);
+  const did = details.id ?? null;
+  const saved = did ? myList.has(did.provider, did.value) : false;
   const seasons = details.seasons;
   const activeSeason: Season | null = seasons[seasonIdx] ?? null;
   const isAnime = details.media_type === "anime";
   const isSeries = details.media_type === "series" || seasons.length > 0;
-  const runtime = formatRuntime(details.duration);
   const episodeCount = seasons.reduce((n, s) => n + s.episodes.length, 0);
   const anime = details.anime ?? null;
   const animeSeasonText =
@@ -66,16 +66,16 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
         : null;
 
   const watchHref = (season: number, episode: number) =>
-    `/watch/${details.id.provider}/${details.id.value}${
-      isSeries || isAnime ? `?s=${season}&e=${episode}` : ""
-    }`;
+    did
+      ? `/watch/${did.provider}/${did.value}${isSeries || isAnime ? `?s=${season}&e=${episode}` : ""}`
+      : "#";
 
   const startHref = watchHref(activeSeason?.number ?? 1, activeSeason?.episodes[0]?.number ?? 1);
+  const runtime = formatRuntime(details.duration);
 
   const metaStrip: string[] = [];
   if (details.imdb_rating) metaStrip.push(`${details.imdb_rating}★`);
   if (isAnime && animeStatusText) metaStrip.push(animeStatusText);
-  if (isAnime && animeSeasonText) metaStrip.push(animeSeasonText);
   if (details.year && !(isAnime && animeSeasonText)) metaStrip.push(details.year);
   if (!isAnime && runtime) metaStrip.push(runtime);
   if ((isSeries || isAnime) && episodeCount > 0) metaStrip.push(`${episodeCount} EPS`);
@@ -108,7 +108,7 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
               </div>
             </div>
             <p className="mono-meta mt-2.5 flex items-center justify-between text-[10px] uppercase tracking-[0.16em] text-zinc-500">
-              <span>{catalogTag(details.id.provider, details.id.value)}</span>
+              <span>{did ? catalogTag(did.provider, did.value) : "—"}</span>
               <span className="text-zinc-600">
                 {isAnime ? "ANIME" : isSeries ? "SERIES" : "FILM"}
               </span>
@@ -118,7 +118,7 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
           {/* Info column */}
           <div className="animate-fade-up min-w-0 flex-1 space-y-5">
             <p className="eyebrow">
-              {providerLabel(details.id.provider)} ·{" "}
+              {did ? providerLabel(did.provider) : "Unknown"} ·{" "}
               {isAnime ? "Anime" : isSeries ? "Series" : "Film"}
             </p>
 
@@ -169,12 +169,12 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
               </Link>
               <button
                 onClick={() => {
-                  if (savingList) return;
+                  if (savingList || !did) return;
                   setSavingList(true);
                   void myList
                     .toggle({
-                      provider: details.id.provider,
-                      id: details.id.value,
+                      provider: did.provider,
+                      id: did.value,
                       title: details.title,
                       poster: details.poster_url,
                       mediaType: details.media_type,

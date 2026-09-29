@@ -137,8 +137,9 @@ export const TitleCard = memo(function TitleCard({
   expandable?: boolean;
 }) {
   const myList = useMyList();
-  const href = `/title/${item.id.provider}/${item.id.value}`;
-  const watchHref = `/watch/${item.id.provider}/${item.id.value}`;
+  const idRef = item.id ?? null;
+  const href = idRef ? `/title/${idRef.provider}/${idRef.value}` : "#";
+  const watchHref = idRef ? `/watch/${idRef.provider}/${idRef.value}` : "#";
   // Poster URLs are either absolute (movie providers) or backend-relative
   // proxy paths which need the /api/mb prefix.
   const posterSrc = item.poster_url
@@ -168,7 +169,7 @@ export const TitleCard = memo(function TitleCard({
    */
   const holdClosed = useRef(false);
 
-  const inMyList = myList.has(item.id.provider, item.id.value);
+  const inMyList = idRef ? myList.has(idRef.provider, idRef.value) : false;
 
   const clearOpenTimer = useCallback(() => {
     if (openTimer.current != null) {
@@ -282,10 +283,14 @@ export const TitleCard = memo(function TitleCard({
   useEffect(() => {
     if (!open || !expandable) return;
     if (details) return;
+    if (!idRef) {
+      setFetching(false);
+      return;
+    }
     const ctrl = new AbortController();
     setFetching(true);
     api
-      .details(item.id.provider, item.id.value)
+      .details(idRef.provider, idRef.value)
       .then((res) => {
         if (ctrl.signal.aborted) return;
         setDetails(res.details);
@@ -344,12 +349,12 @@ export const TitleCard = memo(function TitleCard({
   };
 
   const toggleList = async () => {
-    if (busy) return;
+    if (busy || !idRef) return;
     setBusy(true);
     try {
       await myList.toggle({
-        provider: item.id.provider,
-        id: item.id.value,
+        provider: idRef.provider,
+        id: idRef.value,
         title: item.title,
         poster: item.poster_url,
         mediaType: item.media_type,
@@ -368,8 +373,9 @@ export const TitleCard = memo(function TitleCard({
       ? (() => {
           const s = details.seasons[0];
           const ep = s?.episodes?.[0];
-          return s && ep
-            ? `/watch/${details.id.provider}/${details.id.value}?s=${s.number}&e=${ep.number}`
+          const did = details.id ?? null;
+          return s && ep && did
+            ? `/watch/${did.provider}/${did.value}?s=${s.number}&e=${ep.number}`
             : watchHref;
         })()
       : watchHref;
