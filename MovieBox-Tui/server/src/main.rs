@@ -2407,6 +2407,9 @@ fn transcode_args(
         cfg.preset.clone(),
         "-crf".to_string(),
         cfg.crf.clone(),
+        // Low-latency x264: no lookahead delay, no scenecut search stalls.
+        "-tune".to_string(),
+        "fastdecode,zerolatency".to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         "-profile:v".to_string(),
@@ -2422,7 +2425,7 @@ fn transcode_args(
         "-f".to_string(),
         "hls".to_string(),
         "-hls_time".to_string(),
-        "6".to_string(),
+        "4".to_string(),
         "-hls_list_size".to_string(),
         "0".to_string(),
         "-hls_flags".to_string(),

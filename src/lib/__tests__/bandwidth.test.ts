@@ -80,41 +80,41 @@ describe("estimate", () => {
 });
 
 describe("bufferTargetFor", () => {
-  it("returns 15s for <1Mbps", () => {
-    expect(bufferTargetFor(500_000)).toBe(15);
-    expect(bufferTargetFor(999_999)).toBe(15);
-    expect(bufferTargetFor(0)).toBe(15);
+  it("returns 30s for <1Mbps", () => {
+    expect(bufferTargetFor(500_000)).toBe(30);
+    expect(bufferTargetFor(999_999)).toBe(30);
+    expect(bufferTargetFor(0)).toBe(30);
   });
 
-  it("returns 30s for <5Mbps", () => {
-    expect(bufferTargetFor(1_000_000)).toBe(30);
-    expect(bufferTargetFor(2_500_000)).toBe(30);
-    expect(bufferTargetFor(4_999_999)).toBe(30);
+  it("returns 60s for <5Mbps", () => {
+    expect(bufferTargetFor(1_000_000)).toBe(60);
+    expect(bufferTargetFor(2_500_000)).toBe(60);
+    expect(bufferTargetFor(4_999_999)).toBe(60);
   });
 
-  it("returns 60s for >=5Mbps", () => {
-    expect(bufferTargetFor(5_000_000)).toBe(60);
-    expect(bufferTargetFor(10_000_000)).toBe(60);
-    expect(bufferTargetFor(100_000_000)).toBe(60);
+  it("returns 120s for >=5Mbps", () => {
+    expect(bufferTargetFor(5_000_000)).toBe(120);
+    expect(bufferTargetFor(10_000_000)).toBe(120);
+    expect(bufferTargetFor(100_000_000)).toBe(120);
   });
 
-  it("caps at 120s (never exceeds)", () => {
-    expect(bufferTargetFor(1_000_000_000)).toBeLessThanOrEqual(120);
-    expect(bufferTargetFor(Infinity)).toBe(60);
+  it("caps at 180s (never exceeds)", () => {
+    expect(bufferTargetFor(1_000_000_000)).toBeLessThanOrEqual(180);
+    expect(bufferTargetFor(Infinity)).toBe(120);
   });
 
-  it("returns 15s for invalid/negative/NaN", () => {
-    expect(bufferTargetFor(NaN)).toBe(15);
-    expect(bufferTargetFor(Infinity * -1)).toBe(15);
-    expect(bufferTargetFor(-100)).toBe(15);
-    expect(bufferTargetFor(null as unknown as number)).toBe(15);
-    expect(bufferTargetFor(undefined as unknown as number)).toBe(15);
+  it("returns 30s for invalid/negative/NaN", () => {
+    expect(bufferTargetFor(NaN)).toBe(30);
+    expect(bufferTargetFor(Infinity * -1)).toBe(30);
+    expect(bufferTargetFor(-100)).toBe(30);
+    expect(bufferTargetFor(null as unknown as number)).toBe(30);
+    expect(bufferTargetFor(undefined as unknown as number)).toBe(30);
   });
 
   it("handles boundary transitions without oscillation helper", () => {
-    expect(bufferTargetFor(999_999)).toBe(15);
-    expect(bufferTargetFor(1_000_000)).toBe(30);
-    expect(bufferTargetFor(4_999_999)).toBe(30);
-    expect(bufferTargetFor(5_000_000)).toBe(60);
+    expect(bufferTargetFor(999_999)).toBe(30);
+    expect(bufferTargetFor(1_000_000)).toBe(60);
+    expect(bufferTargetFor(4_999_999)).toBe(60);
+    expect(bufferTargetFor(5_000_000)).toBe(120);
   });
 });

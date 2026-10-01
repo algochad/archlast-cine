@@ -41,16 +41,17 @@ export function estimate(samples: BandwidthSample[]): number {
 
 /**
  * Dynamic forward-buffer target seconds for a given throughput.
- * <1 Mbps → 15s (constrained 3G)
- * <5 Mbps → 30s (average)
- * else     → 60s (fiber / high speed)
- * Cap 120s never exceeded.
+ * <1 Mbps → 30s (constrained 3G)
+ * <5 Mbps → 60s (average)
+ * else     → 120s (fiber / high speed)
+ * The transcode path produces ~16x realtime on this box, so a deep target
+ * is cheap: the client banks minutes ahead instead of hovering at 2-10s.
  */
 export function bufferTargetFor(bps: number): number {
-  if (bps === Infinity) return 60;
-  if (!Number.isFinite(bps) || bps <= 0) return 15;
-  if (bps < 1_000_000) return 15;
-  if (bps < 5_000_000) return 30;
-  const base = 60;
-  return Math.min(base, 120);
+  if (bps === Infinity) return 120;
+  if (!Number.isFinite(bps) || bps <= 0) return 30;
+  if (bps < 1_000_000) return 30;
+  if (bps < 5_000_000) return 60;
+  const base = 120;
+  return Math.min(base, 180);
 }

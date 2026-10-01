@@ -1694,7 +1694,8 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         const initTarget = bufferTargetFor(seedBps);
         const backLen = bb === 0 ? Infinity : bb;
         const hls = new Hls({
-          maxBufferLength: initTarget,
+          maxBufferLength: Math.max(initTarget, 60),
+          maxMaxBufferLength: 120,
           backBufferLength: backLen,
           abrEwmaDefaultEstimate: seedBps,
           startLevel: 0,
