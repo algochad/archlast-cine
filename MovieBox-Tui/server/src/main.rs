@@ -3391,8 +3391,11 @@ async fn transcode_file(
     // The live playlist is rewritten as ffmpeg produces segments: it must
     // never be cached, or hls.js freezes on the first 1-segment snapshot and
     // stalls at the end of seg00000. Segments are content-addressed per
-    // session and truly immutable, so they keep the long cache.
-    let cache_control = if name == "index.m3u8" {
+    // session BUT their names are reused across seek restarts (seg00000.ts
+    // is reborn at every seek point), so a long cache makes hls.js replay
+    // the pre-seek bytes after a seek. Both are no-store; the steady-state
+    // cost is one playlist + one segment fetch per 6s window.
+    let cache_control = if name == "index.m3u8" || name.ends_with(".ts") {
         "no-store"
     } else {
         "public, max-age=31536000, immutable"
