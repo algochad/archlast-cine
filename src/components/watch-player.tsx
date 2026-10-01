@@ -1598,6 +1598,23 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     }
   }, []);
 
+  /** EXTINF sum of the live playlist: fallback produced-seconds when /state is down. */
+  const indexProducedSeconds = useCallback(async (indexUrl: string): Promise<number> => {
+    try {
+      const res = await fetch(indexUrl, { cache: "no-store" });
+      if (!res.ok) return 0;
+      const text = await res.text();
+      let sum = 0;
+      for (const line of text.split("\n")) {
+        const m = line.trim().match(/^#EXTINF:\s*([0-9.]+)/);
+        if (m) sum += Number(m[1]);
+      }
+      return Number.isFinite(sum) ? sum : 0;
+    } catch {
+      return 0;
+    }
+  }, []);
+
   /** Fold a fresh /state response into the absolute-timeline refs. */
   const applyTranscodeState = useCallback((s: TranscodeStateResponse) => {
     if (typeof s.duration_seconds === "number" && s.duration_seconds > 0) {
@@ -1615,25 +1632,39 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     // refresh — that jitter is what this avoids.
   }, []);
 
-  /** Poll the transcode session until the first segment exists (~20s cap). */
+  /**
+   * Poll the transcode session until a real buffer exists before first paint.
+   * Starting playback on segment 1 (2-4s) is what forces the pause-and-wait
+   * loop: the player burns the whole buffer before ffmpeg gets ahead. Waiting
+   * for ~30s of produced media (~8 segments) costs ~5 extra seconds up front
+   * and buys a buffer the player never catches up to — ffmpeg outruns realtime
+   * 7-16x on this box. Cap 25s so a slow source still starts.
+   */
   const waitForTranscode = useCallback(
     async (session: string, indexUrl: string): Promise<void> => {
-      const deadline = Date.now() + 20_000;
+      const deadline = Date.now() + 25_000;
       while (Date.now() < deadline) {
         try {
           const state = await api.transcodeState(session);
           applyTranscodeState(state);
-          if (!state.restarting && state.ready && state.segments >= 1) return;
+          if (!state.restarting && state.ready && state.produced_seconds >= 30) return;
+          if (!state.restarting && state.ready && state.segments >= 8) return;
         } catch {
           // Backend recycle / session restart mid-poll surfaces as 404/502: keep waiting
           // for the deadline instead of failing the whole title on a transient miss.
         }
-        if (await indexHasSegments(indexUrl)) return;
-        await delay(1500);
+        if (await indexHasSegments(indexUrl)) {
+          // Playlist lists media but /state is unreachable: still require the
+          // deep buffer — poll the EXTINF sum directly.
+          const produced = await indexProducedSeconds(indexUrl);
+          if (produced >= 30) return;
+        }
+        await delay(1000);
       }
-      throw new Error("This title isn't available right now. Try again or pick another source.");
+      // Slow source: start with whatever exists rather than erroring out.
+      return;
     },
-    [indexHasSegments, applyTranscodeState],
+    [indexHasSegments, indexProducedSeconds, applyTranscodeState],
   );
 
   /**
@@ -3220,7 +3251,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         transcodeIndexUrlRef.current = indexUrl;
         setState("loading");
         setError(null);
-        const deadline = Date.now() + 20_000;
+        const deadline = Date.now() + 25_000;
         let ready = false;
         while (Date.now() < deadline && !ready) {
           if (sourceEpochRef.current !== epoch || !transcodeActiveRef.current) return;
@@ -3228,13 +3259,23 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           try {
             state = await api.transcodeState(session);
             applyTranscodeState(state);
-            ready = !state.restarting && state.ready && state.segments >= 1;
+            // Same deep-start rule as first paint: resume with ~20s banked so
+            // the player doesn't burn the 1-segment buffer mid-restart.
+            ready = !state.restarting && state.ready && (state.produced_seconds - absSeconds >= 20 || state.segments >= 5);
           } catch {
             // Backend recycle / restart mid-seek: the old playlist may still serve
-            // while the new pipeline warms — the indexHasSegments check below covers it.
+            // while the new pipeline warms — the EXTINF check below covers it.
           }
-          if (!ready && (await indexHasSegments(indexUrl))) ready = true;
-          if (!ready) await delay(1200);
+          if (!ready) {
+            const produced = await indexProducedSeconds(indexUrl);
+            // Post-restart playlist starts at the seek point: EXTINF sum IS the
+            // banked buffer (offset-relative, not absolute).
+            if (produced >= 20) ready = true;
+            else if (await indexHasSegments(indexUrl)) {
+              // Playlist exists but still shallow: keep waiting for depth.
+            }
+          }
+          if (!ready) await delay(1000);
         }
         if (sourceEpochRef.current !== epoch || !transcodeActiveRef.current) return;
         setRemoteSeeking(false);
@@ -3262,7 +3303,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         }
       }
     },
-    [flashNotice, pokeControls, destroyHlsOnly, applyTranscodeState, indexHasSegments, playHls, reapplyCaptions],
+    [flashNotice, pokeControls, destroyHlsOnly, applyTranscodeState, indexHasSegments, indexProducedSeconds, playHls, reapplyCaptions],
   );
 
   /**
