@@ -3388,6 +3388,15 @@ async fn transcode_file(
     } else {
         "application/octet-stream"
     };
+    // The live playlist is rewritten as ffmpeg produces segments: it must
+    // never be cached, or hls.js freezes on the first 1-segment snapshot and
+    // stalls at the end of seg00000. Segments are content-addressed per
+    // session and truly immutable, so they keep the long cache.
+    let cache_control = if name == "index.m3u8" {
+        "no-store"
+    } else {
+        "public, max-age=31536000, immutable"
+    };
     // Range support: parse `Range: bytes=...`
     if let Some(range_val) = headers.get(header::RANGE)
         && let Ok(range_str) = range_val.to_str()
@@ -3421,7 +3430,7 @@ async fn transcode_file(
                         (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
                         (
                             header::CACHE_CONTROL,
-                            HeaderValue::from_static("public, max-age=31536000, immutable"),
+                            HeaderValue::from_str(cache_control).unwrap(),
                         ),
                     ],
                     Body::from_stream(stream),
@@ -3456,7 +3465,7 @@ async fn transcode_file(
             (header::ACCEPT_RANGES, HeaderValue::from_static("bytes")),
             (
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
+                HeaderValue::from_str(cache_control).unwrap(),
             ),
         ],
         Body::from_stream(stream),

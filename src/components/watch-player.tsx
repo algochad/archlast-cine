@@ -1912,13 +1912,29 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         /\.mp4($|\?)/i.test(source) ||
         rel.mirrors.some((m) => /\.mp4($|\?)/i.test(m.resolver_url)) ||
         /\.mp4($|\?)/i.test(rel.filename ?? "");
+      // The provider tags container but ships H.265 inside: codec is the only
+      // signal on an .mp4 URL, and native playback would be black+audio on an
+      // HEVC-less browser. Route those to the live transcoder up front.
+      const codecHintHevc = /hevc|h265|x265|dvh/i.test(rel.codec ?? "");
+      const needTranscodeProbe =
+        looksMp4 && codecHintHevc && typeof window !== "undefined" && window.MediaSource != null && !browserSupportsHevc(video);
       const isDash =
-        !looksMp4 &&
-        (source.endsWith(".mpd") ||
+        (!looksMp4 || needTranscodeProbe) &&
+        (needTranscodeProbe ||
+          source.endsWith(".mpd") ||
           rel.quality?.toLowerCase().includes("multi") ||
           rel.mirrors.some((m) => m.resolver_url.includes(".mpd")));
 
       if (isDash) {
+        // An .mp4 URL carrying an HEVC codec hint never reaches the DASH path:
+        // the container label is untrusted, the codec tag is the signal, and
+        // native playback would be black+audio on this browser.
+        if (needTranscodeProbe) {
+          console.warn("[playback] mp4 with HEVC codec hint; routing to transcode");
+          hevcOnlyRef.current = true;
+          await startTranscode(source);
+          return;
+        }
         // Sniff the manifest before dash.js: HEVC-family streams are undecodable
         // in Chromium/Linux → fall back to live transcode; mixed streams have
         // their HEVC representations stripped client-side.
@@ -1929,7 +1945,6 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         } catch {
           console.warn("[playback] manifest sniff fetch failed; playing original URL with watchdog cover");
         }
-
         let dashSource = source;
         if (manifestText !== null) {
           const pre = sniffManifest(manifestText);
@@ -1973,6 +1988,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
             }
           }
         }
+        // DASH engine lives below; manifest block ends here.
 
         // Exception: static import crashes SSR; load only when needed in browser
         const dashModuleEpoch = sourceEpochRef.current;
