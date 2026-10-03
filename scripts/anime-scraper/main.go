@@ -271,10 +271,23 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 			if len(options) == 0 {
 				continue
 			}
-			best := options[0]
-			log.Printf("[Resolve] Search via %s matched %q (%s), resolving ep %d", p.Name(), best.Title, best.Key, req.Episode)
-			if tryProvider(p, best.Key) {
-				break
+			// Try every match, not just the first: search ranking is
+			// popularity-ordered, so S1 sits behind S2/specials while the
+			// decoy-poisoned top hit fails validation. Cap at 4 to bound
+			// the worst case (each dead hit costs a validation round-trip).
+			tried := 0
+			for _, best := range options {
+				if tried >= 4 {
+					break
+				}
+				tried++
+				log.Printf("[Resolve] Search via %s matched %q (%s), resolving ep %d", p.Name(), best.Title, best.Key, req.Episode)
+				if tryProvider(p, best.Key) {
+					break
+				}
+				if len(streams) > 0 {
+					break
+				}
 			}
 			if len(streams) > 0 {
 				break

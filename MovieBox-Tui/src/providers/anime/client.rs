@@ -825,6 +825,15 @@ impl crate::providers::ReleaseProvider for AnimeProvider {
             Err(e) => Some(e.to_string()),
         };
 
+        // Senshi direct (no sidecar): MAL-id embeds for AllAnime ids via the
+        // title->AniList->MAL hop, numeric AniList ids directly. Independent
+        // of the sidecar, so it survives scraper outages and decoy waves.
+        let senshi_err = match self.senshi_episode_streams(id, episode).await {
+            Ok(releases) if !releases.is_empty() => return Ok(releases),
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        };
+
         // Fallback to direct AllAnime API (may fail without crypto).
         let direct_err = match self.allanime_episode_streams(id, episode).await {
             Ok(releases) if !releases.is_empty() => return Ok(releases),
@@ -834,10 +843,11 @@ impl crate::providers::ReleaseProvider for AnimeProvider {
 
         // Technical causes stay in server logs; the UI only sees generic copy.
         log::warn!(
-            "anime episode_streams: no playable streams for id={} ep={}: resolver_err={:?} direct_err={:?}",
+            "anime episode_streams: no playable streams for id={} ep={}: resolver_err={:?} senshi_err={:?} direct_err={:?}",
             id,
             episode,
             resolver_err,
+            senshi_err,
             direct_err
         );
         Err(ProviderError::Unavailable(ANIME_UNAVAILABLE.to_string()))
@@ -1245,20 +1255,30 @@ impl AnimeProvider {
     }
 
     async fn get_mal_id_for_anime(&self, id: &str) -> Result<i64, ProviderError> {
-        // Try to parse as numeric AniList ID first
+        // Numeric AniList id: direct details hop.
         if let Ok(anilist_id) = id.trim().parse::<i64>() {
             let media: AniListMedia = self.post_graphql(
                 DETAILS_QUERY,
                 serde_json::json!({ "id": anilist_id }),
             ).await?;
-            
+
             if let Some(mal_id) = media.id_mal {
                 return Ok(mal_id);
             }
         }
-        
-        // For AllAnime string IDs, we'd need to search AniList by title
-        // For now, return error - Senshi fallback only works for AniList IDs
+
+        // AllAnime string id: details -> english title -> AniList search ->
+        // first hit's MAL id. One extra round-trip, no sidecar involved.
+        let title = self.allanime_title_for_id(id).await?;
+        let page: PageData = self.post_graphql(
+            SEARCH_QUERY,
+            serde_json::json!({ "page": 1, "perPage": 5, "search": title }),
+        ).await?;
+        for media in &page.media {
+            if let Some(mal_id) = media.id_mal {
+                return Ok(mal_id);
+            }
+        }
         Err(ProviderError::NotFound)
     }
 }

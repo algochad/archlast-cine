@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -67,9 +68,12 @@ func validateResolvedStream(rawURL string) error {
 	if err != nil || streamURL.Scheme == "" || streamURL.Host == "" {
 		return fmt.Errorf("invalid anipub stream url %q", rawURL)
 	}
-	if !isMegaplayCDNHost(streamURL.Host) {
-		return nil
-	}
+	// Validation used to be scoped to the megaplay CDN only, but the CDN
+	// rotates hosts (kotocdn.site -> nexabloom.top -> ...) and each new
+	// host silently skipped validation — letting ad-injected decoy
+	// playlists through to the player as infinite spinners. Validate every
+	// anipub stream: real playlists are 100% .ts/.m4s, decoys reveal
+	// themselves by extension on the first check.
 
 	v := &hlsStreamValidator{
 		client:   curdhost.HTTPClient(),
@@ -84,46 +88,65 @@ func validateResolvedStream(rawURL string) error {
 		return fmt.Errorf("anipub stream manifest %q is not an HLS playlist", rawURL)
 	}
 
-	mediaURL, err := selectMediaPlaylistURL(streamURL, masterBody)
-	if err != nil {
-		return err
-	}
-	mediaBody, err := v.fetch(mediaURL)
-	if err != nil {
-		return fmt.Errorf("anipub stream media playlist fetch failed: %w", err)
-	}
-
-	segments := parsePlaylistSegments(mediaBody)
-	if len(segments) == 0 {
-		return fmt.Errorf("anipub stream %q has no media segments", rawURL)
-	}
-
-	decoyCount := 0
-	for _, segment := range segments {
-		if isDecoySegmentURI(segment) {
-			decoyCount++
-		}
-	}
-	if decoyCount == len(segments) {
-		return fmt.Errorf("anipub stream %q is an ad-injected decoy: all %d segments are ad/decoy content", rawURL, len(segments))
-	}
-	if decoyRatio := float64(decoyCount) / float64(len(segments)); decoyRatio >= 0.5 {
-		return fmt.Errorf("anipub stream %q is an ad-injected decoy: %d/%d segments are ad/decoy content", rawURL, decoyCount, len(segments))
-	}
-
-	// The first non-decoy segment may still redirect to ad/decoy content, so
-	// probe its magic bytes before trusting the playlist.
-	for _, segment := range segments {
-		if isDecoySegmentURI(segment) {
+	mediaURLs := collectVariantPlaylists(streamURL, masterBody)
+	var lastErr error
+	for _, mediaURL := range mediaURLs {
+		mediaBody, err := v.fetch(mediaURL)
+		if err != nil {
+			lastErr = fmt.Errorf("anipub stream media playlist fetch failed: %w", err)
 			continue
 		}
-		if data := v.fetchRange(segment, 0, 15); looksLikeDecoySegment(data) {
-			return fmt.Errorf("anipub stream %q first media segment is not video content", rawURL)
-		}
-		break
-	}
 
-	return nil
+		segments := parsePlaylistSegments(mediaBody)
+		if len(segments) == 0 {
+			lastErr = fmt.Errorf("anipub stream %q has no media segments", rawURL)
+			continue
+		}
+
+		// Extension-spoofed segments (.jpg/.html/.js/...) with MPEG-TS
+		// bytes are REAL video the CDN mislabels: rewrite the playlist
+		// line-by-line, dropping only segments whose magic bytes are NOT
+		// video. A variant survives when at least one segment probes as
+		// video; pure-ad variants (zero video segments) fall through to
+		// the next variant.
+		clean := make([]string, 0, len(segments))
+		probedVideo := 0
+		probedNonVideo := 0
+		for _, segment := range segments {
+			if !isDecoySegmentURI(segment) {
+				clean = append(clean, segment)
+				continue
+			}
+			data := v.fetchRange(segment, 0, 15)
+			if len(data) == 0 {
+				// Probe failed (network): keep the line — the player,
+				// not the validator, is the final judge.
+				clean = append(clean, segment)
+				continue
+			}
+			if looksLikeDecoySegment(data) {
+				probedNonVideo++
+				continue
+			}
+			probedVideo++
+			clean = append(clean, segment)
+		}
+		if len(clean) == 0 {
+			lastErr = fmt.Errorf("anipub stream %q variant %q is an ad-injected decoy (%d video / %d non-video probed)", rawURL, mediaURL, probedVideo, probedNonVideo)
+			continue
+		}
+		// First surviving segment may still redirect to ad content, so
+		// probe its magic bytes before trusting the playlist.
+		if data := v.fetchRange(clean[0], 0, 15); looksLikeDecoySegment(data) {
+			lastErr = fmt.Errorf("anipub stream %q first media segment is not video content", rawURL)
+			continue
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("anipub stream %q has no playable variant", rawURL)
 }
 
 // hlsStreamValidator fetches manifests and probe bytes for a stream.
@@ -181,7 +204,9 @@ func (v *hlsStreamValidator) fetchRange(rawURL string, start, end int) []byte {
 		return nil
 	}
 	defer resp.Body.Close()
-	if !curdhost.HTTPStatusOK(resp.StatusCode) {
+	// Cloudflare-fronted CDNs often ignore Range and return 200 with the
+	// full object: accept the bytes either way, the magic check decides.
+	if resp.StatusCode != http.StatusPartialContent && !curdhost.HTTPStatusOK(resp.StatusCode) {
 		return nil
 	}
 
@@ -190,44 +215,58 @@ func (v *hlsStreamValidator) fetchRange(rawURL string, start, end int) []byte {
 	return buf[:n]
 }
 
-// selectMediaPlaylistURL picks the highest-bandwidth variant from a master
-// playlist, or returns the master URL itself when it is a media playlist.
-func selectMediaPlaylistURL(masterURL *url.URL, body string) (string, error) {
+// collectVariantPlaylists lists every variant in a master playlist,
+// highest-bandwidth first (or the master URL itself when it is already a
+// media playlist). Callers try each in turn: the top variant is often an
+// ad-injected decoy while a lower one serves clean video.
+func collectVariantPlaylists(masterURL *url.URL, body string) []string {
 	if !strings.Contains(body, "#EXT-X-STREAM-INF") {
-		return masterURL.String(), nil
+		return []string{masterURL.String()}
 	}
-
-	bestBandwidth := -1
-	bestURI := ""
+	type variant struct {
+		bandwidth int
+		uri       string
+	}
+	var variants []variant
 	lines := strings.Split(body, "\n")
-	for i := 0; i < len(lines); i++ {
+	for i := range lines {
 		line := strings.TrimSpace(lines[i])
 		if !strings.HasPrefix(line, "#EXT-X-STREAM-INF") {
 			continue
 		}
 		bandwidth := parseBandwidth(line)
-		if bandwidth <= bestBandwidth {
-			continue
-		}
-		for j := i + 1; j < len(lines); j++ {
-			next := strings.TrimSpace(lines[j])
+		for j := range len(lines)-(i+1) {
+			next := strings.TrimSpace(lines[i+1+j])
 			if next == "" || strings.HasPrefix(next, "#") {
 				continue
 			}
-			bestBandwidth = bandwidth
-			bestURI = next
+			variants = append(variants, variant{bandwidth: bandwidth, uri: next})
 			break
 		}
 	}
-	if bestURI == "" {
+	sort.Slice(variants, func(i, j int) bool { return variants[i].bandwidth > variants[j].bandwidth })
+	var out []string
+	for _, v := range variants {
+		ref, err := url.Parse(v.uri)
+		if err != nil {
+			continue
+		}
+		out = append(out, masterURL.ResolveReference(ref).String())
+	}
+	if len(out) == 0 {
+		return []string{masterURL.String()}
+	}
+	return out
+}
+
+// selectMediaPlaylistURL picks the highest-bandwidth variant from a master
+// playlist, or returns the master URL itself when it is a media playlist.
+func selectMediaPlaylistURL(masterURL *url.URL, body string) (string, error) {
+	variants := collectVariantPlaylists(masterURL, body)
+	if len(variants) == 0 {
 		return "", fmt.Errorf("no variant playlist found in master playlist")
 	}
-	ref, err := url.Parse(bestURI)
-	if err != nil {
-		return "", fmt.Errorf("invalid variant playlist uri %q: %w", bestURI, err)
-	}
-	resolved := masterURL.ResolveReference(ref)
-	return resolved.String(), nil
+	return variants[0], nil
 }
 
 func parseBandwidth(infLine string) int {
@@ -267,30 +306,49 @@ func isDecoySegmentURI(raw string) bool {
 			return true
 		}
 	}
+	// Extension-spoofed decoys: the CDN serves ad/image content under
+	// non-.ts extensions (.jpg/.html/.js/.css/.txt/.png/.webp/...). Real
+	// HLS media segments are MPEG-TS (.ts), fMP4 (.m4s/.mp4/.cmfv), or
+	// extensionless (opaque CDN path tokens) — the magic-byte probe below
+	// is what catches image bytes hiding behind a clean name.
+	if idx := strings.LastIndex(lower, "/"); idx >= 0 {
+		last := lower[idx+1:]
+		if q := strings.IndexAny(last, "?#"); q >= 0 {
+			last = last[:q]
+		}
+		if !strings.Contains(last, ".") {
+			return false
+		}
+	}
+	if idx := strings.LastIndex(lower, "."); idx >= 0 {
+		ext := lower[idx:]
+		if q := strings.IndexAny(ext, "?#"); q >= 0 {
+			ext = ext[:q]
+		}
+		switch ext {
+		case ".ts", ".m4s", ".mp4", ".cmfv", ".cmfa", ".m4i":
+			return false
+		default:
+			return true
+		}
+	}
 	return false
 }
-
 // looksLikeDecoySegment reports whether probe bytes look like an image, an
 // HTML error page, or other non-video content instead of an HLS media segment.
 func looksLikeDecoySegment(data []byte) bool {
-	if len(data) < 4 {
+	// MPEG-TS sync word: real .ts segments start here 100% of the time.
+	// fMP4 starts with an `ftyp` box (byte 4..8). Anything else — JPEG
+	// SOI, PNG, GIF, RIFF/WEBP, HTML — is ad/decoy content, even when the
+	// CDN dresses the URL in a video-looking extension.
+	if len(data) == 0 {
 		return false
 	}
-	if data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' {
-		return true
+	if data[0] == 0x47 {
+		return false
 	}
-	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
-		return true
+	if len(data) >= 8 && string(data[4:8]) == "ftyp" {
+		return false
 	}
-	if string(data[:4]) == "GIF8" {
-		return true
-	}
-	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
-		return true
-	}
-	lower := strings.ToLower(string(data))
-	if strings.HasPrefix(lower, "<") || strings.Contains(lower, "<html") || strings.Contains(lower, "<!doctype") {
-		return true
-	}
-	return false
+	return true
 }

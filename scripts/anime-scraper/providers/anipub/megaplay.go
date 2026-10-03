@@ -16,7 +16,9 @@ import (
 )
 
 var (
-	videoPathRE = regexp.MustCompile(`/(?:video|play)/(\d+)/(sub|dub)`)
+	// AniPub emits /video/<id>/<mode> but the details API now returns
+	// /Video/<id>/<mode> (capital V): match case-insensitively.
+	videoPathRE = regexp.MustCompile(`(?i)/(?:video|play)/(\d+)/(sub|dub)`)
 	playPathRE  = regexp.MustCompile(`/play/(\d+)/(\d+)/(sub|dub)`)
 	dataIDRE    = regexp.MustCompile(`data-id="(\d+)"`)
 )

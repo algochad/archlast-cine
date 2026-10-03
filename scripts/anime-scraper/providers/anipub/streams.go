@@ -39,20 +39,30 @@ func getEpisodeStreamsForMode(showID string, config providers.PlaybackConfig, ep
 	}
 
 	// The direct file host hotlink-403s non-browser clients; megaplay's own
-	// client fails over to its first-party proxy (?domain=<host>), so do the
-	// same before validation instead of returning an unplayable URL.
-	if proxied := rewriteDirectToProxy(streamURL); proxied != streamURL {
-		if err := validateResolvedStream(proxied); err == nil {
+	// client fails over to its first-party proxy (?domain=<host>), so try
+	// the proxy — but the proxy copy can 404 on a stale salt path while the
+	// direct origin still serves (and vice versa). Prefer whichever
+	// validates, proxied first: the proxy host allows non-browser segment
+	// fetches while the direct origin 403s them.
+	proxied := rewriteDirectToProxy(streamURL)
+	if proxied != streamURL {
+		proxiedErr := validateResolvedStream(proxied)
+		directErr := validateResolvedStream(streamURL)
+		proxiedOK := proxiedErr == nil
+		directOK := directErr == nil
+		switch {
+		case proxiedOK:
 			streamURL = proxied
-		} else if err := validateResolvedStream(streamURL); err != nil {
-			curdhost.Log(fmt.Sprintf("anipub stream %q rejected: %v", streamURL, err))
-			return nil, nil, err
+		case directOK:
+			// keep the direct URL
+		default:
+			curdhost.Log(fmt.Sprintf("anipub stream %q rejected: neither direct nor proxy serves the playlist (direct=%v proxied=%v)", streamURL, directErr, proxiedErr))
+			return nil, nil, fmt.Errorf("no playable stream for episode %d", epNo)
 		}
 	} else if err := validateResolvedStream(streamURL); err != nil {
 		curdhost.Log(fmt.Sprintf("anipub stream %q rejected: %v", streamURL, err))
 		return nil, nil, err
 	}
-
 	hints := map[string]providers.StreamPlaybackHint{
 		streamURL: {
 			Referrer: megaplayBaseURL + "/",

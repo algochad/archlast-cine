@@ -577,7 +577,7 @@ fn rewrite_hls_url(uri: &str, origin: &str, base: &str, ticket_base: &str, proxy
     }
     if uri.starts_with("http://") || uri.starts_with("https://") {
         let (foreign_ticket, _) = tickets.insert_dedup(uri.to_string(), headers.to_vec());
-        return format!("{ticket_base}/{foreign_ticket}");
+        return format!("{ticket_base}/f/{foreign_ticket}");
     }
     if !uri.starts_with('/') {
         return format!("{proxy_dir}{uri}");
@@ -640,7 +640,7 @@ fn rewrite_dash_manifest_xml_aware(text: &str, origin: &str, base: &str, ticket_
                             format!("{base}/{rel}")
                         } else if resolved.starts_with("http://") || resolved.starts_with("https://") {
                             let (foreign_ticket, _) = tickets.insert_dedup(resolved.clone(), headers.to_vec());
-                            format!("{ticket_base}/{foreign_ticket}")
+                            format!("{ticket_base}/f/{foreign_ticket}")
                         } else {
                             format!("{base}/{inner}")
                         };
@@ -690,7 +690,7 @@ fn rewrite_dash_manifest_xml_aware(text: &str, origin: &str, base: &str, ticket_
                     Some(format!("{base}/{rel}"))
                 } else if url_val.starts_with("http://") || url_val.starts_with("https://") {
                     let (foreign_ticket, _) = tickets.insert_dedup(url_val.to_string(), headers.to_vec());
-                    Some(format!("{ticket_base}/{foreign_ticket}"))
+                    Some(format!("{ticket_base}/f/{foreign_ticket}"))
                 } else if url_val.starts_with('/') && !url_val.starts_with("//") {
                     // Origin-relative (e.g. "/dash/xxx/init-stream$Number$.m4s").
                     let rel = url_val.trim_start_matches('/').to_string();
@@ -760,7 +760,7 @@ fn rewrite_dash_foreign_urls(text: &str, base: &str, ticket_base: &str, tickets:
                         && !content.starts_with(base)
                     {
                         let (foreign_ticket, _) = tickets.insert_dedup(content.clone(), headers.to_vec());
-                        let replacement = format!("{ticket_base}/{foreign_ticket}");
+                        let replacement = format!("{ticket_base}/f/{foreign_ticket}");
                         rewritten.push_str(&out[last..content_start]);
                         rewritten.push_str(&replacement);
                         last = content_start + content.len();
@@ -800,7 +800,7 @@ fn rewrite_dash_foreign_urls(text: &str, base: &str, ticket_base: &str, tickets:
             let url_val = &out[val_start..val_end];
             if (url_val.starts_with("http://") || url_val.starts_with("https://")) && !url_val.starts_with(base) {
                 let (foreign_ticket, _) = tickets.insert_dedup(url_val.to_string(), headers.to_vec());
-                let replacement = format!("{ticket_base}/{foreign_ticket}");
+                let replacement = format!("{ticket_base}/f/{foreign_ticket}");
                 final_out.push_str(&out[last2..val_start]);
                 final_out.push_str(&replacement);
                 last2 = val_end;
@@ -2034,7 +2034,17 @@ async fn proxy_fetch(
     State(state): State<AppState>,
     Path((ticket, rest)): Path<(String, String)>,
     headers: HeaderMap,
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    // Axum strips `?query` out of `{*rest}`: re-attach it so proxied URLs
+    // with signed query params (e.g. `?domain=` on anime HLS masters)
+    // resolve to the real upstream instead of a query-less 404.
+    let rest = if query.is_empty() {
+        rest
+    } else {
+        let qs = query.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+        format!("{rest}?{qs}")
+    };
     proxy_fetch_inner(state, ticket, rest, headers).await
 }
 
@@ -2051,8 +2061,18 @@ async fn proxy_fetch_inner(
 
     // Resolve the upstream URL:
     //   rest == ""        -> the ticket's original URL
+    //   rest starts "f/"  -> foreign-ticket reference (HLS cross-host
+    //                        segments rewritten as `{base}/f/<ticket>`)
     //   rest starts "a/"  -> absolute path under the origin host
     //   anything else     -> relative to the original URL's directory
+    if let Some(fticket) = rest.strip_prefix("f/") {
+        if let Some(foreign) = state.tickets.get(fticket) {
+            log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
+            return proxy_fetch_inner_foreign(state, foreign, headers).await;
+        }
+        log::warn!("proxy_fetch: unknown foreign ticket={fticket} (outer ticket={ticket} rest={rest:?})");
+        return api_error(StatusCode::NOT_FOUND, "unknown or expired ticket");
+    }
     let upstream = if rest.is_empty() {
         t.raw_url.clone()
     } else if let Some(abs) = rest.strip_prefix("a/") {
@@ -2061,11 +2081,29 @@ async fn proxy_fetch_inner(
             return api_error(StatusCode::BAD_REQUEST, "bad proxy path");
         }
         // A foreign-ticket reference minted by the HLS rewrite for a
-        // cross-host segment URL: resolve it to the stored upstream URL and
-        // adopt ITS headers (provider-required Referer/UA).
-        if let Some(foreign) = state.tickets.get(abs) {
-            log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
-            return proxy_fetch_inner_foreign(state, foreign, headers).await;
+        // cross-host segment URL (`f/<ticket>`): resolve it to the stored
+        // upstream URL and adopt ITS headers (provider-required Referer/UA).
+        // The `f/` namespace keeps bare 16-hex segment filenames under the
+        // ticket origin (e.g. anime `17730e2cd67247a5`) from colliding with
+        // a foreign-ticket id.
+        if let Some(fticket) = abs.strip_prefix("f/") {
+            // Foreign ids are lowercase hex; same-origin segment names may
+            // differ in case — compare exactly, never case-fold.
+            if let Some(foreign) = state.tickets.get(fticket) {
+                log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
+                return proxy_fetch_inner_foreign(state, foreign, headers).await;
+            }
+            log::warn!("proxy_fetch: unknown foreign ticket={fticket} (outer ticket={ticket} rest={rest:?})");
+            return api_error(StatusCode::NOT_FOUND, "unknown or expired ticket");
+        }
+        // Legacy bare-ticket references (pre-`f/` rewrite): resolve ONLY on
+        // exact match — a same-origin segment filename that merely looks
+        // like a ticket must fall through to the origin join below.
+        if state.tickets.get(abs).is_some() {
+            if let Some(foreign) = state.tickets.get(abs) {
+                log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
+                return proxy_fetch_inner_foreign(state, foreign, headers).await;
+            }
         }
         if abs.starts_with("http://") || abs.starts_with("https://") {
             abs.to_string()
@@ -2260,7 +2298,10 @@ async fn proxy_fetch_inner(
                     }
                     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
                         let (foreign_ticket, _) = state.tickets.insert_dedup(trimmed.to_string(), t.headers.clone());
-                        return format!("{ticket_base}/{foreign_ticket}");
+                        // Prefix with `f/` so a bare 16-hex segment filename under
+                        // the ticket origin (e.g. anime `17730e2cd67247a5`)
+                        // can never collide with a foreign-ticket reference.
+                        return format!("{ticket_base}/f/{foreign_ticket}");
                     }
                     if !trimmed.starts_with('/') {
                         return format!("{proxy_dir}{trimmed}");
