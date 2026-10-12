@@ -887,15 +887,19 @@ mod tests {
     async fn show_popup_when_subtitles_available() {
         let mut app = crate::tui::app::App::new();
 
+        let caption = |name: &str, url: &str| crate::providers::models::SubtitleOption {
+            name: name.to_string(),
+            url: url.to_string(),
+            language: None,
+            format: None,
+            forced: None,
+            sdh: None,
+            embedded: None,
+            provider: None,
+        };
         let ext_captions = vec![
-            crate::providers::models::SubtitleOption {
-                name: "Spanish".to_string(),
-                url: "https://example.com/es.srt".to_string(),
-            },
-            crate::providers::models::SubtitleOption {
-                name: "French".to_string(),
-                url: "https://example.com/fr.srt".to_string(),
-            },
+            caption("Spanish", "https://example.com/es.srt"),
+            caption("French", "https://example.com/fr.srt"),
         ];
 
         app.handle_playback(crate::tui::action::Action::ShowSubtitlePopup(

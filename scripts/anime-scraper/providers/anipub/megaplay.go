@@ -27,26 +27,26 @@ var (
 // AniPub emits two link shapes: legacy https://anipub.xyz/video/<embedID>/<mode>
 // and current https://anipub.xyz/play/<malID>/<epNo>/<mode> (embedID unknown
 // until the play page's megaplay iframe is followed). Both are handled here.
-func resolveMegaplayStream(videoLink, mode string) (string, string, error) {
+func resolveMegaplayStream(videoLink, mode string) (string, subtitleSet, error) {
 	videoLink = strings.TrimSpace(videoLink)
 	if videoLink == "" {
-		return "", "", fmt.Errorf("empty video link")
+		return "", subtitleSet{}, fmt.Errorf("empty video link")
 	}
 
 	mode = providers.NormalizeTranslationType(mode)
 
 	streamPage, err := megaplayStreamPageURL(videoLink, mode)
 	if err != nil {
-		return "", "", err
+		return "", subtitleSet{}, err
 	}
 	html, err := fetchString(streamPage, baseURL+"/")
 	if err != nil {
-		return "", "", err
+		return "", subtitleSet{}, err
 	}
 
 	dataID := dataIDRE.FindStringSubmatch(html)
 	if len(dataID) < 2 {
-		return "", "", fmt.Errorf("megaplay data-id not found")
+		return "", subtitleSet{}, fmt.Errorf("megaplay data-id not found")
 	}
 
 	// Both endpoints now return only tracks + an "enc" token: an AES-CBC
@@ -56,7 +56,7 @@ func resolveMegaplayStream(videoLink, mode string) (string, string, error) {
 	// without a browser.
 	var payload megaplaySourcesResponse
 	if err := fetchJSON(megaplaySourcesURL(dataID[1], true), streamPage, &payload); err != nil {
-		return "", "", err
+		return "", subtitleSet{}, err
 	}
 	if strings.TrimSpace(payload.Sources.File) == "" && payload.Enc != "" {
 		if file, err := decryptMegaplayEnc(payload.Enc); err == nil {
@@ -66,7 +66,7 @@ func resolveMegaplayStream(videoLink, mode string) (string, string, error) {
 	if strings.TrimSpace(payload.Sources.File) == "" {
 		var legacy megaplaySourcesResponse
 		if err := fetchJSON(megaplaySourcesURL(dataID[1], false), streamPage, &legacy); err != nil {
-			return "", "", err
+			return "", subtitleSet{}, err
 		}
 		payload.Tracks = legacy.Tracks
 		if payload.Sources.File == "" && legacy.Enc != "" {
@@ -78,10 +78,10 @@ func resolveMegaplayStream(videoLink, mode string) (string, string, error) {
 
 	streamURL := strings.TrimSpace(payload.Sources.File)
 	if streamURL == "" {
-		return "", "", fmt.Errorf("megaplay stream url missing")
+		return "", subtitleSet{}, fmt.Errorf("megaplay stream url missing")
 	}
-	subtitle := pickSubtitleTrack(payload, mode)
-	return streamURL, subtitle, nil
+	subs := subtitleSet{Primary: pickSubtitleTrack(payload, mode), Tracks: subtitleTracks(payload, mode)}
+	return streamURL, subs, nil
 }
 
 // Megaplay "enc" token decryption: AES-256-CBC with a 32-byte zero-padded key
@@ -207,4 +207,47 @@ func pickSubtitleTrack(payload megaplaySourcesResponse, mode string) string {
 		}
 	}
 	return fallback
+}
+
+// subtitleSet is a megaplay stream's soft-sub offering: the preferred
+// English file plus every track in every language.
+type subtitleSet struct {
+	Primary string
+	Tracks  []providers.SubtitleTrack
+}
+
+// subtitleLangCodes maps megaplay's English language labels to ISO 639-1.
+var subtitleLangCodes = map[string]string{
+	"arabic": "ar", "chinese": "zh", "czech": "cs", "danish": "da", "dutch": "nl",
+	"english": "en", "finnish": "fi", "french": "fr", "german": "de", "greek": "el",
+	"hebrew": "he", "hindi": "hi", "hungarian": "hu", "indonesian": "id", "italian": "it",
+	"japanese": "ja", "korean": "ko", "malay": "ms", "norwegian": "no", "polish": "pl",
+	"portuguese": "pt", "romanian": "ro", "russian": "ru", "spanish": "es", "swedish": "sv",
+	"thai": "th", "turkish": "tr", "ukrainian": "uk", "vietnamese": "vi",
+}
+
+// subtitleTracks lists every captions track megaplay offers, any language.
+// Dub streams get none: English dub + auto-selected English subs double up.
+func subtitleTracks(payload megaplaySourcesResponse, mode string) []providers.SubtitleTrack {
+	if mode == "dub" {
+		return nil
+	}
+	var tracks []providers.SubtitleTrack
+	for _, track := range payload.Tracks {
+		file := strings.TrimSpace(track.File)
+		if file == "" || !strings.EqualFold(strings.TrimSpace(track.Kind), "captions") {
+			continue
+		}
+		label := strings.TrimSpace(track.Label)
+		lang := subtitleLangCodes[strings.ToLower(label)]
+		if lang == "" {
+			lang = subtitleLangCodes[strings.ToLower(strings.SplitN(label, " ", 2)[0])]
+		}
+		format := ""
+		if i := strings.LastIndexByte(strings.SplitN(file, "?", 2)[0], '.'); i >= 0 {
+			format = strings.ToLower(strings.SplitN(file, "?", 2)[0][i+1:])
+		}
+		tracks = append(tracks, providers.SubtitleTrack{URL: file, Label: label, Language: lang, Format: format})
+	}
+	return tracks
 }

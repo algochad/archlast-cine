@@ -48,23 +48,23 @@ export const api = {
     request<StreamsResponse>(
       `/streams?provider=${provider}&id=${encodeURIComponent(id)}&season=${season}&episode=${episode}`,
     ),
-  captions: (id: string, resourceId?: string | null) => {
-    const rid = resourceId ? `&resource_id=${encodeURIComponent(resourceId)}` : "";
-    return request<CaptionsResponse>(`/captions?id=${encodeURIComponent(id)}${rid}`);
+  captions: (id: string, resourceId?: string | null, opts?: { provider?: ProviderId; episode?: number }) => {
+    let qs = `id=${encodeURIComponent(id)}`;
+    if (resourceId) qs += `&resource_id=${encodeURIComponent(resourceId)}`;
+    if (opts?.provider) qs += `&provider=${opts.provider}`;
+    if (opts?.episode != null && opts.episode > 0) qs += `&episode=${opts.episode}`;
+    return request<CaptionsResponse>(`/captions?${qs}`);
   },
   subtitleSearch: (opts: {
-    provider: "opensubtitles" | "subscene" | "aniskip" | "jimaku";
-    title?: string;
-    episode?: string | number;
+    title: string;
+    season?: number;
+    episode?: number;
     lang?: string;
-    hash?: string;
   }) => {
-    const qs = new URLSearchParams();
-    qs.set("provider", opts.provider);
-    if (opts.title) qs.set("title", opts.title);
-    if (opts.episode != null && String(opts.episode).trim() !== "") qs.set("episode", String(opts.episode));
+    const qs = new URLSearchParams({ provider: "opensubtitles", title: opts.title });
+    if (opts.season != null && opts.season > 0) qs.set("season", String(opts.season));
+    if (opts.episode != null && opts.episode > 0) qs.set("episode", String(opts.episode));
     if (opts.lang) qs.set("lang", opts.lang);
-    if (opts.hash) qs.set("hash", opts.hash);
     return request<{ provider: string; subtitles: SubtitleOption[] }>(`/subtitles/search?${qs.toString()}`);
   },
   skipMarkers: (opts: {

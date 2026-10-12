@@ -1153,9 +1153,27 @@ struct CaptionsParams {
     id: String,
     #[serde(default)]
     resource_id: Option<String>,
+    /// Provider key (`anime`, `moviebox`, ...). Anime ids are not MovieBox
+    /// subject ids, so its captions come from the stream resolver instead.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    episode: Option<usize>,
 }
 
 async fn captions(State(state): State<AppState>, Query(p): Query<CaptionsParams>) -> Response {
+    if p.provider.as_deref().map(str::trim) == Some("anime") {
+        let subtitles = state
+            .svc
+            .anime_client
+            .episode_captions(&p.id, p.episode.unwrap_or(1))
+            .await;
+        return Json(serde_json::json!({
+            "id": p.id,
+            "subtitles": subtitles,
+        }))
+        .into_response();
+    }
     // Sibling subject ids (alternate audio/dub tracks) widen caption coverage
     // the same way the TUI does.
     let mut siblings: Vec<String> =
@@ -1186,77 +1204,84 @@ async fn captions(State(state): State<AppState>, Query(p): Query<CaptionsParams>
 
 #[derive(Deserialize)]
 struct SubtitleSearchParams {
-    provider: String,
+    #[serde(default)]
+    provider: Option<String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
-    episode: Option<String>,
+    season: Option<usize>,
+    #[serde(default)]
+    episode: Option<usize>,
     #[serde(default)]
     lang: Option<String>,
-    #[serde(default)]
-    hash: Option<String>,
 }
 
 async fn subtitle_search(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(p): Query<SubtitleSearchParams>,
 ) -> Response {
-    let provider = p.provider.trim().to_ascii_lowercase();
-    let allowed = ["opensubtitles", "subscene", "aniskip", "jimaku"];
-    if !allowed.contains(&provider.as_str()) {
+    let provider = p
+        .provider
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "opensubtitles".to_string());
+    if provider != "opensubtitles" {
         return api_error(
             StatusCode::BAD_REQUEST,
-            format!("unsupported provider '{}': expected one of opensubtitles|subscene|aniskip|jimaku", p.provider),
+            format!("unsupported provider '{provider}': expected opensubtitles"),
         );
     }
-    // Hash matching is deferred: backend computes from proxy bytes when a ticket
-    // is available. No client hashing — this endpoint only does title/episode/lang
-    // search and always returns normalized SubtitleOption[].
     let lang = p.lang.unwrap_or_else(|| "en".to_string());
     let title = p.title.unwrap_or_default();
-    let ep = p.episode.unwrap_or_default();
-    // For now the endpoint is a normalization stub: it validates params and
-    // returns a well-formed SubtitleOption[] payload. Real external provider
-    // proxying (OpenSubtitles/Subscene/Jimaku/Aniskip) can augment the `mock`
-    // branch below once credentials/rate-limiting are configured. The shape is
-    // stable so the CC modal can already merge badged results.
-    let mut subtitles: Vec<moviebox_tui::providers::models::SubtitleOption> = Vec::new();
-    // Provide a deterministic demo fixture when a title is supplied so the CC
-    // modal merge path is exercisable without external network.
-    if !title.trim().is_empty() {
-        let safe_title = title.trim().replace(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-' && c != '_', "");
-        let tag = if ep.trim().is_empty() { safe_title.clone() } else { format!("{} E{}", safe_title, ep.trim()) };
-        // Only synthesize one entry per search; real providers would return many.
-        subtitles.push(moviebox_tui::providers::models::SubtitleOption {
-            name: format!("{} [{provider}]", tag),
-            url: format!("https://example.com/subs/{}_{}.srt", provider, safe_title.replace(' ', "_")),
-            language: Some(lang.clone()),
-            format: Some("srt".to_string()),
-            forced: Some(false),
-            sdh: Some(false),
-            embedded: Some(false),
-            provider: Some(provider.clone()),
-        });
-        // Aniskip/Jimaku are anime-specific; include an ASS fixture to exercise
-        // the JASSUB path when those providers are queried.
-        if provider == "aniskip" || provider == "jimaku" {
-            subtitles.push(moviebox_tui::providers::models::SubtitleOption {
-                name: format!("{} [{provider} ASS]", tag),
-                url: format!("https://example.com/subs/{}_{}.ass", provider, safe_title.replace(' ', "_")),
-                language: Some(lang.clone()),
-                format: Some("ass".to_string()),
-                forced: Some(false),
-                sdh: Some(false),
-                embedded: Some(false),
-                provider: Some(provider.clone()),
-            });
-        }
+    match moviebox_tui::providers::subtitles::search_opensubtitles(
+        &state.svc.http_client,
+        &title,
+        p.season,
+        p.episode,
+        &lang,
+    )
+    .await
+    {
+        Ok(subtitles) => Json(serde_json::json!({
+            "provider": provider,
+            "subtitles": subtitles,
+        }))
+        .into_response(),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, e),
     }
-    Json(serde_json::json!({
-        "provider": provider,
-        "subtitles": subtitles,
-    }))
-    .into_response()
+}
+
+#[derive(Deserialize)]
+struct SubtitleFileParams {
+    src: String,
+    #[serde(default)]
+    enc: String,
+}
+
+/// Serves one search-result subtitle as UTF-8 text (gunzipped, transcoded).
+async fn subtitle_file(
+    State(state): State<AppState>,
+    Query(p): Query<SubtitleFileParams>,
+) -> Response {
+    match moviebox_tui::providers::subtitles::fetch_opensubtitles_file(
+        &state.svc.http_client,
+        &p.src,
+        &p.enc,
+    )
+    .await
+    {
+        Ok(text) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            text,
+        )
+            .into_response(),
+        Err(e) if e.contains("not allowed") => api_error(StatusCode::BAD_REQUEST, e),
+        Err(e) => api_error(StatusCode::BAD_GATEWAY, e),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -3949,6 +3974,7 @@ async fn main() {
         .route("/api/streams", get(streams))
         .route("/api/captions", get(captions))
         .route("/api/subtitles/search", get(subtitle_search))
+        .route("/api/subtitles/file", get(subtitle_file))
         .route("/api/skip-markers", get(skip_markers))
         .route("/api/play", post(play))
         .route("/api/proxy/ticket", post(create_ticket))

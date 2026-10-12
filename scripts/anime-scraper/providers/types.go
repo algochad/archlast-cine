@@ -20,6 +20,17 @@ type PlaybackConfig struct {
 type StreamPlaybackHint struct {
 	Referrer string
 	Subtitle string
+	// Subtitles lists every soft-sub track the stream's host offers (any
+	// language); Subtitle above is just the preferred English one.
+	Subtitles []SubtitleTrack
+}
+
+// SubtitleTrack is one external soft-sub file (WebVTT/SRT/ASS) for a stream.
+type SubtitleTrack struct {
+	URL      string
+	Label    string
+	Language string // ISO 639-1 when known, else empty
+	Format   string // vtt, srt, ass; empty when unknown
 }
 
 // Provider resolves catalog search, episode lists, and stream URLs.

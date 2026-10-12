@@ -36,7 +36,8 @@ Tasks (backend → client in lockstep):
 
 - Not in repo. Must implement fetchers (client or server-side). Decision: server-side in Rust (caching, auth, rate-limit) — web client already proxies through backend for auth headers.
 - Tasks:
-  1. New endpoint `GET /api/subtitles/search?provider=opensubtitles|subscene|aniskip|jimaku&hash=&title=&episode=&release_group=&lang=` → proxies to external API, normalizes to `SubtitleOption[]`.
+  1. **Shipped (OpenSubtitles only).** `GET /api/subtitles/search?provider=opensubtitles&title=&season=&episode=&lang=` queries the keyless OpenSubtitles legacy REST API (`MovieBox-Tui/src/providers/subtitles.rs`) and returns `SubtitleOption[]` whose URLs point at `GET /api/subtitles/file?src=&enc=` — that endpoint (host-allowlisted to `dl.opensubtitles.org`) gunzips and transcodes the download to UTF-8. Subscene (dead), Jimaku (needs an API key) and Aniskip (skip times, not subtitles) are not implemented; the old fixture stub that returned `example.com` URLs is gone.
+     Anime captions: `GET /api/captions?id=&provider=anime&episode=` returns the soft-sub tracks (all languages) the scraper resolved for that episode (megaplay VTTs; Referer is injected via the release mirror headers). The player falls back to the OpenSubtitles search whenever the provider offers nothing in the preferred language.
   2. Client: "Search subtitles" row in CC menu (when external providers enabled in prefs) opens search modal → results merge into `subOptions` with badge "OpenSubtitles" etc.
   3. Hash matching: compute file hash client-side? Web can't read response bytes easily (stream). Better: backend has file access via proxy — backend computes hash. `POST /api/subtitles/by-hash` with `ticket` + `range` to read first 64KB? Or backend fetches full file once and caches. Scope P4 — P1 ships backend search endpoint with title/episode/season query (AnimeSkip has season/ep), wire later.
 

@@ -307,14 +307,65 @@ struct AniListStudio {
     name: Option<String>,
 }
 
+/// Soft-sub tracks the resolver reported per `show:episode`, kept so the web
+/// captions endpoint can serve them without re-running a full stream resolve.
+type SubtitleCache = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<crate::providers::models::SubtitleOption>>>,
+>;
+
+/// Cap on cached `show:episode` entries; the map is cleared when exceeded.
+const SUBTITLE_CACHE_MAX: usize = 256;
+
 #[derive(Clone)]
 pub struct AnimeProvider {
     http: Client,
+    subtitles: SubtitleCache,
 }
 
 impl AnimeProvider {
     pub fn new(http: Client) -> Self {
-        Self { http }
+        Self {
+            http,
+            subtitles: SubtitleCache::default(),
+        }
+    }
+
+    fn subtitle_key(show_id: &str, episode: usize) -> String {
+        format!("{show_id}:{episode}")
+    }
+
+    fn cached_subtitles(&self, show_id: &str, episode: usize) -> Option<Vec<crate::providers::models::SubtitleOption>> {
+        self.subtitles
+            .lock()
+            .ok()?
+            .get(&Self::subtitle_key(show_id, episode))
+            .cloned()
+    }
+
+    fn store_subtitles(&self, show_id: &str, episode: usize, subs: Vec<crate::providers::models::SubtitleOption>) {
+        if let Ok(mut map) = self.subtitles.lock() {
+            if map.len() >= SUBTITLE_CACHE_MAX {
+                map.clear();
+            }
+            map.insert(Self::subtitle_key(show_id, episode), subs);
+        }
+    }
+
+    /// Soft-sub tracks for an episode. Served from the resolver's last answer;
+    /// resolves the episode once when nothing is cached yet.
+    pub async fn episode_captions(
+        &self,
+        id: &str,
+        episode: usize,
+    ) -> Vec<crate::providers::models::SubtitleOption> {
+        use crate::providers::ReleaseProvider;
+        if let Some(subs) = self.cached_subtitles(id, episode) {
+            return subs;
+        }
+        if self.episode_streams(id, 1, episode).await.is_err() {
+            return Vec::new();
+        }
+        self.cached_subtitles(id, episode).unwrap_or_default()
     }
 
     fn pick_title(title: &AniListTitle) -> String {
@@ -745,7 +796,7 @@ impl crate::providers::Provider for AnimeProvider {
             supports_search: true,
             supports_pagination: true,
             supports_series: true,
-            supports_subtitles: false,
+            supports_subtitles: true,
             supports_homepage: false,
         }
     }
@@ -991,6 +1042,43 @@ impl AnimeProvider {
                 });
             }
         }
+        // Soft-sub tracks ride on the first stream that offers any.
+        let subs: Vec<crate::providers::models::SubtitleOption> = streams
+            .iter()
+            .find_map(|s| {
+                let provider = s.get("provider").and_then(|v| v.as_str()).map(str::to_string);
+                let tracks = s.get("subtitles")?.as_array()?;
+                let parsed: Vec<_> = tracks
+                    .iter()
+                    .filter_map(|t| {
+                        let url = t.get("url")?.as_str()?.trim();
+                        if url.is_empty() {
+                            return None;
+                        }
+                        let label = t.get("label").and_then(|v| v.as_str()).unwrap_or("").trim();
+                        let str_field = |k: &str| {
+                            t.get(k)
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|v| !v.is_empty())
+                                .map(str::to_string)
+                        };
+                        Some(crate::providers::models::SubtitleOption {
+                            name: if label.is_empty() { "Subtitles".to_string() } else { label.to_string() },
+                            url: url.to_string(),
+                            language: str_field("language"),
+                            format: str_field("format"),
+                            forced: Some(false),
+                            sdh: Some(false),
+                            embedded: Some(false),
+                            provider: provider.clone(),
+                        })
+                    })
+                    .collect();
+                (!parsed.is_empty()).then_some(parsed)
+            })
+            .unwrap_or_default();
+        self.store_subtitles(show_id, episode, subs);
 
         Ok(releases)
     }

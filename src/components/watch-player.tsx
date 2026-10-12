@@ -251,7 +251,6 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   const jassubAssRef = useRef<string | null>(null);
   const jassubActiveRef = useRef(false);
   const [searchOpen, setSearchOpen] = useState(false);
-  const [searchProvider, setSearchProvider] = useState<'opensubtitles'|'subscene'|'aniskip'|'jimaku'>('opensubtitles');
   const [searchResults, setSearchResults] = useState<SubtitleOption[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [autoplay, setAutoplay] = useState<boolean>(() => {
@@ -1033,12 +1032,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     try {
       const h = await api.health();
       const cap = h.providers.find((pp) => pp.key === provider)?.capabilities.supports_subtitles;
-      const supports = cap ?? (provider === "moviebox" ? true : false);
+      const supports = cap ?? (provider === "moviebox" || provider === "anime");
       setSupportsSubs(supports);
       healthFetchedRef.current = true;
       return supports;
     } catch {
-      const fallback = provider === "moviebox";
+      const fallback = provider === "moviebox" || provider === "anime";
       setSupportsSubs(fallback);
       healthFetchedRef.current = true;
       return fallback;
@@ -1098,8 +1097,42 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   const applyChosenCaptionsRef = useRef<((opt: SubtitleOption | null) => Promise<void>) | null>(null);
   const applySecondRef = useRef<((opt: SubtitleOption | null) => Promise<void>) | null>(null);
 
-  /** Load the available subtitle options once per title, capability-driven. */
-  const loadSubtitleOptions = useCallback(async () => {
+  /** Add options to the menu (deduped); optionally auto-pick the best one. */
+  const appendSubOptions = useCallback((incoming: SubtitleOption[], autoSelect: boolean) => {
+    setSubOptions((prev) => {
+      const keyFor = (o: SubtitleOption) => `${o.url}::${(o.language ?? o.name ?? '').toLowerCase()}::${o.format ?? ''}::${o.forced?1:0}::${o.sdh?1:0}::${o.provider ?? ''}`;
+      const seen = new Set(prev.map(keyFor));
+      const toAdd = incoming.filter((o) => {
+        const k = keyFor(o);
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      if (!toAdd.length) return prev;
+      const merged = [...prev, ...toAdd];
+      if (autoSelect) setTimeout(() => tryAutoSelect(merged), 0);
+      return merged;
+    });
+  }, [tryAutoSelect]);
+
+  /** OpenSubtitles lookup. Anime matches by episode only: its seasons are cour-numbered. */
+  const searchExternalSubs = useCallback(async (title: string, seriesLike: boolean, lang: string): Promise<SubtitleOption[]> => {
+    if (!title.trim()) return [];
+    const res = await api.subtitleSearch({
+      title: title.trim(),
+      season: provider === "anime" ? undefined : season,
+      episode: seriesLike ? episode : undefined,
+      lang,
+    });
+    return (res.subtitles ?? []).map((o) => ({ ...o, source: 'search' as const }));
+  }, [provider, season, episode]);
+
+  /**
+   * Load the available subtitle options once per title, capability-driven.
+   * Provider captions first; when none are in the preferred language, fall
+   * back to an OpenSubtitles search so every title has something to show.
+   */
+  const loadSubtitleOptions = useCallback(async (ctx: { title: string; seriesLike: boolean; releases: Release[] }) => {
     const supports = await ensureSubtitleCap();
     if (!supports) {
       setSubOptions([]);
@@ -1107,38 +1140,48 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       return;
     }
     setSupportsSubs(true);
+    let prefLang = 'en';
+    try { prefLang = (getPrefs().prefSubLang?.[0] ?? 'en').toLowerCase(); } catch { /* defaults */ }
+    let tagged: SubtitleOption[] = [];
     try {
-      const rel = (loadedRef.current?.streams.releases ?? []) as Release[];
+      const rel = ctx.releases;
       const activeRel = activeRef.current ? rel.find((r) => `${r.provider}:${r.filename}` === activeRef.current?.releaseKey) ?? rel[0] : rel[0];
       const rid = activeRel?.resource_id ?? null;
-      const subs = await api.captions(id, rid);
-      const tagged: SubtitleOption[] = subs.subtitles.map((o) => ({ ...o, source: 'api' as const }));
-      setSubOptions((prev) => {
-        const manifestPrev = prev.filter((p) => p.source === 'manifest');
-        if (!manifestPrev.length) {
-          setTimeout(() => tryAutoSelect(tagged), 0);
-          return tagged;
-        }
-        const merged: SubtitleOption[] = [...tagged];
-        const keyFor = (o: SubtitleOption) => `${o.url}::${(o.language ?? o.name ?? '').toLowerCase()}::${o.format ?? ''}::${o.forced?1:0}::${o.sdh?1:0}`;
-        const seen = new Set(tagged.map((tt) => keyFor(tt)));
-        for (const mm of manifestPrev) {
-          const key = keyFor(mm);
-          if (!seen.has(key)) {
-            merged.push(mm);
-            seen.add(key);
-          }
-        }
-        setTimeout(() => tryAutoSelect(merged), 0);
-        return merged;
-      });
+      const subs = await api.captions(id, rid, { provider, episode });
+      tagged = subs.subtitles.map((o) => ({ ...o, source: 'api' as const }));
     } catch {
-      setSubOptions((prev) => {
-        const manifestOnly = prev.filter((p) => p.source === 'manifest');
-        return manifestOnly;
-      });
+      // provider has no captions answer: fall through to external search
     }
-  }, [provider, id, ensureSubtitleCap, tryAutoSelect]);
+    const hasPref = tagged.some((o) => (o.language ?? '').toLowerCase().split(/[-_]/)[0] === prefLang);
+    setSubOptions((prev) => {
+      const manifestPrev = prev.filter((p) => p.source === 'manifest');
+      if (!manifestPrev.length) {
+        if (hasPref) setTimeout(() => tryAutoSelect(tagged), 0);
+        return tagged;
+      }
+      const merged: SubtitleOption[] = [...tagged];
+      const keyFor = (o: SubtitleOption) => `${o.url}::${(o.language ?? o.name ?? '').toLowerCase()}::${o.format ?? ''}::${o.forced?1:0}::${o.sdh?1:0}`;
+      const seen = new Set(tagged.map((tt) => keyFor(tt)));
+      for (const mm of manifestPrev) {
+        const key = keyFor(mm);
+        if (!seen.has(key)) {
+          merged.push(mm);
+          seen.add(key);
+        }
+      }
+      if (hasPref) setTimeout(() => tryAutoSelect(merged), 0);
+      return merged;
+    });
+    if (hasPref) return;
+    let external: SubtitleOption[] = [];
+    try {
+      external = await searchExternalSubs(ctx.title, ctx.seriesLike, prefLang);
+    } catch {
+      // external search is best-effort; keep whatever the provider offered
+    }
+    appendSubOptions(external, false);
+    tryAutoSelect([...tagged, ...external]);
+  }, [provider, id, episode, ensureSubtitleCap, tryAutoSelect, searchExternalSubs, appendSubOptions]);
 
   /** Merge manifest-discovered tracks into subOptions, deduped by (url, language). */
   const mergeManifestTracks = useCallback((tracks: { language: string; url: string; kind: string; forced?: boolean; sdh?: boolean }[], baseDir: string | null) => {
@@ -1183,7 +1226,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
 
   /** Fetch + parse one subtitle file through the header-injecting proxy. */
   const fetchSubtitleText = useCallback(async (opt: SubtitleOption): Promise<string | null> => {
-    if (opt.url.startsWith('/api/proxy/')) {
+    if (opt.url.startsWith('/api/proxy/') || opt.url.startsWith('/api/mb/')) {
       try {
         const r = await fetch(opt.url, { cache: "no-store" });
         if (!r.ok) return null;
@@ -1420,6 +1463,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     },
     [fetchSubtitleText],
   );
+  useEffect(() => { applyChosenCaptionsRef.current = applyChosenCaptions; }, [applyChosenCaptions]);
 
   const applySecondCaptions = useCallback(async (opt: SubtitleOption | null) => {
     const video = videoRef.current;
@@ -2169,7 +2213,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   const boot = useCallback(async () => {
     setState("loading");
     setError(null);
-    void loadSubtitleOptions();
+
     try {
       // Streams are the hard requirement; details are cosmetic (title/poster).
       // An anipub numeric id (e.g. 8347) resolves streams but 404s details
@@ -2209,6 +2253,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         };
       }
       setLoaded({ streams, details });
+      // After streams: anime captions ride on the resolve that just ran.
+      void loadSubtitleOptions({
+        title: details.title,
+        seriesLike: details.media_type !== "movie",
+        releases: streams.releases,
+      });
       const choices = streams.releases.filter((r) => r.mirrors.length > 0);
       if (!choices.length) {
         setError("This title isn't available right now. Try again or pick another source.");
@@ -2577,29 +2627,17 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     if (!title.trim()) { flashNotice("No title for search"); return; }
     setSearchLoading(true);
     try {
-      const res = await api.subtitleSearch({ provider: searchProvider, title: title.trim(), episode: String(episode ?? ""), lang: getPrefs().prefSubLang?.[0] ?? "en" });
-      const incoming: SubtitleOption[] = (res.subtitles ?? []).map((o) => ({ ...o, source: 'search' as const }));
+      const incoming = await searchExternalSubs(title, loaded?.details.media_type !== "movie", getPrefs().prefSubLang?.[0] ?? "en");
       setSearchResults(incoming);
-      if (!incoming.length) { flashNotice("No results from " + searchProvider); return; }
-      // merge badged into subOptions, deduped by (url, language, format, forced, sdh)
-      setSubOptions((prev) => {
-        const keyFor = (o: SubtitleOption) => `${o.url}::${(o.language ?? o.name ?? '').toLowerCase()}::${o.format ?? ''}::${o.forced?1:0}::${o.sdh?1:0}::${o.provider ?? ''}`;
-        const seen = new Set(prev.map((p) => keyFor(p)));
-        const toAdd: SubtitleOption[] = [];
-        for (const opt of incoming) {
-          const k = keyFor(opt);
-          if (!seen.has(k)) { seen.add(k); toAdd.push(opt); }
-        }
-        if (!toAdd.length) return prev;
-        return [...prev, ...toAdd];
-      });
-      flashNotice(`Found ${incoming.length} from ${searchProvider}`);
+      if (!incoming.length) { flashNotice("No subtitles found"); return; }
+      appendSubOptions(incoming, false);
+      flashNotice(`Found ${incoming.length} subtitles`);
     } catch (e) {
       flashNotice(e instanceof Error ? e.message : "Search failed");
     } finally {
       setSearchLoading(false);
     }
-  }, [loaded, episode, searchProvider, flashNotice]);
+  }, [loaded, searchExternalSubs, appendSubOptions, flashNotice]);
 
 
 
@@ -5100,23 +5138,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                       </li>
                       {searchOpen && (
                         <li className="hairline-t px-3 py-2.5">
-                          <div className="flex flex-wrap gap-1.5">
-                            {(['opensubtitles','subscene','aniskip','jimaku'] as const).map((p) => (
-                              <button
-                                key={p}
-                                onClick={() => setSearchProvider(p)}
-                                className={`rounded-full border px-2.5 py-1 text-[11px] font-bold capitalize tracking-widest transition ${searchProvider===p ? "border-brand bg-brand/15 text-brand" : "border-white/15 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
-                              >
-                                {p}
-                              </button>
-                            ))}
-                          </div>
                           <button
                             onClick={() => void runSubtitleSearch()}
                             disabled={searchLoading}
-                            className="mt-2 w-full rounded-md bg-brand px-3 py-2 text-xs font-bold text-white transition hover:bg-brand/90 disabled:opacity-50"
+                            className="w-full rounded-md bg-brand px-3 py-2 text-xs font-bold text-white transition hover:bg-brand/90 disabled:opacity-50"
                           >
-                            {searchLoading ? "Searching…" : `Search ${searchProvider}`}
+                            {searchLoading ? "Searching…" : "Search OpenSubtitles"}
                           </button>
                           {searchResults.length > 0 && (
                             <ul className="mt-2 max-h-40 overflow-y-auto rounded-md border border-white/10">

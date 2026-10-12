@@ -235,7 +235,7 @@ func collectVariantPlaylists(masterURL *url.URL, body string) []string {
 			continue
 		}
 		bandwidth := parseBandwidth(line)
-		for j := range len(lines)-(i+1) {
+		for j := range len(lines) - (i + 1) {
 			next := strings.TrimSpace(lines[i+1+j])
 			if next == "" || strings.HasPrefix(next, "#") {
 				continue
@@ -334,6 +334,7 @@ func isDecoySegmentURI(raw string) bool {
 	}
 	return false
 }
+
 // looksLikeDecoySegment reports whether probe bytes look like an image, an
 // HTML error page, or other non-video content instead of an HLS media segment.
 func looksLikeDecoySegment(data []byte) bool {

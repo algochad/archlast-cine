@@ -32,11 +32,39 @@ type StreamResponse struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-type StreamInfo struct {
+// SubtitleInfo is one external soft-sub file offered alongside a stream.
+type SubtitleInfo struct {
 	URL      string `json:"url"`
-	Quality  string `json:"quality"`
-	Provider string `json:"provider"`
-	Referrer string `json:"referrer,omitempty"`
+	Label    string `json:"label"`
+	Language string `json:"language,omitempty"`
+	Format   string `json:"format,omitempty"`
+}
+
+type StreamInfo struct {
+	URL       string         `json:"url"`
+	Quality   string         `json:"quality"`
+	Provider  string         `json:"provider"`
+	Referrer  string         `json:"referrer,omitempty"`
+	Subtitles []SubtitleInfo `json:"subtitles,omitempty"`
+}
+
+// subtitleInfos flattens a provider hint into the wire shape. Providers that
+// only expose one preferred English file get it as a single track.
+func subtitleInfos(h providers.StreamPlaybackHint) []SubtitleInfo {
+	var out []SubtitleInfo
+	for _, t := range h.Subtitles {
+		out = append(out, SubtitleInfo{URL: t.URL, Label: t.Label, Language: t.Language, Format: t.Format})
+	}
+	if len(out) == 0 && strings.TrimSpace(h.Subtitle) != "" {
+		file := strings.TrimSpace(h.Subtitle)
+		format := ""
+		path := strings.SplitN(file, "?", 2)[0]
+		if i := strings.LastIndexByte(path, '.'); i >= 0 && len(path)-i <= 5 {
+			format = strings.ToLower(path[i+1:])
+		}
+		out = append(out, SubtitleInfo{URL: file, Label: "English", Language: "en", Format: format})
+	}
+	return out
 }
 
 type SearchRequest struct {
@@ -221,8 +249,10 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 
 		for i, url := range urls {
 			referrer := ""
+			var subs []SubtitleInfo
 			if h, ok := hints[url]; ok {
 				referrer = h.Referrer
+				subs = subtitleInfos(h)
 			}
 			if referrer == "" {
 				if meta, ok := providers.MetaFor(p.Name()); ok && meta.Referrer != "" {
@@ -230,10 +260,11 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			streams = append(streams, StreamInfo{
-				URL:      url,
-				Quality:  fmt.Sprintf("auto-%d", i),
-				Provider: p.Name(),
-				Referrer: referrer,
+				URL:       url,
+				Quality:   fmt.Sprintf("auto-%d", i),
+				Provider:  p.Name(),
+				Referrer:  referrer,
+				Subtitles: subs,
 			})
 		}
 		return len(urls) > 0

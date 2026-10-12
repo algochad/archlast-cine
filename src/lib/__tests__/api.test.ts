@@ -85,6 +85,20 @@ describe("request builders: URL mapping and method plumbing", () => {
       `/api/mb/captions?id=${encodeURIComponent("id with spaces")}`,
     );
   });
+  it("captions carries provider and episode so anime resolves its own tracks", async () => {
+    const fn = fetchMock(okJson({}));
+    await api.captions("B6AMhLy6EQHDgYgBF", null, { provider: "anime", episode: 3 });
+    expect((fn.mock.calls[0] as unknown as [string, RequestInit])[0]).toBe(
+      "/api/mb/captions?id=B6AMhLy6EQHDgYgBF&provider=anime&episode=3",
+    );
+  });
+  it("subtitleSearch omits season/episode for movies (0 or unset)", async () => {
+    const fn = fetchMock(okJson({ provider: "opensubtitles", subtitles: [] }));
+    await api.subtitleSearch({ title: "Inception", season: 0, lang: "en" });
+    expect((fn.mock.calls[0] as unknown as [string, RequestInit])[0]).toBe(
+      "/api/mb/subtitles/search?provider=opensubtitles&title=Inception&lang=en",
+    );
+  });
   it("play POSTs a JSON body", async () => {
     const fn = fetchMock(okJson({}));
     const body = { provider: "moviebox" as const, id: "x", season: 1, episode: 2, resolution: 1080 };
