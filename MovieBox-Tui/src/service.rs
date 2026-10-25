@@ -17,6 +17,7 @@ pub struct MovieBoxService {
     pub dhakaflix_client: DhakaFlixClient,
     pub addon_client: crate::providers::addons::AddonClient,
     pub anime_client: crate::providers::anime::AnimeProvider,
+    pub collaps_client: crate::providers::collaps::CollapsProvider,
     pub http_client: reqwest::Client,
 }
 
@@ -40,6 +41,7 @@ impl MovieBoxService {
             dhakaflix_client: DhakaFlixClient::new(),
             addon_client: crate::providers::addons::AddonClient::new(),
             anime_client: crate::providers::anime::AnimeProvider::new(http_client.clone()),
+            collaps_client: crate::providers::collaps::CollapsProvider::new(http_client.clone()),
             http_client,
         }
     }
@@ -60,6 +62,7 @@ impl MovieBoxService {
             ProviderKind::BdixDhakaFlix => Provider::capabilities(&self.dhakaflix_client),
             ProviderKind::Addons => Provider::capabilities(&self.addon_client),
             ProviderKind::Anime => Provider::capabilities(&self.anime_client),
+            ProviderKind::Collaps => Provider::capabilities(&self.collaps_client),
         }
     }
 
@@ -94,6 +97,7 @@ impl MovieBoxService {
             }
             ProviderKind::Addons => Provider::search(&self.addon_client, query, page).await,
             ProviderKind::Anime => Provider::search(&self.anime_client, query, page).await,
+            ProviderKind::Collaps => Provider::search(&self.collaps_client, query, page).await,
         }
     }
 
@@ -166,6 +170,7 @@ impl MovieBoxService {
             }
             ProviderKind::Addons => Provider::details(&self.addon_client, subject_id).await,
             ProviderKind::Anime => Provider::details(&self.anime_client, subject_id).await,
+            ProviderKind::Collaps => Provider::details(&self.collaps_client, subject_id).await,
         }
     }
 

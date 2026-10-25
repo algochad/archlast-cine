@@ -3,7 +3,7 @@
 export const REGION_IDS = ['ph', 'us', 'in', 'sg'] as const;
 export type RegionId = (typeof REGION_IDS)[number];
 
-export const PROVIDER_IDS = ['moviebox', 'fourkhdhub'] as const;
+export const PROVIDER_IDS = ['collaps', 'moviebox', 'fourkhdhub'] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 
 export const MEDIA_TYPES = ['movie', 'series', 'anime'] as const;

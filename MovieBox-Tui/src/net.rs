@@ -54,13 +54,32 @@ impl Resolve for FallbackResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let resolver = Arc::clone(&GLOBAL_RESOLVER);
         Box::pin(async move {
-            let lookup = resolver.lookup_ip(name.as_str()).await?;
-            let addrs: Addrs = Box::new(
-                lookup
-                    .into_iter()
-                    .map(|address| SocketAddr::new(address, 0)),
-            );
-            Ok(addrs)
+            let err = match resolver.lookup_ip(name.as_str()).await {
+                Ok(lookup) => {
+                    let addrs: Addrs = Box::new(
+                        lookup
+                            .into_iter()
+                            .map(|address| SocketAddr::new(address, 0)),
+                    );
+                    return Ok(addrs);
+                }
+                Err(err) => err,
+            };
+            // hickory's stub resolver intermittently answers NoRecordsFound for
+            // CNAME chains (e.g. CDN edges behind short-TTL Cloudflare zones)
+            // that the system resolver answers fine: retry through getaddrinfo.
+            let host = name.as_str().to_string();
+            let system = tokio::task::spawn_blocking(move || {
+                use std::net::ToSocketAddrs;
+                (host.as_str(), 0)
+                    .to_socket_addrs()
+                    .map(Iterator::collect::<Vec<SocketAddr>>)
+            })
+            .await;
+            match system {
+                Ok(Ok(addrs)) if !addrs.is_empty() => Ok(Box::new(addrs.into_iter()) as Addrs),
+                _ => Err(err.into()),
+            }
         })
     }
 }

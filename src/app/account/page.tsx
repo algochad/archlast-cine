@@ -12,6 +12,7 @@ const INPUT =
 const LABEL = "mono-meta mb-1.5 block text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500";
 
 const PROVIDERS: { id: string; label: string }[] = [
+  { id: "collaps", label: "Collaps" },
   { id: "moviebox", label: "MovieBox" },
   { id: "fourkhdhub", label: "4KHDHub" },
 ];

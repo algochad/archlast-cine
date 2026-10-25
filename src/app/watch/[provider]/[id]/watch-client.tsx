@@ -8,6 +8,7 @@ const WatchPlayer = dynamic(() => import("@/components/watch-player").then((m) =
 });
 
 export type WatchPlayerProvider =
+  | "collaps"
   | "moviebox"
   | "fourkhdhub"
   | "bdix_circleftp"

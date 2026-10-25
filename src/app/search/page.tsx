@@ -11,6 +11,7 @@ type TypeFilter = "all" | MediaType;
 
 const SOURCES: { id: SourceFilter; label: string }[] = [
   { id: "all", label: "All" },
+  { id: "collaps", label: "Collaps" },
   { id: "moviebox", label: "MovieBox" },
   { id: "fourkhdhub", label: "4KHDHub" },
   { id: "anime", label: "Anime" },

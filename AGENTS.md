@@ -19,6 +19,7 @@ Polyglot monorepo: Next.js web (root), NestJS account API (`api/`), Rust media b
 ## Architecture & Data Flow
 
 - Web request flow: browser → Next App Router (`src/app/`) → same-origin route handlers (`src/app/api/mb/*`, `src/app/api/account/*`) → Rust backend (`MB_BACKEND_URL`, default `http://127.0.0.1:9797`) or Nest API (`API_PORT`, default `4100`) → Postgres + Redis.
+- Default movie/series source (`collaps` provider, `MovieBox-Tui/src/providers/collaps/`): metadata from Cinemeta (keyless TMDB/IMDb aggregate) for home/search/details, streams + subtitles scraped from the Collaps embed (`/embed/imdb/tt…`), all keyed by IMDb id. `/api/home` serves it unless `?provider=moviebox` (falls back to MovieBox if Cinemeta is down).
 - Media proxy: `next.config.ts` rewrites `/api/proxy/:ticket` → backend; frontend helper `mbUrl()` in `src/lib/api.ts` maps backend `/api/*` paths to `/api/mb/*` so Range/DASH traffic stays same-origin.
  - Account flow: `src/lib/api-account.ts` → `/api/account/*` handlers (own httpOnly `mb_token` cookie) → Nest `auth`/`users`/`history`/`my-list` modules → Prisma (Postgres) + Redis (token denylist, login rate limit). Client never sees a JWT.
 - Session state: `src/lib/session.tsx` exposes three React contexts (`Session`/`MyList`/`History`) implementing the contract in `src/lib/session-contract.ts`; region mirrored in readable `mb_region` cookie.
@@ -74,7 +75,7 @@ docker compose -f docker-compose.dev.yml up --build   # hot-reload dev (db/redis
 - Node `>=20` (Docker uses `node:22-slim`); package manager is **npm** with lockfiles (`package-lock.json` at root and `api/`). Do not introduce Bun/pnpm workspaces.
 - Rust edition 2024 (server; TUI crate pins `rust-version 1.90`, Docker builds with `rust:1.97-bookworm`); Go module in `scripts/anime-scraper/`.
 - Framework pins: Next `16.3.5` (read `node_modules/next/dist/docs/` before writing App Router code), React `19`, Tailwind `4.1`, Prisma `6.19.3`, Postgres `16-alpine`, Redis `7-alpine`. Runtime image needs `ffmpeg` (HEVC→H.264 live transcode).
-- Env knobs: `MB_BACKEND_URL`, `MOVIEBOX_SERVER_PORT`, `MOVIEBOX_PROXY_BASE` (public origin for manifests), `API_PORT`/`API_HOST`, `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`/`JWT_TTL`, `PRISMA_AUTO_PUSH`, `*_HOST_PORT` port overrides in `.env`.
+- Env knobs: `CINEMETA_BASE_URL` / `COLLAPS_EMBED_BASE_URL` (Collaps provider upstreams), `MB_BACKEND_URL`, `MOVIEBOX_SERVER_PORT`, `MOVIEBOX_PROXY_BASE` (public origin for manifests), `API_PORT`/`API_HOST`, `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`/`JWT_TTL`, `PRISMA_AUTO_PUSH`, `*_HOST_PORT` port overrides in `.env`.
 
 ## Testing & QA
 

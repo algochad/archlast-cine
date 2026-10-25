@@ -35,7 +35,7 @@ export interface AccountSettings {
   /** Streaming-market region; maps to a Rust backend in the region pool. */
   region: RegionId;
   /** Default content provider. */
-  provider: "moviebox" | "fourkhdhub";
+  provider: "collaps" | "moviebox" | "fourkhdhub";
   /** Synced player prefs subset (cross-device). Device-local prefs stay in localStorage only. */
   player?: PlayerPrefsSubset;
 }

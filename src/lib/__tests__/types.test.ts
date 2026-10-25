@@ -50,9 +50,9 @@ describe("backend contract shapes", () => {
     const shape: ApiErrorShape = { error: "boom" };
     expect(shape.error).toBe("boom");
   });
-  it("ProviderId covers all six providers", () => {
-    const ids: ProviderId[] = ["moviebox", "fourkhdhub", "bdix_circleftp", "bdix_dhakaflix", "addons", "anime"];
-    expect(new Set(ids).size).toBe(6);
+  it("ProviderId covers all seven providers", () => {
+    const ids: ProviderId[] = ["collaps", "moviebox", "fourkhdhub", "bdix_circleftp", "bdix_dhakaflix", "addons", "anime"];
+    expect(new Set(ids).size).toBe(7);
   });
   it("CatalogItem round-trips provider, title, type, year, poster", () => {
     const item: CatalogItem = {

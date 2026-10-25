@@ -146,12 +146,15 @@ impl TicketStore {
         (ticket, origin)
     }
 
+    /// Sliding TTL: every hit renews the ticket, so a long VOD whose
+    /// segments keep flowing through it never expires mid-playback.
     fn get(&self, id: &str) -> Option<Ticket> {
-        let map = self.inner.lock();
-        let t = map.get(id)?;
+        let mut map = self.inner.lock();
+        let t = map.get_mut(id)?;
         if t.created.elapsed() > Self::TTL {
             return None;
         }
+        t.created = Instant::now();
         Some(Ticket {
             raw_url: t.raw_url.clone(),
             origin: t.origin.clone(),
@@ -500,7 +503,7 @@ fn provider_of(raw: &str) -> Result<ProviderKind, Response> {
     ProviderKind::parse(raw).ok_or_else(|| {
         api_error(
             StatusCode::BAD_REQUEST,
-            format!("unknown provider: {raw} (expected moviebox, fourkhdhub, bdix_circleftp, bdix_dhakaflix, addons or anime)"),
+            format!("unknown provider: {raw} (expected collaps, moviebox, fourkhdhub, bdix_circleftp, bdix_dhakaflix, addons or anime)"),
         )
     })
 }
@@ -913,11 +916,32 @@ struct HomeParams {
     tab: Option<String>,
     #[serde(default)]
     page: Option<usize>,
+    /// `moviebox` forces the legacy MovieBox homepage; anything else serves
+    /// the Collaps feed (Cinemeta catalogs), falling back to MovieBox when
+    /// Cinemeta is unreachable.
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 async fn home(State(state): State<AppState>, Query(p): Query<HomeParams>) -> Response {
     let tab = p.tab.unwrap_or_else(|| "2".to_string());
     let page = p.page.unwrap_or(1);
+    let legacy = p.provider.as_deref().and_then(ProviderKind::parse) == Some(ProviderKind::MovieBox);
+    if !legacy && page == 1 {
+        match state.svc.collaps_client.homepage().await {
+            Ok((items, metrics)) => {
+                return Json(serde_json::json!({
+                    "tab": tab,
+                    "page": page,
+                    "provider": ProviderKind::Collaps,
+                    "items": items,
+                    "metrics": metrics,
+                }))
+                .into_response();
+            }
+            Err(e) => log::warn!("home: collaps feed failed, falling back to moviebox: {e}"),
+        }
+    }
     match state.svc.homepage(&tab, page).await {
         Ok((items, metrics)) => Json(serde_json::json!({
             "tab": tab,
@@ -989,6 +1013,7 @@ async fn search_unified(
     }
 
     let providers = [
+        ProviderKind::Collaps,
         ProviderKind::MovieBox,
         ProviderKind::FourKHdHub,
         ProviderKind::Anime,
@@ -1027,7 +1052,14 @@ async fn search_unified(
         }
     }
 
-    merged.sort_by(|a, b| relevance_score(&q, &b.1).cmp(&relevance_score(&q, &a.1)));
+    // Equal relevance: the `providers` order above wins, so the default
+    // source leads regardless of which search finished first.
+    let rank = |p: ProviderKind| providers.iter().position(|k| *k == p).unwrap_or(providers.len());
+    merged.sort_by(|a, b| {
+        relevance_score(&q, &b.1)
+            .cmp(&relevance_score(&q, &a.1))
+            .then_with(|| rank(a.0).cmp(&rank(b.0)))
+    });
     merged.truncate(UNIFIED_TOTAL);
 
     let items: Vec<serde_json::Value> = merged
@@ -1158,10 +1190,24 @@ struct CaptionsParams {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    season: Option<usize>,
+    #[serde(default)]
     episode: Option<usize>,
 }
 
 async fn captions(State(state): State<AppState>, Query(p): Query<CaptionsParams>) -> Response {
+    if p.provider.as_deref().and_then(ProviderKind::parse) == Some(ProviderKind::Collaps) {
+        let subtitles = state
+            .svc
+            .collaps_client
+            .captions(&p.id, p.season.unwrap_or(0), p.episode.unwrap_or(0))
+            .await;
+        return Json(serde_json::json!({
+            "id": p.id,
+            "subtitles": subtitles,
+        }))
+        .into_response();
+    }
     if p.provider.as_deref().map(str::trim) == Some("anime") {
         let subtitles = state
             .svc
@@ -1733,6 +1779,9 @@ async fn fetch_releases(
         ProviderKind::Anime => {
             ReleaseProvider::episode_streams(&svc.anime_client, id, season, episode).await
         }
+        ProviderKind::Collaps => {
+            ReleaseProvider::episode_streams(&svc.collaps_client, id, season, episode).await
+        }
     }
 }
 
@@ -1998,53 +2047,12 @@ async fn proxy_rotate(State(state): State<AppState>, Path(ticket): Path<String>)
     Json(serde_json::json!({ "ticket": ticket, "mirror_label": next_mirror.label, "rotated": true })).into_response()
 }
 
-async fn proxy_fetch_foreign(state: AppState, foreign: Ticket, headers: HeaderMap) -> Response {
-    let mut builder = state.proxy_client.get(&foreign.raw_url);
-    for (name, value) in &foreign.headers {
-        if let Ok(n) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
-            builder = builder.header(n, value);
-        }
-    }
-    builder = builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
-    if let Some(range) = headers.get(reqwest::header::RANGE) {
-        builder = builder.header(reqwest::header::RANGE, range);
-    }
-    let resp = match builder.send().await {
-        Ok(r) => r,
-        Err(e) => return api_error(StatusCode::BAD_GATEWAY, format!("upstream error: {e}")),
-    };
-    let status = resp.status();
-    let mut out = HeaderMap::new();
-    const PASS: [&str; 6] = [
-        "content-type",
-        "content-range",
-        "accept-ranges",
-        "etag",
-        "last-modified",
-        "cache-control",
-    ];
-    for name in PASS {
-        if let Some(v) = resp.headers().get(name) {
-            let n = axum::http::HeaderName::from_static(name);
-            out.insert(n, v.clone());
-        }
-    }
-    if let Some(len) = resp.content_length() {
-        out.insert(
-            axum::http::header::CONTENT_LENGTH,
-            axum::http::HeaderValue::from_str(&len.to_string()).unwrap(),
-        );
-    }
-    let stream = resp.bytes_stream();
-    (status, out, Body::from_stream(stream)).into_response()
-}
-
-async fn proxy_fetch_inner_foreign(
-    state: AppState,
-    foreign: Ticket,
-    headers: HeaderMap,
-) -> Response {
-    proxy_fetch_foreign(state, foreign, headers).await
+/// A foreign ticket (cross-host URL minted by a manifest rewrite) is served
+/// as a ticket of its own: segments stream through, and a manifest — e.g. an
+/// HLS variant playlist on another CDN host than its master — is rewritten
+/// against the foreign ticket so its relative segment URLs stay proxied.
+async fn proxy_fetch_foreign(state: AppState, foreign_ticket: &str, headers: HeaderMap) -> Response {
+    Box::pin(proxy_fetch_inner(state, foreign_ticket.to_string(), String::new(), headers)).await
 }
 
 async fn proxy_fetch_root(
@@ -2093,7 +2101,7 @@ async fn proxy_fetch_inner(
     if let Some(fticket) = rest.strip_prefix("f/") {
         if let Some(foreign) = state.tickets.get(fticket) {
             log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
-            return proxy_fetch_inner_foreign(state, foreign, headers).await;
+            return proxy_fetch_foreign(state, fticket, headers).await;
         }
         log::warn!("proxy_fetch: unknown foreign ticket={fticket} (outer ticket={ticket} rest={rest:?})");
         return api_error(StatusCode::NOT_FOUND, "unknown or expired ticket");
@@ -2116,7 +2124,7 @@ async fn proxy_fetch_inner(
             // differ in case — compare exactly, never case-fold.
             if let Some(foreign) = state.tickets.get(fticket) {
                 log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
-                return proxy_fetch_inner_foreign(state, foreign, headers).await;
+                return proxy_fetch_foreign(state, fticket, headers).await;
             }
             log::warn!("proxy_fetch: unknown foreign ticket={fticket} (outer ticket={ticket} rest={rest:?})");
             return api_error(StatusCode::NOT_FOUND, "unknown or expired ticket");
@@ -2124,11 +2132,9 @@ async fn proxy_fetch_inner(
         // Legacy bare-ticket references (pre-`f/` rewrite): resolve ONLY on
         // exact match — a same-origin segment filename that merely looks
         // like a ticket must fall through to the origin join below.
-        if state.tickets.get(abs).is_some() {
-            if let Some(foreign) = state.tickets.get(abs) {
-                log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
-                return proxy_fetch_inner_foreign(state, foreign, headers).await;
-            }
+        if let Some(foreign) = state.tickets.get(abs) {
+            log::debug!("proxy_fetch: ticket={ticket} rest={rest:?} -> foreign ticket (upstream={})", foreign.raw_url);
+            return proxy_fetch_foreign(state, abs, headers).await;
         }
         if abs.starts_with("http://") || abs.starts_with("https://") {
             abs.to_string()
@@ -2153,7 +2159,9 @@ async fn proxy_fetch_inner(
     // ------ Manifest edge cache (B3): check cache before upstream fetch ------
     // Keyed (ticket, upstream_url). VOD MPD 60s, live-ish HLS 5s via MANIFEST_CACHE_TTL.
     let cache_key = format!("manifest:{}:{}", ticket, upstream);
-    let is_manifest_url = upstream.ends_with(".mpd") || upstream.ends_with(".m3u8");
+    // Signed URLs carry a query string; the extension lives before it.
+    let upstream_no_query = upstream.split(['?', '#']).next().unwrap_or(&upstream);
+    let is_manifest_url = upstream_no_query.ends_with(".mpd") || upstream_no_query.ends_with(".m3u8");
     let now = Instant::now();
     // Fast-path: serve cached rewritten manifest if still fresh
     if is_manifest_url {
@@ -2225,7 +2233,10 @@ async fn proxy_fetch_inner(
 
     let resp = match builder.send().await {
         Ok(r) => r,
-        Err(e) => return api_error(StatusCode::BAD_GATEWAY, format!("upstream error: {e}")),
+        Err(e) => {
+            log::warn!("proxy_fetch: upstream request failed for ticket={ticket}: {e:?}");
+            return api_error(StatusCode::BAD_GATEWAY, format!("upstream error: {e}"));
+        }
     };
     let status = resp.status();
     let content_type = resp
@@ -2244,8 +2255,7 @@ async fn proxy_fetch_inner(
         return (StatusCode::NOT_MODIFIED, out, Body::empty()).into_response();
     }
     let is_manifest = status.is_success()
-        && (upstream.ends_with(".mpd")
-            || upstream.ends_with(".m3u8")
+        && (is_manifest_url
             || content_type.contains("dash+xml")
             || content_type.contains("mpegurl")
             || content_type.contains("vnd.apple.mpegurl"));
@@ -2277,7 +2287,7 @@ async fn proxy_fetch_inner(
         let origin_base = format!("{ticket_base}/a");
         let base: &str = &origin_base;
         // Determine if this is an HLS manifest (needs relative URL rewriting)
-        let is_hls = upstream.ends_with(".m3u8")
+        let is_hls = upstream_no_query.ends_with(".m3u8")
             || content_type.contains("mpegurl")
             || content_type.contains("vnd.apple.mpegurl");
 
@@ -3860,6 +3870,7 @@ async fn local_favorites() -> Json<serde_json::Value> {
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let providers: Vec<serde_json::Value> = [
+        ProviderKind::Collaps,
         ProviderKind::MovieBox,
         ProviderKind::FourKHdHub,
         ProviderKind::BdixCircleFtp,

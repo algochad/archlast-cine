@@ -6,6 +6,7 @@ export const dynamic = "force-dynamic";
 
 const backend = process.env.MB_BACKEND_URL ?? "http://127.0.0.1:9797";
 const VALID: Record<string, true> = {
+  collaps: true,
   moviebox: true,
   fourkhdhub: true,
   bdix_circleftp: true,

@@ -46,7 +46,13 @@ import { DEFAULT_SUB_STYLE, coerceSubStyle, styleToCssVars, type SubStyle } from
 import { createSmartSpeed, type SmartSpeedHandle } from "@/lib/smart-speed";
 import { findThumb, parseThumbsVtt, type ThumbCue } from "@/lib/thumbs";
 import { attachJassub, destroyJassub } from "@/lib/jassub";
-type Provider = "moviebox" | "fourkhdhub" | "bdix_circleftp" | "bdix_dhakaflix" | "anime";
+import { parseHlsAudioRenditions, pickAudioTrack, type AudioTrackLike } from "@/lib/audio-tracks";
+type Provider = "collaps" | "moviebox" | "fourkhdhub" | "bdix_circleftp" | "bdix_dhakaflix" | "anime";
+
+const PROVIDER_LABELS: Partial<Record<Provider, string>> = {
+  collaps: "Collaps",
+  moviebox: "MovieBox",
+};
 
 interface Props {
   provider: Provider;
@@ -651,7 +657,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     try {
       ms.metadata = new MediaMetadata({
         title: label,
-        artist: provider === "moviebox" ? "MovieBox" : "Stream",
+        artist: PROVIDER_LABELS[provider] ?? "Stream",
       });
       const video = videoRef.current;
       if (!video) return;
@@ -1032,12 +1038,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     try {
       const h = await api.health();
       const cap = h.providers.find((pp) => pp.key === provider)?.capabilities.supports_subtitles;
-      const supports = cap ?? (provider === "moviebox" || provider === "anime");
+      const supports = cap ?? (provider === "collaps" || provider === "moviebox" || provider === "anime");
       setSupportsSubs(supports);
       healthFetchedRef.current = true;
       return supports;
     } catch {
-      const fallback = provider === "moviebox" || provider === "anime";
+      const fallback = provider === "collaps" || provider === "moviebox" || provider === "anime";
       setSupportsSubs(fallback);
       healthFetchedRef.current = true;
       return fallback;
@@ -1147,7 +1153,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       const rel = ctx.releases;
       const activeRel = activeRef.current ? rel.find((r) => `${r.provider}:${r.filename}` === activeRef.current?.releaseKey) ?? rel[0] : rel[0];
       const rid = activeRel?.resource_id ?? null;
-      const subs = await api.captions(id, rid, { provider, episode });
+      const subs = await api.captions(id, rid, { provider, season, episode });
       tagged = subs.subtitles.map((o) => ({ ...o, source: 'api' as const }));
     } catch {
       // provider has no captions answer: fall through to external search
@@ -1181,7 +1187,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
     }
     appendSubOptions(external, false);
     tryAutoSelect([...tagged, ...external]);
-  }, [provider, id, episode, ensureSubtitleCap, tryAutoSelect, searchExternalSubs, appendSubOptions]);
+  }, [provider, id, season, episode, ensureSubtitleCap, tryAutoSelect, searchExternalSubs, appendSubOptions]);
 
   /** Merge manifest-discovered tracks into subOptions, deduped by (url, language). */
   const mergeManifestTracks = useCallback((tracks: { language: string; url: string; kind: string; forced?: boolean; sdh?: boolean }[], baseDir: string | null) => {
@@ -1733,7 +1739,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   }, []);
 
   const playHls = useCallback(
-    async (indexUrl: string) => {
+    async (indexUrl: string, audioPreference?: AudioTrackLike) => {
       const video = videoRef.current;
       if (!video) return;
       // Epoch at call time: the hls.js import below awaits, and a source
@@ -1776,6 +1782,9 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           startLevel: 0,
           capLevelToPlayerSize: true,
           startFragPrefetch: true,
+          // Chosen before load: switching hls.audioTrack while the alt-audio
+          // pipeline boots can stall it with nothing appended.
+          ...(audioPreference ? { audioPreference: { lang: audioPreference.lang, name: audioPreference.name } } : {}),
         });
         hlsRef.current = hls;
         // seed estimator state
@@ -2194,7 +2203,17 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
               return;
             }
           }
-          void playHls(source);
+          // Multi-audio masters (Collaps) flag a dub DEFAULT=YES; start on the
+          // viewer's preferred language instead when the stream carries it.
+          let audioPreference: AudioTrackLike | undefined;
+          if (hlsText !== null) {
+            const renditions = parseHlsAudioRenditions(hlsText);
+            let prefs: string[] = ["en"];
+            try { prefs = getPrefs().prefAudioLang; } catch { /* defaults */ }
+            const idx = pickAudioTrack(renditions, prefs);
+            if (idx >= 0 && !renditions[idx].default) audioPreference = renditions[idx];
+          }
+          void playHls(source, audioPreference);
         } else {
           video.src = source;
           video.load();
@@ -4395,7 +4414,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         <div className="min-w-0">
           <h1 className="truncate text-lg font-bold text-white md:text-xl">{label}</h1>
           <p className="flex items-center gap-2 text-xs text-zinc-400">
-            <span>{provider === "moviebox" ? "MovieBox" : provider}</span>
+            <span>{PROVIDER_LABELS[provider] ?? provider}</span>
             {active ? <span>· {active.label.replace(/\.(mp4|mkv|mpd)$/i, "")}</span> : null}
             {transcodeActive && (
               <span className="mono-meta rounded-[2px] border border-brand/40 bg-brand/10 px-1.5 py-px text-[9px] font-bold tracking-[0.2em] text-brand">

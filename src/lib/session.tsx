@@ -23,7 +23,7 @@ import {
 } from "@/lib/player-prefs";
 import type { PlayerPrefs } from "@/lib/player-prefs";
 
-const DEFAULT_SETTINGS: AccountSettings = { region: "ph", provider: "moviebox" };
+const DEFAULT_SETTINGS: AccountSettings = { region: "ph", provider: "collaps" };
 
 const REGION_IDS: RegionId[] = ["ph", "us", "in", "sg"];
 

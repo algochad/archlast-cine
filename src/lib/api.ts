@@ -48,10 +48,15 @@ export const api = {
     request<StreamsResponse>(
       `/streams?provider=${provider}&id=${encodeURIComponent(id)}&season=${season}&episode=${episode}`,
     ),
-  captions: (id: string, resourceId?: string | null, opts?: { provider?: ProviderId; episode?: number }) => {
+  captions: (
+    id: string,
+    resourceId?: string | null,
+    opts?: { provider?: ProviderId; season?: number; episode?: number },
+  ) => {
     let qs = `id=${encodeURIComponent(id)}`;
     if (resourceId) qs += `&resource_id=${encodeURIComponent(resourceId)}`;
     if (opts?.provider) qs += `&provider=${opts.provider}`;
+    if (opts?.season != null && opts.season > 0) qs += `&season=${opts.season}`;
     if (opts?.episode != null && opts.episode > 0) qs += `&episode=${opts.episode}`;
     return request<CaptionsResponse>(`/captions?${qs}`);
   },

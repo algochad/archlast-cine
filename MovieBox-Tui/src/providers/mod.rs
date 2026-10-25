@@ -1,6 +1,7 @@
 pub mod addons;
 pub mod anime;
 pub mod bdix;
+pub mod collaps;
 pub mod fourkhdhub;
 pub mod models;
 pub mod moviebox;

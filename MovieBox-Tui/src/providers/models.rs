@@ -16,6 +16,8 @@ pub enum ProviderKind {
     Addons,
     #[serde(rename = "anime", alias = "anilist")]
     Anime,
+    #[serde(rename = "collaps")]
+    Collaps,
 }
 
 impl ProviderKind {
@@ -35,6 +37,7 @@ impl ProviderKind {
             Self::BdixDhakaFlix => "bdix_dhakaflix",
             Self::Addons => "addons",
             Self::Anime => "anime",
+            Self::Collaps => "collaps",
         }
     }
 
@@ -46,6 +49,7 @@ impl ProviderKind {
             Self::BdixDhakaFlix => "DhakaFlix (BDIX)",
             Self::Addons => "Addons",
             Self::Anime => "Anime",
+            Self::Collaps => "Collaps",
         }
     }
 
@@ -57,6 +61,7 @@ impl ProviderKind {
             "bdix_dhakaflix" | "dhakaflix (bdix)" => Some(Self::BdixDhakaFlix),
             "addons" | "addon" => Some(Self::Addons),
             "anime" | "anilist" => Some(Self::Anime),
+            "collaps" => Some(Self::Collaps),
             _ => None,
         }
     }
@@ -290,6 +295,7 @@ impl Release {
                 ProviderKind::Addons => "Addon",
                 ProviderKind::MovieBox => "Direct",
                 ProviderKind::Anime => "AniList",
+                ProviderKind::Collaps => "Collaps",
             })
     }
 

@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 export const dynamic = "force-dynamic";
 
 const VALID: Record<string, true> = {
+  collaps: true,
   moviebox: true,
   fourkhdhub: true,
   bdix_circleftp: true,

@@ -13,6 +13,7 @@ export type MediaType = "movie" | "series" | "anime";
 
 /** Providers that can serve media data. */
 export type ProviderSource =
+  | "collaps"
   | "moviebox"
   | "fourkhdhub"
   | "bdix_circleftp"

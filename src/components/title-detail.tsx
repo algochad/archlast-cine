@@ -10,7 +10,9 @@ import type { MediaDetails, ProviderId, Season } from "@/lib/types";
 
 function catalogTag(provider: ProviderId, value: string): string {
   const prefix =
-    provider === "moviebox"
+    provider === "collaps"
+      ? "IMDB"
+      : provider === "moviebox"
       ? "MB"
       : provider === "fourkhdhub"
         ? "4K"
@@ -367,6 +369,8 @@ function animeStatusLabel(status: string): string {
 
 function providerLabel(p: ProviderId): string {
   switch (p) {
+    case "collaps":
+      return "Collaps";
     case "moviebox":
       return "MovieBox";
     case "fourkhdhub":
