@@ -88,9 +88,9 @@ function EpisodeCard({
   return (
     <Link
       href={watchHref(did.provider, did.value, { season: episode.season, episode: episode.number })}
-      className="group relative block overflow-hidden rounded-2xl bg-surface-2 ring-1 ring-line transition duration-300 hover:-translate-y-1 hover:ring-brand/60 hover:shadow-[0_18px_44px_rgba(0,0,0,0.5),0_0_30px_rgba(124,108,255,0.18)]"
+      className="group relative block overflow-hidden rounded-2xl bg-surface-2 ring-1 ring-line transition duration-300 hover:-translate-y-1 hover:ring-brand/60 hover:shadow-[0_18px_44px_rgba(0,0,0,0.5),0_0_30px_rgba(34,197,94,0.18)]"
     >
-      <div className="relative aspect-video w-full overflow-hidden bg-[linear-gradient(160deg,#17203a,#0b101e)]">
+      <div className="relative aspect-video w-full overflow-hidden bg-[linear-gradient(160deg,#1b1b1e,#0d0d0e)]">
         {still && !failed ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
@@ -111,13 +111,13 @@ function EpisodeCard({
           E{episode.number}
         </span>
         <span className="absolute inset-0 grid place-items-center opacity-0 transition duration-300 group-hover:opacity-100">
-          <span className="grid h-12 w-12 place-items-center rounded-full bg-[linear-gradient(135deg,#8b7bff,#5d4cf0)] text-white shadow-[0_8px_30px_rgba(124,108,255,0.6)]">
+          <span className="grid h-12 w-12 place-items-center rounded-full bg-[linear-gradient(135deg,#4ade80,#16a34a)] text-white shadow-[0_8px_30px_rgba(34,197,94,0.6)]">
             <PlayIcon width={18} height={18} className="translate-x-px" />
           </span>
         </span>
         {pct > 0 && (
           <div className="absolute inset-x-0 bottom-0 h-1 bg-white/20">
-            <div className="h-full bg-[linear-gradient(90deg,#7c6cff,#38d6f5)]" style={{ width: `${pct}%` }} />
+            <div className="h-full bg-[linear-gradient(90deg,#22c55e,#86efac)]" style={{ width: `${pct}%` }} />
           </div>
         )}
       </div>
@@ -253,8 +253,8 @@ export function TitleDetail({ details }: { details: MediaDetails }) {
       <section className="relative isolate overflow-hidden">
         <div className="absolute inset-0">
           <Backdrop details={details} />
-          <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(6,9,18,0.95)_0%,rgba(6,9,18,0.7)_38%,rgba(6,9,18,0.2)_75%,transparent_100%)]" />
-          <div className="absolute inset-0 bg-[linear-gradient(0deg,#060912_1%,rgba(6,9,18,0.7)_30%,transparent_65%)]" />
+          <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(10,10,11,0.95)_0%,rgba(10,10,11,0.7)_38%,rgba(10,10,11,0.2)_75%,transparent_100%)]" />
+          <div className="absolute inset-0 bg-[linear-gradient(0deg,#0a0a0b_1%,rgba(10,10,11,0.7)_30%,transparent_65%)]" />
           <div className="absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-ink/85 to-transparent" />
         </div>
 

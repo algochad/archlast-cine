@@ -191,7 +191,7 @@ export default function SearchPage() {
         </p>
 
         <div className="relative mt-8 text-left">
-          <div className="glass flex items-center gap-3 rounded-full px-5 py-2.5 shadow-[0_20px_60px_rgba(0,0,0,0.45)] transition duration-200 focus-within:border-brand/60 focus-within:shadow-[0_0_0_4px_rgba(124,108,255,0.16),0_20px_60px_rgba(0,0,0,0.45)]">
+          <div className="glass flex items-center gap-3 rounded-full px-5 py-2.5 shadow-[0_20px_60px_rgba(0,0,0,0.45)] transition duration-200 focus-within:border-brand/60 focus-within:shadow-[0_0_0_4px_rgba(34,197,94,0.16),0_20px_60px_rgba(0,0,0,0.45)]">
             <SearchIcon width={20} height={20} className="shrink-0 text-brand-hover" />
             <input
               ref={inputRef}

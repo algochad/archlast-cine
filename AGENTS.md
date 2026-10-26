@@ -60,7 +60,7 @@ docker compose up --build   # production stack (Coolify uses docker-compose.yml)
 ## Code Conventions
 
 - TypeScript strict; path alias `@/*` → `apps/web/src/*`; kebab-case files, PascalCase components, camelCase functions. Shared TS config comes from `@archlast/tsconfig`.
-- Design system: tokens in `apps/web/src/app/globals.css` (`@theme`: ink / surface / brand violet + aqua, Outfit display + DM Sans). Utilities: `.btn-solid/.btn-glass/.btn-ghost`, `.chip`, `.glass`, `.poster`, `.field`, `.page-shell`, `.display-title`, `.section-title`. Prefer these over ad-hoc styles.
+- Design system: tokens in `apps/web/src/app/globals.css` (`@theme`: ink (true black) / surface / brand emerald green + mint, Outfit display + DM Sans). Utilities: `.btn-solid/.btn-glass/.btn-ghost`, `.chip`, `.glass`, `.poster`, `.field`, `.page-shell`, `.display-title`, `.section-title`. Prefer these over ad-hoc styles.
 - Frontend client pattern (`lib/api.ts`): typed `request<T>()`, `ApiError` with `.status`, always `encodeURIComponent` query params.
 - Server components call the gateway through `lib/server-api.ts` (`backendJson`), never raw `fetch` with hard-coded URLs.
 - Nest: constructor DI, DTOs validated by the global pipe, errors via Nest built-ins. Account types come from `@archlast/contracts` (re-exported by `apps/api/src/common/account.types.ts`).

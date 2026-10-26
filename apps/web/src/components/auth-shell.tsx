@@ -24,9 +24,9 @@ export function AuthShell({
     <div className="grid min-h-screen lg:grid-cols-[1.1fr_1fr]">
       {/* Showcase */}
       <aside className="relative hidden overflow-hidden lg:block" aria-hidden="true">
-        <div className="absolute inset-0 bg-[radial-gradient(70%_60%_at_20%_15%,rgba(124,108,255,0.55),transparent_70%),radial-gradient(60%_55%_at_85%_80%,rgba(56,214,245,0.28),transparent_70%),linear-gradient(160deg,#0f1530,#060912)]" />
+        <div className="absolute inset-0 bg-[radial-gradient(70%_60%_at_20%_15%,rgba(34,197,94,0.55),transparent_70%),radial-gradient(60%_55%_at_85%_80%,rgba(134,239,172,0.28),transparent_70%),linear-gradient(160deg,#0d1a12,#0a0a0b)]" />
         <div className="absolute -right-24 top-24 h-80 w-80 rounded-full bg-brand/30 blur-[100px]" />
-        <div className="absolute inset-0 bg-[linear-gradient(0deg,#060912_0%,transparent_45%)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(0deg,#0a0a0b_0%,transparent_45%)]" />
         <div className="relative flex h-full flex-col justify-between p-14 pt-32">
           <div>
             <p className="eyebrow">Archlast Cine</p>

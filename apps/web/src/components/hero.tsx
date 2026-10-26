@@ -130,8 +130,8 @@ export function Hero({ slides }: { slides: HeroSlide[] }) {
         ))}
 
         {/* Scrims: readable text on the left, seamless fade into the page below */}
-        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(6,9,18,0.94)_0%,rgba(6,9,18,0.62)_34%,rgba(6,9,18,0.08)_68%,transparent_100%)]" />
-        <div className="absolute inset-0 bg-[linear-gradient(0deg,#060912_2%,rgba(6,9,18,0.55)_26%,transparent_52%)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(10,10,11,0.94)_0%,rgba(10,10,11,0.62)_34%,rgba(10,10,11,0.08)_68%,transparent_100%)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(0deg,#0a0a0b_2%,rgba(10,10,11,0.55)_26%,transparent_52%)]" />
         <div className="absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-ink/80 to-transparent" />
         <div className="pointer-events-none absolute -left-40 bottom-0 h-[520px] w-[520px] rounded-full bg-brand/15 blur-[120px]" />
 

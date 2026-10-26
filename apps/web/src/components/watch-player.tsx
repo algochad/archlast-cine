@@ -2243,9 +2243,10 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         details = await api.details(provider, id).then((d) => d.details);
       } catch (e) {
         if (superseded()) return;
-        const detailsMissing = e instanceof ApiError && e.status === 404 && provider === "anime";
-        if (!detailsMissing) throw e;
-        console.warn("[playback] anime details 404; continuing with streams only:", id);
+        // Anime metadata comes from rate-limited public APIs; any miss (404,
+        // 429-as-502) must not cost the viewer working streams.
+        if (provider !== "anime") throw e;
+        console.warn("[playback] anime details unavailable; continuing with streams only:", id);
         details = {
           id: { provider, value: id },
           title: id,
@@ -4497,7 +4498,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                     <button
                       key={s.number}
                       onClick={() => setActiveSeasonTab(s.number)}
-                      className={`mono-meta shrink-0 rounded-full px-3 py-1.5 text-xs font-bold tracking-widest transition ${activeSeasonTab === s.number ? "bg-brand text-white" : "bg-white/10 text-zinc-300 hover:bg-white/20"}`}
+                      className={`mono-meta shrink-0 rounded-full px-3 py-1.5 text-xs font-bold tracking-widest transition ${activeSeasonTab === s.number ? "bg-brand text-black" : "bg-white/10 text-zinc-300 hover:bg-white/20"}`}
                     >
                       S{s.number}
                     </button>
@@ -4661,7 +4662,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
             <div className="mt-6 flex flex-col gap-2.5">
               <button
                 onClick={() => resume(false)}
-                className="rounded-lg bg-brand px-4 py-2.5 text-sm font-bold text-white transition hover:bg-brand-hover"
+                className="rounded-lg bg-brand px-4 py-2.5 text-sm font-bold text-black transition hover:bg-brand-hover"
               >
                 Resume from {formatClock(resumeAsk.position)}
               </button>
@@ -5140,7 +5141,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                           <button
                             onClick={() => void runSubtitleSearch()}
                             disabled={searchLoading}
-                            className="w-full rounded-md bg-brand px-3 py-2 text-xs font-bold text-white transition hover:bg-brand/90 disabled:opacity-50"
+                            className="w-full rounded-md bg-brand px-3 py-2 text-xs font-bold text-black transition hover:bg-brand/90 disabled:opacity-50"
                           >
                             {searchLoading ? "Searching…" : "Find more subtitles"}
                           </button>
@@ -5491,7 +5492,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
                         void startSource(digits ? Number(digits[0]) : null, [c.release, ...others]);
                       }}
                       className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
-                        isActive ? "bg-brand text-white" : "bg-white/10 text-zinc-200 hover:bg-white/20"
+                        isActive ? "bg-brand text-black" : "bg-white/10 text-zinc-200 hover:bg-white/20"
                       }`}
                     >
                       {c.label}

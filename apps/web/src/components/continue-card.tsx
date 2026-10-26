@@ -59,7 +59,7 @@ export function ContinueCard({ entry, onRemove }: { entry: WatchEntry; onRemove?
           </div>
           <div className="absolute inset-x-0 bottom-0 h-1 bg-white/15">
             <div
-              className="h-full rounded-r-full bg-[linear-gradient(90deg,#7c6cff,#38d6f5)] shadow-[0_0_12px_rgba(124,108,255,0.8)]"
+              className="h-full rounded-r-full bg-[linear-gradient(90deg,#22c55e,#86efac)] shadow-[0_0_12px_rgba(34,197,94,0.8)]"
               style={{ width: `${pct}%` }}
             />
           </div>

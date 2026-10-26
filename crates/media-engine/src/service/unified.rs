@@ -32,6 +32,9 @@ const CAPTIONS_TTL: Duration = Duration::from_secs(30 * 60);
 const CAPTIONS_PARTIAL_TTL: Duration = Duration::from_secs(2 * 60);
 const SOURCE_TIMEOUT: Duration = Duration::from_secs(8);
 const ALT_STREAMS_TIMEOUT: Duration = Duration::from_secs(12);
+/// The anime resolver can legitimately take ~20s to warm up, but when it is
+/// still going after this, the catalog fallback gets the remaining time.
+const ANIME_NATIVE_TIMEOUT: Duration = Duration::from_secs(35);
 /// Candidates per provider tried when looking for an alternate source.
 const ALT_CANDIDATES: usize = 3;
 
@@ -57,6 +60,8 @@ pub struct HubState {
     alt_releases: TtlCache<Arc<Vec<Release>>>,
     captions: TtlCache<Vec<SubtitleOption>>,
     captions_partial: TtlCache<Vec<SubtitleOption>>,
+    /// One resolve at a time per anime episode; concurrent callers share its result.
+    anime_inflight: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for HubState {
@@ -69,6 +74,7 @@ impl Default for HubState {
             alt_releases: TtlCache::new(ALT_RELEASES_TTL),
             captions: TtlCache::new(CAPTIONS_TTL),
             captions_partial: TtlCache::new(CAPTIONS_PARTIAL_TTL),
+            anime_inflight: Default::default(),
         }
     }
 }
@@ -212,7 +218,103 @@ impl MovieBoxService {
     ) -> Result<Vec<Release>, ProviderError> {
         match provider {
             ProviderKind::Collaps => self.collaps_streams(id, season, episode).await,
+            ProviderKind::Anime => self.anime_streams(id, season, episode).await,
             other => self.native_releases(other, id, season, episode).await,
+        }
+    }
+
+    /// Serializes concurrent resolves of the same episode (double-mounted
+    /// players, retry clicks): the first does the work, the rest read its cache.
+    async fn anime_streams(
+        &self,
+        id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<Release>, ProviderError> {
+        let key = format!("{id}:{season}:{episode}");
+        let gate = {
+            let mut map = self.hub.anime_inflight.lock().unwrap_or_else(|e| e.into_inner());
+            map.entry(key.clone()).or_default().clone()
+        };
+        let result = {
+            let _turn = gate.lock().await;
+            self.anime_streams_once(id, season, episode).await
+        };
+        let mut map = self.hub.anime_inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if Arc::strong_count(&gate) == 2 {
+            map.remove(&key);
+        }
+        drop(map);
+        result
+    }
+
+    /// Anime scrapers first; when they are down, blocked or slow, the same
+    /// show is played from the IMDb catalog (Collaps, then its alternates).
+    async fn anime_streams_once(
+        &self,
+        id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<Release>, ProviderError> {
+        let down_key = format!("anime-native:{id}");
+        let cache_key = format!("anime:{id}:{season}:{episode}");
+        if let Some(releases) = self.hub.alt_releases.get(&cache_key) {
+            return Ok(releases.as_ref().clone());
+        }
+
+        // A scraper that just failed is not retried for a minute, so repeat
+        // plays (retry button, strict-mode double load) skip straight to the
+        // fallback instead of waiting out the scrapers again.
+        let native = if self.hub.alt_missing.get(&down_key).is_some() {
+            Err(ProviderError::Unavailable(
+                "This title isn't available right now. Try again or pick another source."
+                    .to_string(),
+            ))
+        } else {
+            match tokio::time::timeout(
+                ANIME_NATIVE_TIMEOUT,
+                self.native_releases(ProviderKind::Anime, id, season, episode),
+            )
+            .await
+            {
+                Ok(Ok(releases)) if releases.iter().any(|r| !r.mirrors.is_empty()) => {
+                    return Ok(releases);
+                }
+                Ok(result) => result,
+                Err(_) => Err(ProviderError::Unavailable(
+                    "This title isn't available right now. Try again or pick another source."
+                        .to_string(),
+                )),
+            }
+        };
+        self.hub.alt_missing.insert(down_key, ());
+
+        let fallback = async {
+            let (title, year, kind) = self.identity_of(ProviderKind::Anime, id).await?;
+            let imdb = self.imdb_for(&title, year, kind).await?;
+            // Anime entries are single cours: episode N of the first season.
+            // An IMDb *movie* (anime film) is played as-is.
+            let (s, e) = if imdb.is_series {
+                (season.max(1), episode.max(1))
+            } else {
+                (0, 0)
+            };
+            match self.collaps_streams(&imdb.imdb, s, e).await {
+                Ok(releases) if releases.iter().any(|r| !r.mirrors.is_empty()) => {
+                    log::info!("anime {id} ep{episode}: playing from catalog {}", imdb.imdb);
+                    Some(releases)
+                }
+                _ => None,
+            }
+        };
+        match fallback.await {
+            Some(releases) => {
+                self.hub
+                    .alt_releases
+                    .insert(cache_key, Arc::new(releases.clone()));
+                Ok(releases)
+            }
+            None => native,
         }
     }
 

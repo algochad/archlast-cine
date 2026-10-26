@@ -85,7 +85,7 @@ export function Nav() {
               alt=""
               width={40}
               height={40}
-              className="h-9 w-9 rounded-[0.85rem] shadow-[0_8px_26px_rgba(124,108,255,0.45)] transition duration-300 group-hover:scale-105 group-hover:shadow-[0_8px_34px_rgba(124,108,255,0.7)] md:h-10 md:w-10"
+              className="h-9 w-9 rounded-[0.85rem] shadow-[0_8px_26px_rgba(34,197,94,0.45)] transition duration-300 group-hover:scale-105 group-hover:shadow-[0_8px_34px_rgba(34,197,94,0.7)] md:h-10 md:w-10"
             />
             <Wordmark />
           </Link>
@@ -146,7 +146,7 @@ export function Nav() {
                     aria-expanded={menuOpen}
                     aria-label={`Account menu for ${user?.name ?? user?.email ?? ""}`}
                     onClick={() => setMenuOpen((open) => !open)}
-                    className="grid h-10 w-10 place-items-center rounded-full bg-[linear-gradient(135deg,#8b7bff,#38d6f5)] font-display text-[15px] font-bold text-white shadow-[0_6px_22px_rgba(124,108,255,0.45)] ring-2 ring-white/20 transition duration-200 hover:scale-105"
+                    className="grid h-10 w-10 place-items-center rounded-full bg-[linear-gradient(135deg,#4ade80,#86efac)] font-display text-[15px] font-bold text-white shadow-[0_6px_22px_rgba(34,197,94,0.45)] ring-2 ring-white/20 transition duration-200 hover:scale-105"
                   >
                     {initial}
                   </button>
@@ -157,7 +157,7 @@ export function Nav() {
                       className="glass animate-fade-in absolute right-0 top-full z-50 mt-3 w-72 overflow-hidden rounded-2xl bg-surface/95 p-2 shadow-[0_24px_70px_rgba(0,0,0,0.7)]"
                     >
                       <div className="flex items-center gap-3 px-3 py-3">
-                        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[linear-gradient(135deg,#8b7bff,#38d6f5)] font-display text-base font-bold text-white">
+                        <span className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[linear-gradient(135deg,#4ade80,#86efac)] font-display text-base font-bold text-white">
                           {initial}
                         </span>
                         <div className="min-w-0">

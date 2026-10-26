@@ -28,7 +28,7 @@ export function Cover({
     const letter = alt.trim().charAt(0).toUpperCase() || "•";
     return (
       <div
-        className={`absolute inset-0 grid place-items-center overflow-hidden bg-[radial-gradient(120%_90%_at_20%_0%,rgba(124,108,255,0.28),transparent_60%),linear-gradient(160deg,#141c30,#0a0f1c)] ${className}`}
+        className={`absolute inset-0 grid place-items-center overflow-hidden bg-[radial-gradient(120%_90%_at_20%_0%,rgba(34,197,94,0.28),transparent_60%),linear-gradient(160deg,#1a1a1d,#0c0c0d)] ${className}`}
         aria-label={alt}
         role="img"
       >

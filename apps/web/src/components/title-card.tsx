@@ -83,7 +83,7 @@ export const TitleCard = memo(function TitleCard({
           {/* Hover veil + play affordance */}
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/85 via-black/10 to-transparent opacity-70 transition duration-300 group-hover:opacity-100" />
           <span className="pointer-events-none absolute inset-0 z-10 grid place-items-center opacity-0 transition duration-300 group-hover:opacity-100">
-            <span className="grid h-14 w-14 scale-90 place-items-center rounded-full bg-[linear-gradient(135deg,#8b7bff,#5d4cf0)] text-white shadow-[0_10px_40px_rgba(124,108,255,0.6)] transition duration-300 group-hover:scale-100">
+            <span className="grid h-14 w-14 scale-90 place-items-center rounded-full bg-[linear-gradient(135deg,#4ade80,#16a34a)] text-white shadow-[0_10px_40px_rgba(34,197,94,0.6)] transition duration-300 group-hover:scale-100">
               <PlayIcon width={22} height={22} className="translate-x-px" />
             </span>
           </span>
@@ -123,7 +123,7 @@ export const TitleCard = memo(function TitleCard({
           aria-pressed={inList}
           className={`absolute right-2.5 top-2.5 z-20 grid h-8 w-8 place-items-center rounded-full ring-1 backdrop-blur-md transition duration-200 focus-visible:opacity-100 group-hover/card:opacity-100 sm:opacity-0 ${
             inList
-              ? "bg-brand text-white opacity-100 ring-white/30"
+              ? "bg-brand text-black opacity-100 ring-white/30"
               : "bg-black/55 text-white ring-white/20 hover:bg-white/20"
           }`}
         >

@@ -1,47 +1,35 @@
 @import "tailwindcss";
 
 /* ==========================================================================
-   Archlast Cine — "Midnight Aurora" design system
-   Deep midnight canvas, a violet→cyan aurora accent, glass surfaces, and
+   Archlast Cine — "Emerald Noir" design system
+   A true-black canvas, an emerald→mint accent, glass surfaces, and
    Outfit (display) + DM Sans (text). Token names (brand / ink / surface /
    line) are stable: every screen — including the player — reads them.
    ========================================================================== */
 
 @theme {
   /* Canvas + surfaces */
-  --color-ink: #060912;
-  --color-surface: #0c1220;
-  --color-surface-2: #121a2c;
-  --color-raised: #19233a;
+  --color-ink: #0a0a0b;
+  --color-surface: #141416;
+  --color-surface-2: #1a1a1d;
+  --color-raised: #242428;
   --color-line: rgba(255, 255, 255, 0.075);
   --color-line-strong: rgba(255, 255, 255, 0.14);
 
   /* Accent */
-  --color-brand: #7c6cff;
-  --color-brand-hover: #9a8dff;
-  --color-brand-deep: #5d4cf0;
-  --color-brand-soft: rgba(124, 108, 255, 0.16);
-  --color-aqua: #38d6f5;
+  --color-brand: #22c55e;
+  --color-brand-hover: #4ade80;
+  --color-brand-deep: #16a34a;
+  --color-brand-soft: rgba(34, 197, 94, 0.16);
+  --color-aqua: #86efac;
   --color-gold: #ffc857;
   --color-rose: #ff6b8b;
-
-  /* Cool slate neutrals so every existing text-zinc-* sits right on navy */
-  --color-zinc-50: #f6f8fc;
-  --color-zinc-100: #eceff7;
-  --color-zinc-200: #dce1ee;
-  --color-zinc-300: #c2c9db;
-  --color-zinc-400: #98a1b8;
-  --color-zinc-500: #6d778f;
-  --color-zinc-600: #4a5470;
-  --color-zinc-700: #333c54;
-  --color-zinc-800: #222a3e;
-  --color-zinc-900: #151b2b;
 
   --font-sans: var(--font-body), ui-sans-serif, system-ui, sans-serif;
   --font-display: var(--font-heading), var(--font-body), ui-sans-serif, system-ui, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
-  --shadow-glow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset, 0 10px 34px rgba(124, 108, 255, 0.35);
+  --shadow-glow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset, 0 10px 34px rgba(34, 197, 94, 0.35);
   --shadow-lift: 0 22px 60px rgba(0, 0, 0, 0.6);
 
   --animate-float: float 7s ease-in-out infinite;
@@ -49,7 +37,7 @@
 
 :root {
   color-scheme: dark;
-  --aurora: linear-gradient(135deg, #7c6cff 0%, #5d4cf0 45%, #38d6f5 130%);
+  --aurora: linear-gradient(135deg, #22c55e 0%, #16a34a 45%, #86efac 130%);
   --page-gutter: clamp(1.25rem, 3.4vw, 3.5rem);
   --content-max: 1640px;
 }
@@ -57,22 +45,22 @@
 html,
 body {
   background: var(--color-ink);
-  color: #f1f4fb;
+  color: #f2f2f2;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
 
 body {
-  /* A faint aurora wash behind everything keeps flat areas from feeling dead. */
+  /* A faint emerald wash behind everything keeps flat areas from feeling dead. */
   background-image:
-    radial-gradient(1100px 620px at 88% -8%, rgba(124, 108, 255, 0.1), transparent 60%),
-    radial-gradient(900px 560px at -6% 38%, rgba(56, 214, 245, 0.05), transparent 60%);
+    radial-gradient(1100px 620px at 88% -8%, rgba(34, 197, 94, 0.1), transparent 60%),
+    radial-gradient(900px 560px at -6% 38%, rgba(134, 239, 172, 0.05), transparent 60%);
   background-attachment: fixed;
 }
 
 ::selection {
-  background: rgba(124, 108, 255, 0.5);
+  background: rgba(34, 197, 94, 0.5);
   color: #fff;
 }
 
@@ -200,7 +188,7 @@ body {
     font-weight: 800;
     letter-spacing: -0.035em;
     line-height: 1;
-    color: #f8faff;
+    color: #fafafa;
     text-shadow: 0 2px 28px rgba(0, 0, 0, 0.5);
   }
 
@@ -208,7 +196,7 @@ body {
     font-family: var(--font-display);
     font-weight: 700;
     letter-spacing: -0.02em;
-    color: #f6f8fd;
+    color: #f5f5f5;
   }
 
   .eyebrow {
@@ -272,18 +260,18 @@ body {
   }
 
   .btn-solid {
-    background: linear-gradient(135deg, #8b7bff 0%, #6a5af0 55%, #5d4cf0 100%);
-    color: #fff;
+    background: linear-gradient(135deg, #4ade80 0%, #22c55e 55%, #16a34a 100%);
+    color: #04140a;
     box-shadow: var(--shadow-glow);
   }
   .btn-solid:hover {
-    background: linear-gradient(135deg, #9d90ff 0%, #7b6cff 55%, #6a5af0 100%);
-    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1) inset, 0 12px 40px rgba(124, 108, 255, 0.5);
+    background: linear-gradient(135deg, #86efac 0%, #4ade80 55%, #22c55e 100%);
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1) inset, 0 12px 40px rgba(34, 197, 94, 0.5);
   }
 
   .btn-glass {
     background: rgba(255, 255, 255, 0.075);
-    color: #eef1f9;
+    color: #f0f0f0;
     backdrop-filter: blur(14px) saturate(1.4);
     -webkit-backdrop-filter: blur(14px) saturate(1.4);
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.13);
@@ -294,7 +282,7 @@ body {
   }
 
   .btn-ghost {
-    color: #d3d9e8;
+    color: #d4d4d8;
     background: transparent;
   }
   .btn-ghost:hover {
@@ -334,7 +322,7 @@ body {
   .chip[aria-pressed="true"],
   .chip[data-active="true"] {
     background: var(--color-brand-soft);
-    border-color: rgba(124, 108, 255, 0.55);
+    border-color: rgba(34, 197, 94, 0.55);
     color: #fff;
   }
 
@@ -342,7 +330,7 @@ body {
   .glass {
     background:
       linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.02)),
-      rgba(10, 14, 26, 0.55);
+      rgba(16, 16, 18, 0.55);
     border: 1px solid var(--color-line);
     backdrop-filter: blur(18px) saturate(1.3);
     -webkit-backdrop-filter: blur(18px) saturate(1.3);
@@ -352,7 +340,7 @@ body {
   .glass-panel {
     background:
       linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015)),
-      rgba(9, 13, 24, 0.94);
+      rgba(14, 14, 16, 0.94);
     box-shadow: 0 24px 70px rgba(0, 0, 0, 0.65);
   }
 
@@ -367,7 +355,7 @@ body {
     width: 100%;
     border-radius: 0.9rem;
     border: 1px solid var(--color-line-strong);
-    background: rgba(6, 9, 18, 0.55);
+    background: rgba(10, 10, 11, 0.55);
     padding: 0.8rem 1rem;
     font-size: 0.95rem;
     color: #fff;
@@ -381,9 +369,9 @@ body {
     color: var(--color-zinc-500);
   }
   .field:focus {
-    border-color: rgba(124, 108, 255, 0.75);
-    box-shadow: 0 0 0 4px rgba(124, 108, 255, 0.16);
-    background: rgba(6, 9, 18, 0.8);
+    border-color: rgba(34, 197, 94, 0.75);
+    box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.16);
+    background: rgba(10, 10, 11, 0.8);
   }
   .field:disabled {
     opacity: 0.6;
@@ -398,7 +386,7 @@ body {
     color: var(--color-zinc-400);
   }
 
-  /* Poster tile: soft lift + violet glow on hover. */
+  /* Poster tile: soft lift + green glow on hover. */
   .poster {
     position: relative;
     border-radius: 1.1rem;
@@ -414,9 +402,9 @@ body {
   .poster:hover {
     transform: translateY(-6px) scale(1.015);
     box-shadow:
-      0 0 0 1px rgba(124, 108, 255, 0.55),
+      0 0 0 1px rgba(34, 197, 94, 0.55),
       0 24px 50px rgba(0, 0, 0, 0.55),
-      0 0 40px rgba(124, 108, 255, 0.22);
+      0 0 40px rgba(34, 197, 94, 0.22);
   }
 
   /* Legacy: kept for any consumer still referencing it. */
@@ -568,11 +556,11 @@ video::cue {
 }
 .side-flash--left {
   left: 0;
-  background: radial-gradient(ellipse at left center, rgba(124, 108, 255, 0.26) 0%, transparent 70%);
+  background: radial-gradient(ellipse at left center, rgba(34, 197, 94, 0.26) 0%, transparent 70%);
 }
 .side-flash--right {
   right: 0;
-  background: radial-gradient(ellipse at right center, rgba(124, 108, 255, 0.26) 0%, transparent 70%);
+  background: radial-gradient(ellipse at right center, rgba(34, 197, 94, 0.26) 0%, transparent 70%);
 }
 
 /* Brightness overlay reuses dimmerRef; no extra class needed — bg-black opacity driven by JS */
