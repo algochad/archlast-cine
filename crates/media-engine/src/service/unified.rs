@@ -39,6 +39,16 @@ const ANIME_NATIVE_TIMEOUT: Duration = Duration::from_secs(35);
 const ALT_CANDIDATES: usize = 3;
 
 /// Whether a release advertises an English audio track.
+fn is_placeholder_release(release: &Release) -> bool {
+    use crate::providers::moviebox::adapt::{is_deprecation_notice_url, is_placeholder_size};
+    is_placeholder_size(release.size_bytes)
+        || (!release.mirrors.is_empty()
+            && release
+                .mirrors
+                .iter()
+                .all(|m| is_deprecation_notice_url(&m.resolver_url)))
+}
+
 fn has_english_audio(release: &Release) -> bool {
     release
         .language
@@ -335,7 +345,11 @@ impl MovieBoxService {
     ) -> Result<Vec<Release>, ProviderError> {
         match provider {
             ProviderKind::MovieBox => {
-                ReleaseProvider::episode_streams(&self.client, id, season, episode).await
+                let mut releases =
+                    ReleaseProvider::episode_streams(&self.client, id, season, episode).await?;
+                // Blocked titles come back as a short "update the app" clip.
+                releases.retain(|r| !is_placeholder_release(r));
+                Ok(releases)
             }
             ProviderKind::FourKHdHub => match self.fourk_client.as_ref() {
                 Some(client) => ReleaseProvider::episode_streams(client, id, season, episode).await,
@@ -430,15 +444,9 @@ impl MovieBoxService {
         let year = details_year(&details);
         let query = display_title(&details.title);
 
-        let mut providers = vec![ProviderKind::MovieBox];
-        if self.fourk_client.is_some() {
-            providers.push(ProviderKind::FourKHdHub);
-        }
-        // A previously found source is tried first.
-        if let Some(known) = self.hub.alt_found.get(&map_key) {
-            providers.retain(|p| *p != known.provider);
-            providers.insert(0, known.provider);
-        }
+        // 4KHDHub only yields download-page links (HTML, not media), so it
+        // is never offered as a playable alternate.
+        let providers = [ProviderKind::MovieBox];
 
         let wanted_season = (season > 0).then_some(season);
         for provider in providers {
@@ -931,6 +939,34 @@ mod tests {
         assert!(!has_english_audio(&r));
         r.language = None;
         assert!(!has_english_audio(&r));
+    }
+
+    #[test]
+    fn moviebox_placeholder_clips_are_detected() {
+        let mirror = |url: &str| crate::providers::models::SourceMirror {
+            label: "360p".into(),
+            resolver_url: url.into(),
+            headers: vec![],
+            direct_file: true,
+        };
+        let mut r = Release {
+            provider: ProviderKind::MovieBox,
+            filename: "x".into(),
+            quality: None,
+            codec: None,
+            language: None,
+            size_bytes: Some(824_720),
+            season: None,
+            episode: None,
+            mirrors: vec![mirror("https://cdn.example/v/a.mp4")],
+            resource_id: None,
+        };
+        assert!(is_placeholder_release(&r));
+        r.size_bytes = Some(300_000_000);
+        assert!(!is_placeholder_release(&r));
+        r.size_bytes = None;
+        r.mirrors = vec![mirror("https://macdn.aoneroom.com/other/2026/a.mp4")];
+        assert!(is_placeholder_release(&r));
     }
 
     #[test]

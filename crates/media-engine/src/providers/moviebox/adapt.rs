@@ -610,6 +610,12 @@ pub fn moviebox_resource_item_to_release(item: &serde_json::Value) -> Release {
     }
 }
 
+/// Placeholder clips are well under a megabyte; real episodes at the lowest
+/// rendition are tens of megabytes.
+pub fn is_placeholder_size(size_bytes: Option<u64>) -> bool {
+    size_bytes.is_some_and(|n| n > 0 && n < 5 * 1024 * 1024)
+}
+
 pub fn is_deprecation_notice_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains("1c7de0bd3393702d9191801f15f88f8d")
@@ -744,6 +750,11 @@ pub fn moviebox_play_info_json_to_releases(
         let Some(playable_url) = manifest_url else {
             continue;
         };
+        // MovieBox serves a short "update the app" clip in place of blocked
+        // titles; whichever way the URL was derived, it is not the title.
+        if is_deprecation_notice_url(&playable_url) || is_placeholder_size(size_bytes) {
+            continue;
+        }
 
         let is_dash = playable_url.ends_with(".mpd") || format_type.eq_ignore_ascii_case("DASH");
         let parsed_res_count = resolutions_str
@@ -833,6 +844,20 @@ pub fn moviebox_resource_json_to_releases(payload: &serde_json::Value) -> Vec<Re
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn placeholder_clips_are_recognised_by_size_and_url() {
+        assert!(is_placeholder_size(Some(824_720)));
+        assert!(!is_placeholder_size(Some(5 * 1024 * 1024)));
+        assert!(!is_placeholder_size(Some(180_000_000)));
+        assert!(!is_placeholder_size(None));
+        assert!(is_deprecation_notice_url(
+            "https://macdn.aoneroom.com/other/2026/10/10/80da52722ee7de7a4303290af6783424.mp4"
+        ));
+        assert!(!is_deprecation_notice_url(
+            "https://macdn.aoneroom.com/media/2026/10/10/abc.mp4"
+        ));
+    }
 
     #[test]
     fn test_moviebox_search_json_to_catalog() {
