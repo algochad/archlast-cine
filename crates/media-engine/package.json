@@ -1,0 +1,12 @@
+{
+  "name": "@archlast/media-engine",
+  "version": "0.1.18",
+  "private": true,
+  "description": "Rust provider engine (crate `moviebox-tui`): MovieBox/4KHDHub/BDIX/anime/Collaps scrapers, subtitles, and the terminal UI. Vendored fork of mesamirh/MovieBox-Tui.",
+  "scripts": {
+    "test": "cargo test --lib",
+    "typecheck": "cargo check --lib",
+    "lint": "cargo clippy --lib",
+    "clean": "cargo clean"
+  }
+}

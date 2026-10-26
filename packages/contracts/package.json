@@ -1,0 +1,23 @@
+{
+  "name": "@archlast/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared domain contracts between the web app and the account API: ids, account/settings/history/list shapes, subtitle style.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  },
+  "devDependencies": {
+    "@archlast/tsconfig": "*",
+    "typescript": "^5.8.0",
+    "vitest": "^5.0.0"
+  }
+}

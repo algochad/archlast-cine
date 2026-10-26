@@ -48,7 +48,9 @@ services:
       - "${REDIS_HOST_PORT:-}:6379"
 
   api:
-    build: ./api
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -84,7 +86,7 @@ services:
   scraper:
     build:
       context: .
-      dockerfile: scripts/anime-scraper/Dockerfile
+      dockerfile: services/anime-resolver/Dockerfile
     restart: unless-stopped
     environment:
       SCRAPER_HOST: "0.0.0.0"
@@ -104,7 +106,9 @@ services:
     ports:
       - "${SCRAPER_HOST_PORT:-}:9798"
   web:
-    build: .
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
     restart: unless-stopped
     environment:
       NODE_ENV: production

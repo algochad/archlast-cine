@@ -1,14 +1,15 @@
-# Build-context hygiene for the root web image (`docker build .`).
-# The Next build runs `npm ci` inside the image; host artifacts must not ship.
+# Build-context hygiene (root context for every image). Host artifacts must
+# not ship; each image runs `npm ci` / `cargo build` itself.
 .git
-node_modules
-api/node_modules
-api/dist
-.next
+.turbo
+**/node_modules
+**/.next
+**/dist
+**/target
+**/coverage
+**/*.log
+**/*.tsbuildinfo
 out
 build
-dist
-coverage
-*.log
-MovieBox-Tui/**/target
-MovieBox-Tui/**/book
+crates/media-engine/book
+services/anime-resolver/bin

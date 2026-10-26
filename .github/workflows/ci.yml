@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typescript:
+    name: Web, API and contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Typecheck, test and build
+        run: npx turbo run typecheck test build --filter=@archlast/web --filter=@archlast/api --filter=@archlast/contracts
+
+  rust:
+    name: Rust engine and gateway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/media-engine
+            services/media-gateway
+      - name: Engine tests
+        run: cargo test --lib
+        working-directory: crates/media-engine
+      - name: Gateway tests
+        run: cargo test
+        working-directory: services/media-gateway

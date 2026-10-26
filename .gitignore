@@ -3,6 +3,7 @@ node_modules/
 
 # next.js
 .next/
+**/.next/
 out/
 
 # production
@@ -19,9 +20,14 @@ npm-debug.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# rust build artifacts (source is vendored into this repo under MovieBox-Tui/)
-MovieBox-Tui/**/target/
-MovieBox-Tui/**/book/
+# rust build artifacts
+**/target/
+crates/media-engine/book/
 
 .DS_Store
-scripts/anime-scraper/anime-scraper
+
+# turborepo
+.turbo/
+**/dist/
+**/*.tsbuildinfo
+services/anime-resolver/bin/

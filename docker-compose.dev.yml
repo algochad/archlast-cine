@@ -45,15 +45,17 @@ services:
     ports:
       - "${REDIS_HOST_PORT:-6379}:6379"
 
-  # Nest account API. Rebuilds on container restart via the bind mount,
-  # mirroring scripts/dev.mjs (install + prisma generate + build + serve).
+  # Nest account API. Rebuilds on container restart via the bind mount
+  # (install + prisma generate + build + serve), through Turborepo.
   api:
     image: node:22-slim
-    working_dir: /work/api
-    command: sh -c "npm install --no-audit --no-fund && npm run build && npm run start"
+    working_dir: /work
+    command: sh -c "apt-get update -qq && apt-get install -y -qq openssl >/dev/null && npm install --no-audit --no-fund && npx turbo run build --filter=@archlast/api && npm run start --workspace @archlast/api"
     volumes:
-      - ./api:/work/api
-      - api-node-modules:/work/api/node_modules
+      - .:/work
+      - api-node-modules:/work/node_modules
+      - /work/apps/web/.next
+      - /work/services/media-gateway/target
     environment:
       NODE_ENV: development
       DATABASE_URL: postgres://${POSTGRES_USER:-moviebox}:${POSTGRES_PASSWORD:-moviebox}@db:5432/${POSTGRES_DB:-moviebox}
@@ -75,12 +77,13 @@ services:
   # rebuilds on container restart via the bind mount.
   backend:
     image: rust:1.97-bookworm
-    working_dir: /work/MovieBox-Tui/server
-    command: sh -c "cargo run --manifest-path /work/MovieBox-Tui/server/Cargo.toml"
+    working_dir: /work/services/media-gateway
+    command: sh -c "cargo run"
     volumes:
-      - ./MovieBox-Tui:/work/MovieBox-Tui
+      - ./services/media-gateway:/work/services/media-gateway
+      - ./crates/media-engine:/work/crates/media-engine
       - cargo-registry:/usr/local/cargo/registry
-      - cargo-target:/work/MovieBox-Tui/server/target
+      - cargo-target:/work/services/media-gateway/target
     environment:
       MOVIEBOX_SERVER_HOST: "0.0.0.0"
       MOVIEBOX_SERVER_PORT: "9797"
@@ -98,10 +101,10 @@ services:
   # SCRAPER_PORT only (bind is always 0.0.0.0 in dev).
   scraper:
     image: golang:1.22-bookworm
-    working_dir: /work/scripts/anime-scraper
+    working_dir: /work/services/anime-resolver
     command: sh -c "go run ."
     volumes:
-      - ./scripts/anime-scraper:/work/scripts/anime-scraper
+      - ./services/anime-resolver:/work/services/anime-resolver
       - go-mod-cache:/go/pkg/mod
     environment:
       SCRAPER_HOST: "0.0.0.0"
@@ -116,12 +119,12 @@ services:
   web:
     image: node:22-slim
     working_dir: /work
-    command: sh -c "npm install --no-audit --no-fund && npm run dev:web -- --port 3000 --hostname 0.0.0.0"
+    command: sh -c "npm install --no-audit --no-fund && npx turbo run build --filter=@archlast/contracts && npm run dev --workspace @archlast/web -- --hostname 0.0.0.0"
     volumes:
       - .:/work
       - web-node-modules:/work/node_modules
-      - /work/MovieBox-Tui/server/target
-      - /work/.next
+      - /work/services/media-gateway/target
+      - /work/apps/web/.next
     environment:
       NODE_ENV: development
       PORT: "3000"

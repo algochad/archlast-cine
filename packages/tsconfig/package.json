@@ -1,0 +1,9 @@
+{
+  "name": "@archlast/tsconfig",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared TypeScript configurations for Archlast Cine workspaces.",
+  "files": [
+    "*.json"
+  ]
+}

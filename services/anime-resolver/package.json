@@ -1,0 +1,14 @@
+{
+  "name": "@archlast/anime-resolver",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Go sidecar that resolves anime streams + soft subtitles (allanime, anipub, anineko, senshi, animepahe).",
+  "scripts": {
+    "dev": "node ../../scripts/dev-service.mjs --port 9798 --need go -- go run .",
+    "build": "go build -trimpath -o bin/anime-resolver .",
+    "start": "./bin/anime-resolver",
+    "test": "node ../../scripts/dev-service.mjs --need go -- go test ./...",
+    "typecheck": "node ../../scripts/dev-service.mjs --need go -- go vet ./...",
+    "clean": "rm -rf bin"
+  }
+}

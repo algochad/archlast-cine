@@ -1,0 +1,18 @@
+{
+  "name": "@archlast/media-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rust media gateway: catalog/search/details, stream + subtitle resolution, same-origin media proxy and live transcode (axum).",
+  "scripts": {
+    "dev": "node ../../scripts/dev-service.mjs --port 9797 --need cargo --env RUST_LOG=moviebox_server=info,moviebox_tui=info -- cargo run",
+    "build": "cargo build --release",
+    "start": "./target/release/moviebox-server",
+    "test": "cargo test",
+    "typecheck": "cargo check",
+    "lint": "cargo clippy --release",
+    "clean": "cargo clean"
+  },
+  "dependencies": {
+    "@archlast/media-engine": "*"
+  }
+}
