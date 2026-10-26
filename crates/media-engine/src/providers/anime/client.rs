@@ -316,10 +316,36 @@ type SubtitleCache = std::sync::Arc<
 /// Cap on cached `show:episode` entries; the map is cleared when exceeded.
 const SUBTITLE_CACHE_MAX: usize = 256;
 
+/// Successful details are reused for this long: AllAnime throttles bursts, and
+/// a title page asks for the same show twice (page + metadata) plus the player.
+const DETAILS_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Longest we wait out an upstream "try again in N seconds" before retrying.
+const RATE_LIMIT_MAX_WAIT_SECS: u64 = 4;
+const RATE_LIMIT_ATTEMPTS: usize = 3;
+
 #[derive(Clone)]
 pub struct AnimeProvider {
     http: Client,
     subtitles: SubtitleCache,
+    details_cache: std::sync::Arc<crate::providers::hub::cache::TtlCache<MediaDetails>>,
+    /// Serializes details lookups so concurrent callers share one upstream hit.
+    details_gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Seconds an upstream asked us to wait ("Too many requests, please try again
+/// in 8 seconds."), or `None` when the message is not a throttle notice.
+fn rate_limit_wait(message: &str) -> Option<u64> {
+    if !message.contains("Too many requests") {
+        return None;
+    }
+    let after = message.split(" in ").nth(1)?;
+    Some(
+        after
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(2),
+    )
 }
 
 impl AnimeProvider {
@@ -327,6 +353,11 @@ impl AnimeProvider {
         Self {
             http,
             subtitles: SubtitleCache::default(),
+            details_cache: std::sync::Arc::new(crate::providers::hub::cache::TtlCache::with_max(
+                DETAILS_TTL,
+                512,
+            )),
+            details_gate: std::sync::Arc::default(),
         }
     }
 
@@ -558,7 +589,34 @@ impl AnimeProvider {
         })
     }
 
+    /// AllAnime answers bursts with a GraphQL "Too many requests, try again in
+    /// N seconds" error; wait that long (capped) and retry instead of failing.
     async fn post_allanime_graphql<T: for<'de> Deserialize<'de>>(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<T, ProviderError> {
+        let mut attempt = 1;
+        loop {
+            match self
+                .post_allanime_graphql_once::<T>(query, variables.clone())
+                .await
+            {
+                Err(ProviderError::Parsing(msg)) if attempt < RATE_LIMIT_ATTEMPTS => {
+                    let Some(wait) = rate_limit_wait(&msg) else {
+                        return Err(ProviderError::Parsing(msg));
+                    };
+                    let wait = wait.clamp(1, RATE_LIMIT_MAX_WAIT_SECS);
+                    log::debug!("allanime throttled; retrying in {wait}s (attempt {attempt})");
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn post_allanime_graphql_once<T: for<'de> Deserialize<'de>>(
         &self,
         query: &str,
         variables: serde_json::Value,
@@ -846,6 +904,21 @@ impl crate::providers::Provider for AnimeProvider {
     }
 
     async fn details(&self, id: &str) -> Result<MediaDetails, ProviderError> {
+        if let Some(hit) = self.details_cache.get(id) {
+            return Ok(hit);
+        }
+        let _turn = self.details_gate.lock().await;
+        if let Some(hit) = self.details_cache.get(id) {
+            return Ok(hit);
+        }
+        let details = self.details_uncached(id).await?;
+        self.details_cache.insert(id.to_string(), details.clone());
+        Ok(details)
+    }
+}
+
+impl AnimeProvider {
+    async fn details_uncached(&self, id: &str) -> Result<MediaDetails, ProviderError> {
         // Try AniList first (numeric ID)
         if let Ok(anilist_id) = id.trim().parse::<i64>() {
             if let Ok(media) = self
@@ -1407,6 +1480,16 @@ mod tests {
         assert_eq!(details.media_type, MediaType::Anime);
         assert!(!details.title.is_empty());
         assert!(!details.seasons.is_empty());
+    }
+
+    #[test]
+    fn throttle_notices_are_parsed_and_other_errors_ignored() {
+        assert_eq!(
+            rate_limit_wait("Too many requests, please try again in 8 seconds."),
+            Some(8)
+        );
+        assert_eq!(rate_limit_wait("Too many requests"), None);
+        assert_eq!(rate_limit_wait("Cannot query field \"x\""), None);
     }
 
     #[test]
