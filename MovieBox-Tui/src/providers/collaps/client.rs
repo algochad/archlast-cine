@@ -22,6 +22,12 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 const EMBED_TTL: Duration = Duration::from_secs(10 * 60);
 const META_TTL: Duration = Duration::from_secs(60 * 60);
 const CACHE_MAX: usize = 512;
+/// "Not on Collaps" is remembered briefly: it is usually true, but a geo or
+/// rate-limit hiccup must not hide a title for long.
+const MISSING_TTL: Duration = Duration::from_secs(60);
+/// A home feed is reused this long, and served stale (any age) if Cinemeta fails.
+const HOME_TTL: Duration = Duration::from_secs(10 * 60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 /// Cinemeta catalog page size.
 const CATALOG_PAGE: usize = 50;
 
@@ -92,11 +98,15 @@ pub struct CollapsProvider {
     http: Client,
     cinemeta_base: String,
     embed_base: String,
-    /// `None` caches "not on Collaps" so a missing title is not re-fetched
-    /// by every streams/play/captions call.
-    embeds: Arc<TtlCache<Option<Arc<CollapsEmbed>>>>,
+    embeds: Arc<TtlCache<Arc<CollapsEmbed>>>,
+    /// Titles Collaps answered 404 for, so streams/play/captions for one
+    /// title do not each re-fetch a page that is not there.
+    missing: Arc<TtlCache<()>>,
     metas: Arc<TtlCache<Arc<Value>>>,
+    home: Arc<Mutex<Option<(Instant, Home)>>>,
 }
+
+type Home = (Vec<CatalogItem>, HashMap<String, BrowseMetrics>);
 
 impl CollapsProvider {
     pub fn new(http: Client) -> Self {
@@ -105,15 +115,18 @@ impl CollapsProvider {
             cinemeta_base: env_or("CINEMETA_BASE_URL", CINEMETA_BASE),
             embed_base: env_or("COLLAPS_EMBED_BASE_URL", COLLAPS_EMBED_BASE),
             embeds: Arc::new(TtlCache::new(EMBED_TTL)),
+            missing: Arc::new(TtlCache::new(MISSING_TTL)),
             metas: Arc::new(TtlCache::new(META_TTL)),
+            home: Arc::new(Mutex::new(None)),
         }
     }
 
-    async fn get(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
+    async fn get_once(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
         let resp = self
             .http
             .get(url)
             .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
@@ -122,6 +135,18 @@ impl CollapsProvider {
             StatusCode::NOT_FOUND => Err(ProviderError::NotFound),
             StatusCode::TOO_MANY_REQUESTS => Err(ProviderError::RateLimited(None)),
             s => Err(ProviderError::Unavailable(format!("HTTP {s} from {url}"))),
+        }
+    }
+
+    /// GET with one retry for transient failures (network errors, 5xx).
+    /// 404 and 429 are answers, not failures, and are returned as they are.
+    async fn get(&self, url: &str) -> Result<reqwest::Response, ProviderError> {
+        match self.get_once(url).await {
+            Err(ProviderError::Network(_) | ProviderError::Unavailable(_)) => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                self.get_once(url).await
+            }
+            other => other,
         }
     }
 
@@ -163,9 +188,32 @@ impl CollapsProvider {
 
     /// Home feed: two pages each of the top movies and top series, with
     /// per-item metrics for the row builder. Fails only when every catalog does.
-    pub async fn homepage(
-        &self,
-    ) -> Result<(Vec<CatalogItem>, HashMap<String, BrowseMetrics>), ProviderError> {
+    pub async fn homepage(&self) -> Result<Home, ProviderError> {
+        let cached = self.home.lock().ok().and_then(|g| g.clone());
+        if let Some((at, home)) = &cached {
+            if at.elapsed() < HOME_TTL {
+                return Ok(home.clone());
+            }
+        }
+        match self.fetch_home().await {
+            Ok(home) => {
+                if let Ok(mut guard) = self.home.lock() {
+                    *guard = Some((Instant::now(), home.clone()));
+                }
+                Ok(home)
+            }
+            // Cinemeta down: a stale feed beats an empty home page.
+            Err(e) => match cached {
+                Some((_, home)) => {
+                    log::warn!("collaps: home refresh failed ({e}); serving stale feed");
+                    Ok(home)
+                }
+                None => Err(e),
+            },
+        }
+    }
+
+    async fn fetch_home(&self) -> Result<Home, ProviderError> {
         let pages = [
             ("movie", 0),
             ("series", 0),
@@ -239,7 +287,10 @@ impl CollapsProvider {
             return Err(ProviderError::NotFound);
         }
         if let Some(cached) = self.embeds.get(id) {
-            return cached.ok_or(ProviderError::NotFound);
+            return Ok(cached);
+        }
+        if self.missing.get(id).is_some() {
+            return Err(ProviderError::NotFound);
         }
         let url = format!("{}/embed/imdb/{id}", self.embed_base);
         let html = match self.get(&url).await {
@@ -248,20 +299,22 @@ impl CollapsProvider {
                 .await
                 .map_err(|e| ProviderError::Network(e.to_string()))?,
             Err(ProviderError::NotFound) => {
-                self.embeds.insert(id.to_string(), None);
+                self.missing.insert(id.to_string(), ());
                 return Err(ProviderError::NotFound);
             }
             Err(e) => return Err(e),
         };
-        let parsed = embed::parse_embed(&html).map(Arc::new);
-        if parsed.is_none() {
+        // A 200 page without a source (anti-bot page, layout change) is not
+        // cached: the next request should try again.
+        let Some(parsed) = embed::parse_embed(&html).map(Arc::new) else {
             log::warn!(
                 "collaps: embed for {id} has no playable source ({} bytes)",
                 html.len()
             );
-        }
+            return Err(ProviderError::NotFound);
+        };
         self.embeds.insert(id.to_string(), parsed.clone());
-        parsed.ok_or(ProviderError::NotFound)
+        Ok(parsed)
     }
 
     /// Subtitle tracks of one movie/episode; empty when the title has none

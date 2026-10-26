@@ -1571,7 +1571,7 @@ async fn skip_markers(
     //    These paths require a playable URL; if we cannot resolve one we
     //    simply return whatever markers we have (possibly empty) rather than
     //    fabricating pseudo-chapters.
-    if markers.is_empty() && provider != ProviderKind::Anime {
+    if markers.is_empty() && provider != ProviderKind::Anime && provider != ProviderKind::Collaps {
         // Attempt to resolve a playable release for this title/episode so we
         // can probe it. This is best-effort; any error yields an empty list.
         if let Ok(releases) =
@@ -2231,7 +2231,23 @@ async fn proxy_fetch_inner(
         builder = builder.header(header::IF_NONE_MATCH, inm);
     }
 
-    let resp = match builder.send().await {
+    // Connect failures (DNS hiccups, refused/reset on a fresh connection) are
+    // transient on CDN edges; a couple of quick retries hide them from the player.
+    let mut attempt = 0u32;
+    let resp = loop {
+        let Some(request) = builder.try_clone() else {
+            break builder.send().await;
+        };
+        match request.send().await {
+            Err(e) if e.is_connect() && attempt < 2 => {
+                attempt += 1;
+                log::debug!("proxy_fetch: connect failed (attempt {attempt}) for ticket={ticket}: {e}; retrying");
+                tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+            }
+            other => break other,
+        }
+    };
+    let resp = match resp {
         Ok(r) => r,
         Err(e) => {
             log::warn!("proxy_fetch: upstream request failed for ticket={ticket}: {e:?}");

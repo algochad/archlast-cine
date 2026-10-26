@@ -687,6 +687,11 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   }, [label, provider]);
 
   // ---------------- source loading ----------------
+  // Run tokens: the latest startSource()/boot() wins. React dev double-invokes
+  // effects and quality/mirror switches can overlap a boot; without these two
+  // runs both attach their own hls.js to the one <video> and playback stalls.
+  const startRunRef = useRef(0);
+  const bootGenRef = useRef(0);
   const teardown = useCallback(() => {
     if (ratePersistTimerRef.current != null) {
       window.clearTimeout(ratePersistTimerRef.current);
@@ -1929,6 +1934,8 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   const startSource = useCallback(
     async (wantResolution: number | null, candidateOrder: Release[]) => {
       resumePromptedRef.current = false;
+      const run = ++startRunRef.current;
+      const stale = () => startRunRef.current !== run;
       teardown();
       // Fresh codec picture for this source: a stale value from the previous
       // source would misroute the watchdog.
@@ -1951,6 +1958,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           resolution: wantResolution ?? undefined,
         });
       } catch (e) {
+        if (stale()) return;
         // Fall back to a manual first-mirror source.
         const rel = candidateOrder[0];
         if (rel?.mirrors[0]) {
@@ -1963,6 +1971,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
               cache: "no-store",
             });
             const { ticket } = (await t.json()) as { ticket: string };
+            if (stale()) return;
             const origin = new URL(mirror.resolver_url);
             const playUrl = `/api/proxy/${ticket}/a${origin.pathname}${origin.search}`;
             currentSourceRef.current = playUrl;
@@ -1984,6 +1993,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         return;
       }
 
+      if (stale()) return;
       const source = play.play_url;
       currentSourceRef.current = source;
       setActive({
@@ -2030,6 +2040,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         } catch {
           console.warn("[playback] manifest sniff fetch failed; playing original URL with watchdog cover");
         }
+        if (stale()) return;
         let dashSource = source;
         if (manifestText !== null) {
           const pre = sniffManifest(manifestText);
@@ -2079,7 +2090,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
         const dashModuleEpoch = sourceEpochRef.current;
         const dashjs = (await import("dashjs")).default;
         // at all (it would bind the reused video element as a zombie).
-        if (sourceEpochRef.current !== dashModuleEpoch) return;
+        if (sourceEpochRef.current !== dashModuleEpoch || stale()) return;
         const dash = dashjs.MediaPlayer().create();
         dashRef.current = dash;
         // The teardown below detaches the video element synchronously and
@@ -2184,7 +2195,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
             /* playlist unreadable — play with watchdog cover */
           }
           // A source switch/teardown while the sniff was in flight → abandon.
-          if (sourceEpochRef.current !== hlsSniffEpoch) return;
+          if (sourceEpochRef.current !== hlsSniffEpoch || stale()) return;
           if (hlsText !== null) {
             const sniff = sniffHls(hlsText);
             hevcOnlyRef.current = sniff.videoCodecs.length ? sniff.hevcOnly : null;
@@ -2230,6 +2241,8 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
 
   // ---------------- initial load ----------------
   const boot = useCallback(async () => {
+    const gen = ++bootGenRef.current;
+    const superseded = () => bootGenRef.current !== gen;
     setState("loading");
     setError(null);
 
@@ -2240,10 +2253,12 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       // Promise.all lets the details miss kill working playback. Load streams
       // first, then degrade to synthetic anime details on details-404.
       const streams = await api.streams(provider, id, season, episode);
+      if (superseded()) return;
       let details: MediaDetails;
       try {
         details = await api.details(provider, id).then((d) => d.details);
       } catch (e) {
+        if (superseded()) return;
         const detailsMissing = e instanceof ApiError && e.status === 404 && provider === "anime";
         if (!detailsMissing) throw e;
         console.warn("[playback] anime details 404; continuing with streams only:", id);
@@ -2271,6 +2286,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
           animeIds: /^\d+$/.test(id) ? { anilistId: Number(id), malId: null } : null,
         };
       }
+      if (superseded()) return;
       setLoaded({ streams, details });
       // After streams: anime captions ride on the resolve that just ran.
       void loadSubtitleOptions({
@@ -2295,6 +2311,7 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
       );
       await startSource(null, choices);
     } catch (e) {
+      if (superseded()) return;
       if (provider === "anime") {
         console.warn("[playback] anime load failed:", e instanceof Error ? e.message : e);
         setError("This title isn't available right now. Try again or pick another source.");
@@ -2307,6 +2324,9 @@ export function WatchPlayer({ provider, id, season, episode }: Props) {
   useEffect(() => {
     void boot();
     return () => {
+      // Invalidate any boot()/startSource() still in flight for this mount.
+      bootGenRef.current += 1;
+      startRunRef.current += 1;
       // Capture + flush the last position *before* the source is torn down
       // (teardown resets the media element, so a saveNow afterwards would see
       // no duration). Signed-in sessions get a final forced server upsert.
