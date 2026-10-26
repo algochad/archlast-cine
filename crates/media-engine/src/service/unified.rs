@@ -38,6 +38,14 @@ const ANIME_NATIVE_TIMEOUT: Duration = Duration::from_secs(35);
 /// Candidates per provider tried when looking for an alternate source.
 const ALT_CANDIDATES: usize = 3;
 
+/// Whether a release advertises an English audio track.
+fn has_english_audio(release: &Release) -> bool {
+    release
+        .language
+        .as_deref()
+        .is_some_and(|l| l.to_lowercase().contains("english"))
+}
+
 /// A title's IMDb identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImdbRef {
@@ -353,8 +361,10 @@ impl MovieBoxService {
         }
     }
 
-    /// Collaps first; any failure to serve the title (not on Collaps, Collaps
-    /// down) falls back to another source that has it.
+    /// Collaps first. When Collaps cannot serve the title, or only offers
+    /// dubs without an English track (many CIS-sourced titles are Russian
+    /// only), another source that has it is preferred; the Collaps stream stays
+    /// as the last choice so playback never gets worse than before.
     pub async fn collaps_streams(
         &self,
         id: &str,
@@ -363,19 +373,23 @@ impl MovieBoxService {
     ) -> Result<Vec<Release>, ProviderError> {
         let primary =
             ReleaseProvider::episode_streams(&self.collaps_client, id, season, episode).await;
-        match primary {
-            Ok(releases) if !releases.is_empty() => return Ok(releases),
-            _ => {}
+        let playable = |r: &Vec<Release>| r.iter().any(|x| !x.mirrors.is_empty());
+        if let Ok(releases) = &primary {
+            if playable(releases) && releases.iter().any(has_english_audio) {
+                return primary;
+            }
         }
-        match self.alt_releases_for(id, season, episode).await {
-            Some((_, releases)) => Ok(releases.as_ref().clone()),
-            None => primary.and_then(|r| {
-                if r.is_empty() {
-                    Err(ProviderError::NotFound)
-                } else {
-                    Ok(r)
-                }
-            }),
+        let alt = self.alt_releases_for(id, season, episode).await;
+        match (primary, alt) {
+            (Ok(mut own), Some((_, alt))) if playable(&own) => {
+                let mut out = alt.as_ref().clone();
+                out.append(&mut own);
+                Ok(out)
+            }
+            (Ok(own), None) if playable(&own) => Ok(own),
+            (_, Some((_, alt))) => Ok(alt.as_ref().clone()),
+            (Ok(_), None) => Err(ProviderError::NotFound),
+            (Err(e), None) => Err(e),
         }
     }
 
@@ -896,6 +910,27 @@ mod tests {
                 .imdb,
             "tt-first"
         );
+    }
+
+    #[test]
+    fn english_audio_is_read_from_the_release_language() {
+        let mut r = Release {
+            provider: ProviderKind::Collaps,
+            filename: "HLS".into(),
+            quality: None,
+            codec: None,
+            language: Some("Russian, English".into()),
+            size_bytes: None,
+            season: None,
+            episode: None,
+            mirrors: vec![],
+            resource_id: None,
+        };
+        assert!(has_english_audio(&r));
+        r.language = Some("Russian, Korean".into());
+        assert!(!has_english_audio(&r));
+        r.language = None;
+        assert!(!has_english_audio(&r));
     }
 
     #[test]
